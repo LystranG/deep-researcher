@@ -1,0 +1,11 @@
+.git
+.serena
+.venv
+var
+**/__pycache__
+**/.pytest_cache
+apps/web/node_modules
+apps/web/dist
+apps/web/playwright-report
+apps/web/**/*.tsbuildinfo
+*.db
