@@ -208,6 +208,88 @@ test("用户可以从扩展目录安装受信任 Skill", async () => {
   expect(await screen.findByRole("button", { name: "在此空间启用" })).toBeInTheDocument();
 });
 
+// 用户可查看本次研究读取的网页正文
+test("用户可以查看研究来源保存的网页正文", async () => {
+  window.localStorage.setItem("deep-researcher-token", "token");
+  const workspace = {
+    id: "workspace-1",
+    name: "行业研究",
+    description: null,
+    instructions: null,
+    archived: false,
+    memory_auto_apply: true,
+  };
+  const conversation = {
+    id: "conversation-1",
+    workspace_id: "workspace-1",
+    title: "市场规模",
+    archived: false,
+  };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const path = String(input);
+    if (path === "/api/v1/workspaces") {
+      return new Response(JSON.stringify({ items: [workspace] }));
+    }
+    if (path === "/api/v1/workspaces/workspace-1/conversations") {
+      return new Response(JSON.stringify({ items: [conversation] }));
+    }
+    if (path === "/api/v1/conversations/conversation-1/messages") {
+      return new Response(JSON.stringify({ items: [
+        { id: "user-1", role: "user", content: "研究储能市场", version: 1 },
+        { id: "assistant-1", role: "assistant", content: "研究已完成。", version: 1 },
+      ] }));
+    }
+    if (path === "/api/v1/conversations/conversation-1/latest-run") {
+      return new Response(JSON.stringify({ run_id: "run-1", status: "completed", tasks: [] }));
+    }
+    if (path === "/api/v1/conversations/conversation-1/active-run") {
+      return new Response(JSON.stringify(null));
+    }
+    if (path === "/api/v1/runs/run-1/todos") {
+      return new Response(JSON.stringify({ items: [] }));
+    }
+    if (path === "/api/v1/runs/run-1/sources") {
+      return new Response(JSON.stringify({ items: [{
+        id: "source-1",
+        ordinal: 1,
+        title: "储能产业报告",
+        url: "https://example.com/storage-report",
+        content_kind: "web_page",
+        captured_at: "2026-08-09T08:00:00Z",
+        content_preview: "储能装机持续增长。",
+      }] }));
+    }
+    if (path === "/api/v1/sources/source-1") {
+      return new Response(JSON.stringify({
+        id: "source-1",
+        ordinal: 1,
+        title: "储能产业报告",
+        url: "https://example.com/storage-report",
+        content_kind: "web_page",
+        captured_at: "2026-08-09T08:00:00Z",
+        content_preview: "储能装机持续增长。",
+        content: "储能装机持续增长，电网侧需求正在扩大。",
+      }));
+    }
+    return new Response(JSON.stringify({ detail: `unexpected request: ${path}` }), { status: 500 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  const user = userEvent.setup();
+
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: /行业研究/ }));
+  await user.click(await screen.findByRole("button", { name: /市场规模/ }));
+  await user.click(await screen.findByRole("button", { name: "研究来源" }));
+  expect(await screen.findByText("已读取网页正文")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /储能产业报告/ }));
+
+  expect(await screen.findByText("储能装机持续增长，电网侧需求正在扩大。")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "打开原网页" })).toHaveAttribute(
+    "href",
+    "https://example.com/storage-report",
+  );
+});
+
 test("用户刷新后可以拒绝待审批工具调用并继续原研究运行", async () => {
   window.localStorage.setItem("deep-researcher-token", "token");
   const workspace = {

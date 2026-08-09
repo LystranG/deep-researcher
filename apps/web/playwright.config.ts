@@ -35,7 +35,7 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: `rtk env UV_CACHE_DIR=/private/tmp/deep-researcher-uv-cache DEEP_RESEARCHER_OPENAI_API_KEY= DEEP_RESEARCHER_EMBEDDED_WORKER=1 DEEP_RESEARCHER_DATABASE_URL=sqlite:////private/tmp/deep-researcher-e2e-${runId}.db DEEP_RESEARCHER_OBJECT_STORE_ROOT=/private/tmp/deep-researcher-e2e-objects-${runId} DEEP_RESEARCHER_TRUSTED_MCP_URL=http://127.0.0.1:${mcpPort}/mcp uv run uvicorn deep_researcher.app:app --host 127.0.0.1 --port ${apiPort}`,
+      command: `rtk env UV_CACHE_DIR=/private/tmp/deep-researcher-uv-cache DEEP_RESEARCHER_OPENAI_API_KEY= DEEP_RESEARCHER_BRAVE_SEARCH_API_KEY= DEEP_RESEARCHER_EMBEDDED_WORKER=1 DEEP_RESEARCHER_DATABASE_URL=sqlite:////private/tmp/deep-researcher-e2e-${runId}.db DEEP_RESEARCHER_OBJECT_STORE_ROOT=/private/tmp/deep-researcher-e2e-objects-${runId} DEEP_RESEARCHER_TRUSTED_MCP_URL=http://127.0.0.1:${mcpPort}/mcp uv run uvicorn deep_researcher.app:app --host 127.0.0.1 --port ${apiPort}`,
       cwd: repoRoot,
       url: `http://127.0.0.1:${apiPort}/healthz`,
       reuseExistingServer: false,

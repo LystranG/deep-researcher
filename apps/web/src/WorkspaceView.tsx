@@ -13,12 +13,15 @@ import {
   Skill,
   Workspace,
   WorkspaceDocument,
+  ResearchSource,
+  ResearchSourceDetail,
 } from "./api";
 import { RunEventStore, streamRunEvents, useRunEvents } from "./runEventStore";
 
 type ConversationList = { items: Conversation[] };
 type MessageList = { items: Message[] };
 type CitationList = { items: Citation[] };
+type ResearchSourceList = { items: ResearchSource[] };
 type DocumentList = { items: WorkspaceDocument[] };
 type RunCreated = { run_id: string; assistant_message_id: string; status: string };
 type RunReference = { run_id: string; status: string };
@@ -95,6 +98,9 @@ export function WorkspaceView({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [citation, setCitation] = useState<Citation | null>(null);
+  const [researchSources, setResearchSources] = useState<ResearchSource[]>([]);
+  const [selectedResearchSource, setSelectedResearchSource] = useState<ResearchSourceDetail | null>(null);
+  const [showResearchSources, setShowResearchSources] = useState(false);
   const [evidenceSelection, setEvidenceSelection] = useState<EvidenceSelection | null>(null);
   const [evidenceCheck, setEvidenceCheck] = useState<EvidenceCheck | null>(null);
   const [documents, setDocuments] = useState<WorkspaceDocument[]>([]);
@@ -137,6 +143,9 @@ export function WorkspaceView({
     setShowSandbox(false);
     setSandboxTodos([]);
     setCitation(null);
+    setResearchSources([]);
+    setSelectedResearchSource(null);
+    setShowResearchSources(false);
     setEvidenceCheck(null);
     void apiRequest<ConversationList>(
       `/api/v1/workspaces/${workspace.id}/conversations`,
@@ -154,6 +163,9 @@ export function WorkspaceView({
     setToolApprovals([]);
     setEventStore(null);
     setActiveRunId(null);
+    setResearchSources([]);
+    setSelectedResearchSource(null);
+    setShowResearchSources(false);
     void loadConversationState(conversation.id);
   }, [conversation?.id]);
 
@@ -199,7 +211,10 @@ export function WorkspaceView({
       );
       setPersistedTasks(latest?.tasks ?? []);
       setLatestRunId(latest?.run_id ?? null);
-      if (latest?.run_id) await loadSandboxTodos(latest.run_id);
+      if (latest?.run_id) {
+        await loadSandboxTodos(latest.run_id);
+        await loadResearchSources(latest.run_id);
+      }
       const active = await apiRequest<RunCreated | null>(
         `/api/v1/conversations/${conversationId}/active-run`,
         {},
@@ -218,6 +233,34 @@ export function WorkspaceView({
       setSandboxTodos(result.items.filter((item) => item.kind === "python_sandbox"));
     } catch {
       setSandboxTodos([]);
+    }
+  }
+
+  // 读取当前运行的全部搜索来源
+  async function loadResearchSources(runId: string) {
+    try {
+      const result = await apiRequest<ResearchSourceList>(
+        `/api/v1/runs/${runId}/sources`,
+        {},
+        token,
+      );
+      setResearchSources(result.items);
+    } catch {
+      setResearchSources([]);
+    }
+  }
+
+  // 打开研究系统实际读取的网页快照
+  async function showResearchSource(source: ResearchSource) {
+    try {
+      const result = await apiRequest<ResearchSourceDetail>(
+        `/api/v1/sources/${source.id}`,
+        {},
+        token,
+      );
+      setSelectedResearchSource(result);
+    } catch (reason) {
+      reportError(reason);
     }
   }
 
@@ -253,6 +296,7 @@ export function WorkspaceView({
     setPersistedTasks(latest?.tasks ?? []);
     setLatestRunId(latest?.run_id ?? run.run_id);
     await loadSandboxTodos(latest?.run_id ?? run.run_id);
+    await loadResearchSources(latest?.run_id ?? run.run_id);
     setToolApprovals([]);
     setActiveRunId(null);
   }
@@ -779,6 +823,7 @@ export function WorkspaceView({
                 <button onClick={loadMemories}>长期记忆</button>
                 <button onClick={loadSkills}>扩展</button>
                 {latestRunId && <button onClick={() => setShowSandbox(true)}>Python 沙箱</button>}
+                {latestRunId && <button onClick={() => setShowResearchSources(true)}>研究来源</button>}
                 <button onClick={renameConversation}>重命名</button>
                 <button onClick={archiveConversation}>归档</button>
                 <button className="danger-link" onClick={deleteConversation}>删除</button>
@@ -868,6 +913,35 @@ export function WorkspaceView({
           {citation.source_url && <a href={citation.source_url} target="_blank" rel="noreferrer">打开来源网页</a>}
           <blockquote>{citation.evidence_text}</blockquote>
           <small>来源哈希 {citation.source_hash.slice(0, 12)}…</small>
+        </aside>
+      )}
+      {showResearchSources && (
+        <aside className="citation-drawer source-drawer">
+          <button className="drawer-close" onClick={() => setShowResearchSources(false)}>关闭</button>
+          <span className="eyebrow">RESEARCH SOURCES</span>
+          <h3>研究来源</h3>
+          {researchSources.length === 0 && <p>本次运行没有可展示的网页来源。</p>}
+          <div className="source-list">
+            {researchSources.map((source) => (
+              <button
+                className={selectedResearchSource?.id === source.id ? "source-item active" : "source-item"}
+                key={source.id}
+                onClick={() => void showResearchSource(source)}
+              >
+                <strong>{source.ordinal}. {source.title}</strong>
+                <small>{source.content_kind === "web_page" ? "已读取网页正文" : "仅搜索摘要"}</small>
+                <span>{source.url}</span>
+              </button>
+            ))}
+          </div>
+          {selectedResearchSource && (
+            <article className="source-detail">
+              <h4>{selectedResearchSource.title}</h4>
+              <p>{new Date(selectedResearchSource.captured_at).toLocaleString()}</p>
+              <a href={selectedResearchSource.url} target="_blank" rel="noreferrer">打开原网页</a>
+              <blockquote>{selectedResearchSource.content}</blockquote>
+            </article>
+          )}
         </aside>
       )}
       {evidenceCheck && (

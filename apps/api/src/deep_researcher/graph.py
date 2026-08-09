@@ -182,8 +182,7 @@ async def _run_writer(
 def _run_citation_validator(state: ResearchState) -> dict[str, object]:
     """校验 Writer 草稿并只返回可公开的安全回答"""
     sources = state["research_context"]["sources"]
-    evidence = sources[0]["text"] if sources else None
-    validation = validate_answer(state["draft_answer"], evidence)
+    validation = validate_answer(state["draft_answer"], [source["text"] for source in sources])
     return {
         "answer": validation.answer,
         "answer_deltas": [validation.answer],

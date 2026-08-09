@@ -19,13 +19,18 @@ class CitationValidationResult:
     citations: tuple[CitationDraft, ...]
 
 
-def validate_answer(answer: str, evidence: str | None) -> CitationValidationResult:
+def validate_answer(
+    answer: str, evidence: str | list[str] | None
+) -> CitationValidationResult:
     """拒绝冻结 SourceSet 之外的引用并执行抽取式降级"""
+    evidences = [evidence] if isinstance(evidence, str) else (evidence or [])
     labels = {int(label) for label in re.findall(r"\[(\d+)]", answer)}
-    allowed_labels = {1} if evidence is not None else set()
-    if labels - allowed_labels or (evidence is not None and 1 not in labels):
-        answer = f"根据资料：{evidence} [1]" if evidence is not None else "当前没有可核验资料。"
-        labels = {1} if evidence is not None else set()
+    allowed_labels = set(range(1, len(evidences) + 1))
+    if labels - allowed_labels or (evidences and not labels):
+        answer = (
+            f"根据资料：{evidences[0]} [1]" if evidences else "当前没有可核验资料。"
+        )
+        labels = {1} if evidences else set()
     citation_drafts: list[CitationDraft] = []
     for label in sorted(labels):
         citation_drafts.append(

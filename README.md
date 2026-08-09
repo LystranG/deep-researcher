@@ -16,6 +16,19 @@ rtk make dev-web
 
 浏览器访问 `http://127.0.0.1:5173`。默认数据库是 `var/deep-researcher.db`，默认对象目录是 `var/objects`。没有 OpenAI key 时走本地抽取式研究 Adapter；它会基于实际可见的会话纠正和文档 Evidence Span 回答，不会伪装成外部模型调用。
 
+## 模型与网页检索配置
+
+在项目根目录创建 `.env`，按所使用的 OpenAI 兼容服务填写模型配置：
+
+```dotenv
+DEEP_RESEARCHER_OPENAI_API_KEY=你的模型密钥
+DEEP_RESEARCHER_OPENAI_API_BASE=https://你的兼容服务地址/v1
+DEEP_RESEARCHER_OPENAI_MODEL=openai/你的模型ID
+DEEP_RESEARCHER_BRAVE_SEARCH_API_KEY=你的BraveSearch密钥
+```
+
+模型凭证只提供文本生成能力；自动网页研究使用独立的 Brave Search Adapter。未配置 `DEEP_RESEARCHER_BRAVE_SEARCH_API_KEY` 时，系统会明确提示网页检索不可用，不会把无资料误报为研究结论，也不会继续消耗模型 token。配置变更后重启 API。
+
 使用 PostgreSQL 的完整本地部署：
 
 ```bash

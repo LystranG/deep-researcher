@@ -45,7 +45,8 @@ from deep_researcher.research_context import (
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
 from deep_researcher.tool_execution import ToolExecutionService
-from deep_researcher.web_search import SearchUnavailableError, WebSearchGateway
+from deep_researcher.web_page import WebPageGateway
+from deep_researcher.web_search import SearchResult, SearchUnavailableError, WebSearchGateway
 
 
 class ResearchCoordinator:
@@ -57,10 +58,12 @@ class ResearchCoordinator:
         *,
         model_gateway: ModelGateway,
         web_search_gateway: WebSearchGateway,
+        web_page_gateway: WebPageGateway,
         quota_service: QuotaService,
         tool_execution: ToolExecutionService,
         run_token_budget: int,
         run_cost_budget_usd: float,
+        require_web_search_for_external_model: bool,
         step_delay_seconds: float = 0.0,
         graph_runner: ResearchGraphRunner | None = None,
         sandbox_submitter: Callable[[UUID], object] | None = None,
@@ -72,10 +75,12 @@ class ResearchCoordinator:
         self._projector = RunEventProjector(self._event_log)
         self._model_gateway = model_gateway
         self._web_search_gateway = web_search_gateway
+        self._web_page_gateway = web_page_gateway
         self._quota_service = quota_service
         self._tool_execution = tool_execution
         self._run_token_budget = run_token_budget
         self._run_cost_budget_usd = run_cost_budget_usd
+        self._require_web_search_for_external_model = require_web_search_for_external_model
         self._step_delay_seconds = step_delay_seconds
         self._graph_runner = graph_runner or ResearchGraphRunner()
         self._sandbox_submitter = sandbox_submitter
@@ -112,8 +117,6 @@ class ResearchCoordinator:
                     event_key="run-started",
                     lease_owner=lease_owner,
                 )
-            if evidence is None:
-                evidence = self._search_web(run_id, question, lease_owner=lease_owner)
             sources: list[FrozenSource] = []
             if evidence is not None:
                 sources.append(
@@ -125,6 +128,19 @@ class ResearchCoordinator:
                         "content_hash": evidence.content_hash,
                     }
                 )
+            else:
+                for discovered_chunk in self._search_web(
+                    run_id, question, lease_owner=lease_owner
+                ):
+                    sources.append(
+                        {
+                            "source_chunk_id": str(discovered_chunk.id),
+                            "text": discovered_chunk.text,
+                            "start_offset": discovered_chunk.start_offset,
+                            "end_offset": discovered_chunk.end_offset,
+                            "content_hash": discovered_chunk.content_hash,
+                        }
+                    )
             frozen_memory: FrozenMemory | None = None
             if memory is not None:
                 frozen_memory = {
@@ -190,7 +206,6 @@ class ResearchCoordinator:
                 if run is None or run.cancel_requested_at is not None:
                     self._cancel(run_id, lease_owner=lease_owner)
                     return
-            source = research_context["sources"][0] if research_context["sources"] else None
             answer = graph_state["answer"]
             if sandbox_summaries:
                 answer = f"{answer}\n\n受限 Sandbox 计算结果：{sandbox_summaries[0]}"
@@ -258,13 +273,16 @@ class ResearchCoordinator:
                     self._quota_service.settle(session, run, usage_summary)
                     message.content = answer
                     citation_ids: list[str] = []
-                    if source is not None and citation_drafts:
-                        citation_draft = citation_drafts[0]
+                    for citation_draft in citation_drafts:
+                        label = citation_draft["label"]
+                        if label < 1 or label > len(research_context["sources"]):
+                            continue
+                        source = research_context["sources"][label - 1]
                         citation = Citation(
                             workspace_id=run.workspace_id,
                             message_id=message.id,
                             source_chunk_id=UUID(source["source_chunk_id"]),
-                            label=citation_draft["label"],
+                            label=label,
                             answer_start=citation_draft["answer_start"],
                             answer_end=citation_draft["answer_end"],
                             evidence_start=source["start_offset"],
@@ -812,11 +830,16 @@ class ResearchCoordinator:
 
     def _search_web(
         self, run_id: UUID, query: str, *, lease_owner: str | None = None
-    ) -> SourceChunk | None:
+    ) -> list[SourceChunk]:
+        """发现多个网页候选并持久化可读取的正文快照"""
         self._append_event(
             run_id,
             "tool_started",
-            {"tool": "brave_web_search", "query": query},
+            {
+                "tool": "brave_web_search",
+                "query_hash": hashlib.sha256(query.encode()).hexdigest(),
+                "safe_summary": "执行网页搜索",
+            },
             lease_owner=lease_owner,
         )
         try:
@@ -828,7 +851,9 @@ class ResearchCoordinator:
                 {"tool": "brave_web_search", "reason": str(exc)},
                 lease_owner=lease_owner,
             )
-            return None
+            if self._require_web_search_for_external_model:
+                raise
+            return []
         if not results:
             self._append_event(
                 run_id,
@@ -836,48 +861,89 @@ class ResearchCoordinator:
                 {"tool": "brave_web_search", "result_count": 0},
                 lease_owner=lease_owner,
             )
-            return None
+            return []
 
-        result = results[0]
-        content_hash = hashlib.sha256(result["snippet"].encode()).hexdigest()
+        prepared: list[tuple[int, SearchResult, object | None]] = []
+        for ordinal, result in enumerate(results[:5], start=1):
+            page: object | None = None
+            if ordinal <= 3:
+                page = self._web_page_gateway.fetch(result["url"])
+            prepared.append((ordinal, result, page))
+
+        chunks: list[SourceChunk] = []
+        discovered: list[dict[str, object]] = []
         with self._session_factory.begin() as session:
             run = session.get(ResearchRun, run_id)
             if run is None or run.cancel_requested_at is not None:
-                return None
-            snapshot = SourceSnapshot(
-                workspace_id=run.workspace_id,
-                run_id=run.id,
-                source_type="web",
-                title=result["title"],
-                url=result["url"],
-                content=result["snippet"],
-                content_hash=content_hash,
-            )
-            session.add(snapshot)
-            session.flush()
-            chunk = SourceChunk(
-                workspace_id=run.workspace_id,
-                conversation_id=None,
-                attachment_id=None,
-                document_version_id=None,
-                source_snapshot_id=snapshot.id,
-                ordinal=1,
-                text=result["snippet"],
-                page_number=None,
-                start_offset=0,
-                end_offset=len(result["snippet"]),
-                content_hash=content_hash,
-            )
-            session.add(chunk)
-            session.flush()
+                return []
+            for ordinal, result, page in prepared:
+                page_data = page if isinstance(page, dict) else None
+                page_content = (
+                    str(page_data.get("content", "")) if page_data is not None else ""
+                )
+                page_title = str(page_data.get("title", "")) if page_data is not None else ""
+                content_kind = "web_page" if page_content else "search_snippet"
+                content = page_content or result["snippet"]
+                title = page_title or result["title"]
+                content_hash = hashlib.sha256(content.encode()).hexdigest()
+                snapshot = SourceSnapshot(
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    source_type="web",
+                    content_kind=content_kind,
+                    ordinal=ordinal,
+                    title=title,
+                    url=result["url"],
+                    content=content,
+                    content_hash=content_hash,
+                )
+                session.add(snapshot)
+                session.flush()
+                if content_kind == "web_page":
+                    chunk = SourceChunk(
+                        workspace_id=run.workspace_id,
+                        conversation_id=None,
+                        attachment_id=None,
+                        document_version_id=None,
+                        source_snapshot_id=snapshot.id,
+                        ordinal=1,
+                        text=content,
+                        page_number=None,
+                        start_offset=0,
+                        end_offset=len(content),
+                        content_hash=content_hash,
+                    )
+                    session.add(chunk)
+                    session.flush()
+                    chunks.append(chunk)
+                discovered.append(
+                    {
+                        "source_id": str(snapshot.id),
+                        "ordinal": ordinal,
+                        "title": title,
+                        "url": result["url"],
+                        "content_kind": content_kind,
+                    }
+                )
 
+        for source in discovered:
+            self._append_event(
+                run_id,
+                "source_discovered",
+                source,
+                lease_owner=lease_owner,
+            )
         self._append_event(
             run_id,
             "tool_completed",
-            {"tool": "brave_web_search", "result_count": len(results)},
+            {
+                "tool": "brave_web_search",
+                "result_count": len(results),
+                "readable_count": len(chunks),
+            },
             lease_owner=lease_owner,
         )
-        return chunk
+        return chunks
 
     def _latest_relevant_correction(
         self,
@@ -1168,10 +1234,22 @@ class ResearchCoordinator:
                 run is None
                 or run.status in {"cancelled", "completed", "failed"}
                 or (lease_owner is not None and run.lease_owner != lease_owner)
-            ):
+                ):
                 return
             run.status = "failed"
             self._quota_service.release(session, run)
+            public_message: str | None = None
+            if isinstance(error, SearchUnavailableError):
+                if safe_detail == "未配置 Brave Search API 凭证":
+                    public_message = (
+                        "网页检索不可用：未配置 Brave Search API 凭证。"
+                        "请配置 DEEP_RESEARCHER_BRAVE_SEARCH_API_KEY 后重试。"
+                    )
+                else:
+                    public_message = f"网页检索不可用：{safe_detail}。请稍后重试。"
+                assistant_message = session.get(Message, run.assistant_message_id)
+                if assistant_message is not None:
+                    assistant_message.content = public_message
             active_tasks = session.scalars(
                 select(ResearchTask).where(
                     ResearchTask.run_id == run.id,
@@ -1190,6 +1268,18 @@ class ResearchCoordinator:
                         if budget_exhausted
                         else "研究运行失败，任务未能完成"
                     )
+            if public_message is not None:
+                assistant_seq = run.next_event_seq
+                run.next_event_seq += 1
+                session.add(
+                    RunEvent(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        seq=assistant_seq,
+                        type="assistant_delta",
+                        payload={"content": public_message},
+                    )
+                )
             seq = run.next_event_seq
             run.next_event_seq += 1
             session.add(

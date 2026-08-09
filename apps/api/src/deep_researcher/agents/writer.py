@@ -32,6 +32,7 @@ async def write(
         memory=memory["content"] if memory is not None else None,
         skills=tuple(context["skills"]),
         cancellation_token=cancellation_token,
+        evidences=tuple(source["text"] for source in context["sources"]),
     )
     if hasattr(model_gateway, "astream_answer"):
         deltas = [delta async for delta in model_gateway.astream_answer(answer_context)]

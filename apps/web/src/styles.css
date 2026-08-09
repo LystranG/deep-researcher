@@ -148,6 +148,13 @@ input:focus { border-color: #3f725d; box-shadow: 0 0 0 3px rgba(63,114,93,.12); 
 .citation-drawer h3 { margin: .8rem 0 .2rem; font-family: Georgia, serif; font-size: 1.8rem; }
 .citation-drawer p, .citation-drawer small { color: #a9bdb3; }
 .citation-drawer blockquote { margin: 1.4rem 0; padding: 1rem; border-left: 3px solid #c9df95; color: #f5f3e9; background: rgba(255,255,255,.06); line-height: 1.75; }
+.source-list { display: grid; gap: .55rem; margin-top: 1rem; }
+.source-item { display: grid; gap: .25rem; width: 100%; padding: .75rem; text-align: left; color: #f5f3e9; border: 1px solid rgba(255,255,255,.12); border-radius: 10px; background: rgba(255,255,255,.05); }
+.source-item.active { border-color: #c9df95; background: rgba(201,223,149,.12); }
+.source-item small, .source-item span { overflow: hidden; color: #a9bdb3; white-space: nowrap; text-overflow: ellipsis; }
+.source-detail { margin-top: 1rem; }
+.source-detail h4 { margin: 0; font-size: 1.15rem; }
+.source-detail blockquote { max-height: 45vh; overflow: auto; white-space: pre-wrap; }
 .drawer-close { float: right; border: 1px solid rgba(255,255,255,.2); border-radius: 8px; padding: .4rem .6rem; color: #fff; background: transparent; }
 .document-drawer h3 { font-family: Georgia, serif; font-size: 2rem; }
 .document-drawer article { margin: .8rem 0; padding: .9rem; display: grid; gap: .45rem; border: 1px solid rgba(255,255,255,.12); border-radius: 12px; background: rgba(255,255,255,.05); }

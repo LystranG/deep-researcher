@@ -462,6 +462,8 @@ class SourceSnapshot(Base):
         ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
     )
     source_type: Mapped[str] = mapped_column(String(32), default="web")
+    content_kind: Mapped[str] = mapped_column(String(32), default="search_snippet")
+    ordinal: Mapped[int] = mapped_column(Integer, default=1)
     title: Mapped[str] = mapped_column(String(1000))
     url: Mapped[str] = mapped_column(String(4000))
     content: Mapped[str] = mapped_column(Text)

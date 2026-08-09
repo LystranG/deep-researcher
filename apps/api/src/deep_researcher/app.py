@@ -81,6 +81,7 @@ from deep_researcher.tool_execution import (
     ToolApprovalError,
     ToolExecutionService,
 )
+from deep_researcher.web_page import HttpWebPageGateway, WebPageGateway
 from deep_researcher.web_search import WebSearchGateway, build_web_search_gateway
 from deep_researcher.worker import RunWorker
 
@@ -266,6 +267,24 @@ class CitationResponse(BaseModel):
 
 class CitationListResponse(BaseModel):
     items: list[CitationResponse]
+
+
+class ResearchSourceResponse(BaseModel):
+    id: str
+    ordinal: int
+    title: str
+    url: str
+    content_kind: str
+    captured_at: datetime
+    content_preview: str
+
+
+class ResearchSourceListResponse(BaseModel):
+    items: list[ResearchSourceResponse]
+
+
+class ResearchSourceDetailResponse(ResearchSourceResponse):
+    content: str
 
 
 class MemoryCreateRequest(BaseModel):
@@ -459,6 +478,7 @@ def create_app(
     *,
     model_gateway: ModelGateway | None = None,
     web_search_gateway: WebSearchGateway | None = None,
+    web_page_gateway: WebPageGateway | None = None,
     graph_runner: ResearchGraphRunner | None = None,
     mcp_gateway: McpGateway | None = None,
     embedded_worker: bool = False,
@@ -475,6 +495,7 @@ def create_app(
     resolved_web_search_gateway = web_search_gateway or build_web_search_gateway(
         api_key=resolved_settings.brave_search_api_key
     )
+    resolved_web_page_gateway = web_page_gateway or HttpWebPageGateway()
     resolved_mcp_gateway = mcp_gateway
     if resolved_mcp_gateway is None and resolved_settings.trusted_mcp_url:
         resolved_mcp_gateway = LocalTrustedHttpMcpAdapter(
@@ -490,6 +511,7 @@ def create_app(
         session_factory,
         model_gateway=resolved_model_gateway,
         web_search_gateway=resolved_web_search_gateway,
+        web_page_gateway=resolved_web_page_gateway,
         quota_service=QuotaService(
             token_limit=resolved_settings.workspace_token_quota,
             cost_limit_usd=resolved_settings.workspace_cost_quota_usd,
@@ -497,6 +519,7 @@ def create_app(
         tool_execution=tool_execution,
         run_token_budget=resolved_settings.run_token_budget,
         run_cost_budget_usd=resolved_settings.run_cost_budget_usd,
+        require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
         step_delay_seconds=resolved_settings.research_step_delay_seconds,
         graph_runner=graph_runner or ResearchGraphRunner(resolved_settings.database_url),
         sandbox_submitter=lambda execution_id: sandbox_executor.submit(
@@ -2414,6 +2437,49 @@ def create_app(
         if run is None:
             raise HTTPException(status_code=404, detail="研究运行不存在")
         return run
+
+    def research_source_response(snapshot: SourceSnapshot) -> ResearchSourceResponse:
+        """将运行来源快照转换为可浏览摘要"""
+        return ResearchSourceResponse(
+            id=str(snapshot.id),
+            ordinal=snapshot.ordinal,
+            title=snapshot.title,
+            url=snapshot.url,
+            content_kind=snapshot.content_kind,
+            captured_at=snapshot.captured_at,
+            content_preview=snapshot.content[:400],
+        )
+
+    @app.get("/api/v1/runs/{run_id}/sources", response_model=ResearchSourceListResponse)
+    def list_run_sources(
+        run_id: UUID,
+        session: SessionDependency,
+        user: CurrentUser,
+    ) -> ResearchSourceListResponse:
+        """返回当前用户可见运行的全部网页来源"""
+        run = accessible_run(session, user, run_id)
+        snapshots = session.scalars(
+            select(SourceSnapshot)
+            .where(SourceSnapshot.run_id == run.id, SourceSnapshot.invalidated_at.is_(None))
+            .order_by(SourceSnapshot.ordinal, SourceSnapshot.captured_at)
+        ).all()
+        return ResearchSourceListResponse(
+            items=[research_source_response(snapshot) for snapshot in snapshots]
+        )
+
+    @app.get("/api/v1/sources/{source_id}", response_model=ResearchSourceDetailResponse)
+    def get_research_source(
+        source_id: UUID,
+        session: SessionDependency,
+        user: CurrentUser,
+    ) -> ResearchSourceDetailResponse:
+        """返回当前用户有权读取的网页快照正文"""
+        snapshot = session.get(SourceSnapshot, source_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="研究来源不存在")
+        accessible_run(session, user, snapshot.run_id)
+        summary = research_source_response(snapshot)
+        return ResearchSourceDetailResponse(**summary.model_dump(), content=snapshot.content)
 
     def sandbox_output_path(storage_key: str) -> Path:
         root = resolved_settings.sandbox_output_root.resolve()

@@ -45,6 +45,20 @@ export type Citation = {
   source_hash: string;
 };
 
+export type ResearchSource = {
+  id: string;
+  ordinal: number;
+  title: string;
+  url: string;
+  content_kind: string;
+  captured_at: string;
+  content_preview: string;
+};
+
+export type ResearchSourceDetail = ResearchSource & {
+  content: string;
+};
+
 export type EvidenceCheck = {
   id: string;
   claim: string;

@@ -7,6 +7,7 @@ from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import BudgetExceededError
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
+from deep_researcher.web_search import DisabledWebSearchGateway
 from fastapi.testclient import TestClient
 
 
@@ -214,7 +215,11 @@ def test_one_researcher_branch_failure_keeps_other_work_and_marks_evidence_insuf
         object_store_root=tmp_path / "objects",
     )
     graph_runner = ResearchGraphRunner(researcher_gateway=OneBranchFailureResearcher())
-    with running_worker_client(settings, graph_runner=graph_runner) as client:
+    with running_worker_client(
+        settings,
+        graph_runner=graph_runner,
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
         headers = register(client)
         conversation_id = create_conversation(client, headers)
         run = client.post(
@@ -245,7 +250,9 @@ def test_reconnecting_stream_replays_only_events_after_last_event_id(tmp_path) -
         object_store_root=tmp_path / "objects",
     )
 
-    with running_worker_client(settings) as client:
+    with running_worker_client(
+        settings, web_search_gateway=DisabledWebSearchGateway()
+    ) as client:
         headers = register(client)
         conversation_id = create_conversation(client, headers)
         created = client.post(

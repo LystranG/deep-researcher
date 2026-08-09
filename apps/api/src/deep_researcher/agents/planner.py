@@ -62,7 +62,6 @@ def plan(question: str) -> PlannerOutput:
         ]
     if (
         any(keyword in question for keyword in ("计算", "绘图", "数据分析", "算一下"))
-        or any(char.isdigit() for char in question)
     ):
         tasks.append(
             {

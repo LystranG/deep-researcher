@@ -22,6 +22,7 @@ class AnswerContext:
     memory: str | None = None
     skills: tuple[str, ...] = ()
     cancellation_token: CancellationToken | None = None
+    evidences: tuple[str, ...] = ()
 
 
 class ModelGateway(Protocol):
@@ -36,10 +37,11 @@ class ExtractiveModelGateway:
     def stream_answer(self, context: AnswerContext) -> Iterator[str]:
         if context.cancellation_token is not None:
             context.cancellation_token.raise_if_cancelled()
-        if "source-comparison" in context.skills and context.evidence is None:
+        evidence = context.evidences[0] if context.evidences else context.evidence
+        if "source-comparison" in context.skills and evidence is None:
             yield "来源比较：当前没有可定位资料，无法完成多来源对照。"
-        elif context.evidence is not None:
-            yield f"根据资料：{context.evidence} [1]"
+        elif evidence is not None:
+            yield f"根据资料：{evidence} [1]"
         elif context.correction is not None:
             yield f"根据当前会话中的纠正：{context.correction}"
         elif context.memory is not None:
@@ -126,7 +128,14 @@ class LiteLLMModelGateway:
         self._last_usage = None
         if context.cancellation_token is not None:
             context.cancellation_token.raise_if_cancelled()
-        evidence_block = context.evidence or "没有检索到可引用证据"
+        evidence_block = (
+            "\n\n".join(
+                f"证据 [{index}]：{evidence}"
+                for index, evidence in enumerate(context.evidences, start=1)
+            )
+            if context.evidences
+            else context.evidence or "没有检索到可引用证据"
+        )
         correction_block = context.correction or "没有相关会话纠正"
         memory_block = context.memory or "没有可用长期记忆"
         skill_block = ", ".join(context.skills) or "无"
@@ -134,7 +143,7 @@ class LiteLLMModelGateway:
 
 成功标准：
 - 只能把下列证据和会话纠正当作已知事实
-- 使用证据中的事实时，把 [1] 紧跟在对应表述后
+- 使用证据中的事实时，把对应的 [n] 紧跟在表述后
 - 没有证据时明确说明证据不足，不编造来源
 - 不输出思维链、工具过程或不存在的引用编号
 
@@ -142,7 +151,8 @@ class LiteLLMModelGateway:
 会话纠正：{correction_block}
 长期记忆：{memory_block}
 已启用 Skill：{skill_block}
-证据 [1]：{evidence_block}
+可用证据：
+{evidence_block}
 """
         from litellm import acompletion
 
