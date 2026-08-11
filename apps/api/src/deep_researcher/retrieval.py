@@ -16,6 +16,7 @@ from deep_researcher.models import (
     Document,
     DocumentVersion,
     Memory,
+    ResearchRecord,
     SourceChunk,
 )
 
@@ -100,6 +101,20 @@ class MemoryRetrievalAdapter(Protocol):
         workspace_id: UUID,
         user_id: UUID,
         conversation_id: UUID,
+        query: str,
+        query_embedding: tuple[float, ...],
+        limit: int,
+    ) -> list[RetrievalCandidate]: ...
+
+
+class ResearchRecordRetrievalAdapter(Protocol):
+    """按 Workspace 范围召回可跨会话复用的研究记录"""
+
+    def recall(
+        self,
+        session: Session,
+        *,
+        workspace_id: UUID,
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
@@ -426,6 +441,87 @@ class PostgresMemoryRetrievalAdapter:
         )
 
 
+class PostgresResearchRecordRetrievalAdapter:
+    """执行 ResearchRecord 状态过滤、全文与 exact pgvector 召回"""
+
+    def recall(
+        self,
+        session: Session,
+        *,
+        workspace_id: UUID,
+        query: str,
+        query_embedding: tuple[float, ...],
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """召回 Workspace 中 ready 的已核验或争议研究记录"""
+        if limit <= 0:
+            return []
+        eligible = self._eligible_query(workspace_id=workspace_id)
+        if session.bind is None or session.bind.dialect.name != "postgresql":
+            records = session.scalars(
+                eligible.order_by(ResearchRecord.created_at).limit(limit)
+            ).all()
+            return [self._candidate(record) for record in records]
+
+        lexical_query = func.websearch_to_tsquery("simple", query)
+        lexical_rank = func.ts_rank_cd(
+            func.to_tsvector("simple", ResearchRecord.claim_text), lexical_query
+        )
+        lexical_rows = session.execute(
+            eligible.where(
+                func.to_tsvector("simple", ResearchRecord.claim_text).op("@@")(
+                    lexical_query
+                )
+            )
+            .add_columns(lexical_rank.label("lexical_rank"))
+            .order_by(desc(lexical_rank), ResearchRecord.created_at)
+            .limit(limit)
+        ).all()
+        vector_distance = ResearchRecord.embedding.cosine_distance(list(query_embedding))
+        vector_rows = session.execute(
+            eligible.where(ResearchRecord.embedding.is_not(None))
+            .add_columns(vector_distance.label("vector_distance"))
+            .order_by(vector_distance, ResearchRecord.created_at)
+            .limit(limit)
+        ).all()
+        candidates: dict[str, RetrievalCandidate] = {}
+        for rank, row in enumerate(lexical_rows, start=1):
+            record = row[0]
+            candidates.setdefault(str(record.id), self._candidate(record))
+            candidates[str(record.id)].metadata["lexical_rank"] = str(rank)
+        for rank, row in enumerate(vector_rows, start=1):
+            record = row[0]
+            candidates.setdefault(str(record.id), self._candidate(record))
+            candidates[str(record.id)].metadata["vector_rank"] = str(rank)
+        return list(candidates.values())
+
+    @staticmethod
+    def _eligible_query(*, workspace_id: UUID) -> Any:
+        """构建空间、索引和生命周期过滤后的 ResearchRecord 查询"""
+        return select(ResearchRecord).where(
+            ResearchRecord.workspace_id == workspace_id,
+            ResearchRecord.status.in_({"verified", "disputed"}),
+            ResearchRecord.embedding_status == "ready",
+            ResearchRecord.deleted_at.is_(None),
+        )
+
+    @staticmethod
+    def _candidate(record: ResearchRecord) -> RetrievalCandidate:
+        """将有效 ResearchRecord 转成检索候选"""
+        return RetrievalCandidate(
+            candidate_id=str(record.id),
+            text=record.claim_text,
+            source_kind="research_record",
+            content_hash=record.content_hash,
+            embedding=tuple(float(value) for value in (record.embedding or [])),
+            metadata={
+                "record_key": record.record_key,
+                "version": str(record.version),
+                "status": record.status,
+            },
+        )
+
+
 class LiteLLMRerankGateway:
     """通过 LiteLLM 调用 Qwen 或其他兼容 Provider 的 Rerank Adapter"""
 
@@ -463,12 +559,14 @@ class HybridRetrieval:
         source_chunk_adapter: SourceChunkRetrievalAdapter | None = None,
         conversation_segment_adapter: ConversationSegmentRetrievalAdapter | None = None,
         memory_adapter: MemoryRetrievalAdapter | None = None,
+        research_record_adapter: ResearchRecordRetrievalAdapter | None = None,
     ) -> None:
         self._rerank_gateway = rerank_gateway
         self._rrf_k = rrf_k
         self._source_chunk_adapter = source_chunk_adapter
         self._conversation_segment_adapter = conversation_segment_adapter
         self._memory_adapter = memory_adapter
+        self._research_record_adapter = research_record_adapter
 
     def recall_source_chunks(
         self,
@@ -533,6 +631,26 @@ class HybridRetrieval:
             workspace_id=workspace_id,
             user_id=user_id,
             conversation_id=conversation_id,
+            query=query,
+            query_embedding=query_embedding,
+            limit=limit,
+        )
+
+    def recall_research_records(
+        self,
+        session: Session,
+        *,
+        workspace_id: UUID,
+        query: str,
+        query_embedding: tuple[float, ...],
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """召回当前 Workspace 可跨会话复用的研究记录"""
+        if self._research_record_adapter is None:
+            return []
+        return self._research_record_adapter.recall(
+            session,
+            workspace_id=workspace_id,
             query=query,
             query_embedding=query_embedding,
             limit=limit,

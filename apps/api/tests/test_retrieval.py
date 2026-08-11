@@ -1,5 +1,15 @@
+from datetime import UTC, datetime
+from uuid import UUID
+
+import deep_researcher.retrieval as retrieval_module
 import pytest
+from deep_researcher.app import create_app
+from deep_researcher.model_gateway import ExtractiveModelGateway
+from deep_researcher.models import ResearchRecord
 from deep_researcher.retrieval import HybridRetrieval, RetrievalCandidate
+from deep_researcher.settings import Settings
+from deep_researcher.web_search import DisabledWebSearchGateway
+from fastapi.testclient import TestClient
 
 
 class FixedRerankGateway:
@@ -77,3 +87,80 @@ def test_hybrid_retrieval_exposes_rerank_failure() -> None:
             limit=1,
             query_embedding=(1.0, 0.0),
         )
+
+
+def test_research_record_recall_filters_workspace_index_and_lifecycle(tmp_path) -> None:
+    """验证研究记录召回先执行空间、索引和生命周期过滤"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    )
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "retrieval-records@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = UUID(
+            client.post(
+                "/api/v1/workspaces", headers=headers, json={"name": "目标空间"}
+            ).json()["id"]
+        )
+        other_workspace_id = UUID(
+            client.post(
+                "/api/v1/workspaces", headers=headers, json={"name": "隔离空间"}
+            ).json()["id"]
+        )
+        now = datetime.now(UTC)
+        records = [
+            (workspace_id, "verified", "ready", None, "可复用结论 VERIFIED-1"),
+            (workspace_id, "disputed", "ready", None, "冲突结论 DISPUTED-2"),
+            (workspace_id, "verified", "pending", None, "未索引结论 PENDING-3"),
+            (workspace_id, "superseded", "ready", None, "旧版结论 OLD-4"),
+            (workspace_id, "verified", "ready", now, "已删除结论 DELETED-5"),
+            (other_workspace_id, "verified", "ready", None, "跨空间结论 OTHER-6"),
+        ]
+        with client.app.state.session_factory.begin() as session:
+            for index, (scope_id, status, embedding_status, deleted_at, text) in enumerate(
+                records, start=1
+            ):
+                session.add(
+                    ResearchRecord(
+                        workspace_id=scope_id,
+                        record_key=f"record-{index}",
+                        claim_text=text,
+                        status=status,
+                        content_hash=f"hash-{index}",
+                        evidence_refs=[],
+                        embedding=[1.0, float(index)],
+                        embedding_model="test-record-embedding-v1",
+                        embedding_dimensions=2,
+                        embedding_status=embedding_status,
+                        indexed_at=now,
+                        deleted_at=deleted_at,
+                    )
+                )
+
+        retrieval = HybridRetrieval(
+            FixedRerankGateway([]),
+            research_record_adapter=retrieval_module.PostgresResearchRecordRetrievalAdapter(),
+        )
+        with client.app.state.session_factory() as session:
+            candidates = retrieval.recall_research_records(
+                session,
+                workspace_id=workspace_id,
+                query="结论",
+                query_embedding=(1.0, 1.0),
+                limit=10,
+            )
+
+    assert {candidate.text for candidate in candidates} == {
+        "可复用结论 VERIFIED-1",
+        "冲突结论 DISPUTED-2",
+    }
+    assert {candidate.source_kind for candidate in candidates} == {"research_record"}

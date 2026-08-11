@@ -83,6 +83,7 @@ from deep_researcher.retrieval import (
     LiteLLMRerankGateway,
     PostgresConversationSegmentRetrievalAdapter,
     PostgresMemoryRetrievalAdapter,
+    PostgresResearchRecordRetrievalAdapter,
     PostgresSourceChunkRetrievalAdapter,
     RerankGateway,
 )
@@ -604,6 +605,7 @@ def create_app(
             source_chunk_adapter=PostgresSourceChunkRetrievalAdapter(),
             conversation_segment_adapter=PostgresConversationSegmentRetrievalAdapter(),
             memory_adapter=PostgresMemoryRetrievalAdapter(),
+            research_record_adapter=PostgresResearchRecordRetrievalAdapter(),
         )
         if resolved_rerank_gateway
         else None
