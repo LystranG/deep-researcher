@@ -83,6 +83,7 @@ class ResearchCoordinator:
         embedding_gateway: EmbeddingGateway | None = None,
         retrieval: HybridRetrieval | None = None,
         conversation_segment_submitter: Callable[[UUID], object] | None = None,
+        research_record_submitter: Callable[[UUID], object] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._sequence_lock = Lock()
@@ -103,6 +104,7 @@ class ResearchCoordinator:
         self._embedding_gateway = embedding_gateway
         self._retrieval = retrieval
         self._conversation_segment_submitter = conversation_segment_submitter
+        self._research_record_submitter = research_record_submitter
 
     def execute_run(self, run_id: UUID, *, lease_owner: str | None = None) -> None:
         """执行持有有效租约的研究运行"""
@@ -255,6 +257,7 @@ class ResearchCoordinator:
                 )
             citation_drafts = graph_state["citation_drafts"]
             completed_conversation_id: UUID | None = None
+            completed_research_record_id: UUID | None = None
 
             with self._sequence_lock, self._session_factory.begin() as session:
                 run = session.scalar(
@@ -331,6 +334,8 @@ class ResearchCoordinator:
                             else "supported"
                         ),
                     )
+                    if research_record is not None:
+                        completed_research_record_id = research_record.id
                     self._finalize_ledger(
                         session,
                         run,
@@ -379,6 +384,11 @@ class ResearchCoordinator:
                 and self._conversation_segment_submitter is not None
             ):
                 self._conversation_segment_submitter(completed_conversation_id)
+            if (
+                completed_research_record_id is not None
+                and self._research_record_submitter is not None
+            ):
+                self._research_record_submitter(completed_research_record_id)
         except RunCancelledError:
             self._cancel(run_id, lease_owner=lease_owner)
         except Exception as exc:

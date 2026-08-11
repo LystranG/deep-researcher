@@ -9,7 +9,14 @@ from pypdf import PdfReader
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from deep_researcher.models import Attachment, ConversationSegment, Memory, Message, SourceChunk
+from deep_researcher.models import (
+    Attachment,
+    ConversationSegment,
+    Memory,
+    Message,
+    ResearchRecord,
+    SourceChunk,
+)
 from deep_researcher.retrieval import EmbeddingGateway
 from deep_researcher.storage import LocalObjectStore
 
@@ -330,3 +337,53 @@ class MemoryIndexer:
                 memory.embedding_status = "ready"
                 memory.embedding_error = None
                 memory.indexed_at = indexed_at
+
+
+class ResearchRecordIndexer:
+    """异步为可复用 ResearchRecord 生成检索 embedding"""
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        embedding_gateway: EmbeddingGateway | None = None,
+    ) -> None:
+        """初始化 ResearchRecord 索引处理器"""
+        self._session_factory = session_factory
+        self._embedding_gateway = embedding_gateway
+
+    def process(self, record_id: UUID) -> None:
+        """索引指定的未删除且可检索 ResearchRecord"""
+        if self._embedding_gateway is None:
+            return
+        with self._session_factory.begin() as session:
+            record = session.scalar(
+                select(ResearchRecord).where(
+                    ResearchRecord.id == record_id,
+                    ResearchRecord.status.in_({"verified", "disputed"}),
+                    ResearchRecord.deleted_at.is_(None),
+                    ResearchRecord.embedding_status.in_({"pending", "failed"}),
+                )
+            )
+            if record is None:
+                return
+            try:
+                embeddings = self._embedding_gateway.embed_documents([record.claim_text])
+                if len(embeddings) != 1:
+                    raise ValueError("ResearchRecord embedding 返回数量不一致")
+                embedding = embeddings[0]
+                if not embedding:
+                    raise ValueError("ResearchRecord embedding 维度无效")
+            except Exception as exc:
+                record.embedding_status = "failed"
+                record.embedding_error = (
+                    str(exc)[:500]
+                    if isinstance(exc, ValueError)
+                    else "ResearchRecord embedding 失败"
+                )
+                return
+            record.embedding = list(embedding)
+            record.embedding_model = self._embedding_gateway.model_name
+            record.embedding_dimensions = len(embedding)
+            record.embedding_status = "ready"
+            record.embedding_error = None
+            record.indexed_at = datetime.now(UTC)

@@ -26,6 +26,7 @@ from deep_researcher.document_processor import (
     ConversationSegmentProcessor,
     DocumentProcessor,
     MemoryIndexer,
+    ResearchRecordIndexer,
 )
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.mcp_adapter import LocalTrustedHttpMcpAdapter
@@ -314,6 +315,9 @@ class ResearchRecordResponse(BaseModel):
     version: int
     claim_text: str
     status: str
+    embedding_model: str | None
+    embedding_status: str
+    embedding_error: str | None
     evidence: list[ResearchRecordEvidenceResponse]
 
 
@@ -639,6 +643,9 @@ def create_app(
         conversation_segment_submitter=lambda conversation_id: file_executor.submit(
             conversation_segment_processor.process, conversation_id
         ),
+        research_record_submitter=lambda record_id: file_executor.submit(
+            research_record_indexer.process, record_id
+        ),
     )
     object_store = LocalObjectStore(resolved_settings.object_store_root)
     document_processor = DocumentProcessor(
@@ -651,6 +658,10 @@ def create_app(
         embedding_gateway=resolved_embedding_gateway,
     )
     memory_indexer = MemoryIndexer(
+        session_factory,
+        embedding_gateway=resolved_embedding_gateway,
+    )
+    research_record_indexer = ResearchRecordIndexer(
         session_factory,
         embedding_gateway=resolved_embedding_gateway,
     )
@@ -2085,6 +2096,9 @@ def create_app(
                     version=record.version,
                     claim_text=record.claim_text,
                     status=record.status,
+                    embedding_model=record.embedding_model,
+                    embedding_status=record.embedding_status,
+                    embedding_error=record.embedding_error,
                     evidence=[
                         ResearchRecordEvidenceResponse(
                             id=str(span.id),
