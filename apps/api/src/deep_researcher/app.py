@@ -71,6 +71,7 @@ from deep_researcher.models import (
     VerificationClaim,
     VerificationEvidence,
     VerificationJob,
+    WebAcquisitionAttempt,
     Workspace,
     WorkspaceMcpGrant,
     WorkspaceMember,
@@ -105,7 +106,12 @@ from deep_researcher.tool_execution import (
     ToolApprovalError,
     ToolExecutionService,
 )
-from deep_researcher.web_page import HttpWebPageGateway, WebPageGateway
+from deep_researcher.web_page import (
+    HttpWebPageGateway,
+    JinaReaderWebPageAdapter,
+    WebAcquisition,
+    WebAcquisitionGateway,
+)
 from deep_researcher.web_search import WebSearchGateway, build_web_search_gateway
 from deep_researcher.worker import RunWorker
 
@@ -344,6 +350,23 @@ class CitationListResponse(BaseModel):
     items: list[CitationResponse]
 
 
+class WebAcquisitionAttemptResponse(BaseModel):
+    adapter_id: str
+    adapter_version: str
+    requested_url: str
+    final_url: str | None
+    status: str
+    http_status: int | None
+    content_type: str | None
+    warning_category: str | None
+    error_category: str | None
+    retryable: bool
+    completeness: str
+    truncated: bool
+    content_hash: str | None
+    selected_for_snapshot: bool
+
+
 class ResearchSourceResponse(BaseModel):
     id: str
     ordinal: int
@@ -352,6 +375,8 @@ class ResearchSourceResponse(BaseModel):
     content_kind: str
     captured_at: datetime
     content_preview: str
+    content_hash: str
+    acquisition_attempts: list[WebAcquisitionAttemptResponse]
 
 
 class ResearchSourceListResponse(BaseModel):
@@ -553,7 +578,7 @@ def create_app(
     *,
     model_gateway: ModelGateway | None = None,
     web_search_gateway: WebSearchGateway | None = None,
-    web_page_gateway: WebPageGateway | None = None,
+    web_page_gateway: WebAcquisitionGateway | None = None,
     graph_runner: ResearchGraphRunner | None = None,
     mcp_gateway: McpGateway | None = None,
     embedding_gateway: EmbeddingGateway | None = None,
@@ -572,7 +597,12 @@ def create_app(
     resolved_web_search_gateway = web_search_gateway or build_web_search_gateway(
         api_key=resolved_settings.brave_search_api_key
     )
-    resolved_web_page_gateway = web_page_gateway or HttpWebPageGateway()
+    resolved_web_page_gateway = web_page_gateway or WebAcquisition(
+            jina_reader=JinaReaderWebPageAdapter(
+                api_key=resolved_settings.jina_reader_api_key
+            ),
+            local_reader=HttpWebPageGateway(),
+    )
     resolved_embedding_gateway = embedding_gateway
     resolved_rerank_gateway = rerank_gateway
     retrieval_configured = any(
@@ -2736,8 +2766,11 @@ def create_app(
             raise HTTPException(status_code=404, detail="研究运行不存在")
         return run
 
-    def research_source_response(snapshot: SourceSnapshot) -> ResearchSourceResponse:
-        """将运行来源快照转换为可浏览摘要"""
+    def research_source_response(
+        snapshot: SourceSnapshot,
+        attempts: list[WebAcquisitionAttempt],
+    ) -> ResearchSourceResponse:
+        """将来源快照及正文获取尝试转换为可浏览摘要"""
         return ResearchSourceResponse(
             id=str(snapshot.id),
             ordinal=snapshot.ordinal,
@@ -2746,6 +2779,26 @@ def create_app(
             content_kind=snapshot.content_kind,
             captured_at=snapshot.captured_at,
             content_preview=snapshot.content[:400],
+            content_hash=snapshot.content_hash,
+            acquisition_attempts=[
+                WebAcquisitionAttemptResponse(
+                    adapter_id=attempt.adapter_id,
+                    adapter_version=attempt.adapter_version,
+                    requested_url=attempt.requested_url,
+                    final_url=attempt.final_url,
+                    status=attempt.status,
+                    http_status=attempt.http_status,
+                    content_type=attempt.content_type,
+                    warning_category=attempt.warning_category,
+                    error_category=attempt.error_category,
+                    retryable=attempt.retryable,
+                    completeness=attempt.completeness,
+                    truncated=attempt.truncated,
+                    content_hash=attempt.content_hash,
+                    selected_for_snapshot=attempt.source_snapshot_id == snapshot.id,
+                )
+                for attempt in attempts
+            ],
         )
 
     @app.get("/api/v1/runs/{run_id}/sources", response_model=ResearchSourceListResponse)
@@ -2761,8 +2814,26 @@ def create_app(
             .where(SourceSnapshot.run_id == run.id, SourceSnapshot.invalidated_at.is_(None))
             .order_by(SourceSnapshot.ordinal, SourceSnapshot.captured_at)
         ).all()
+        attempts = session.scalars(
+            select(WebAcquisitionAttempt)
+            .where(WebAcquisitionAttempt.run_id == run.id)
+            .order_by(
+                WebAcquisitionAttempt.source_ordinal,
+                WebAcquisitionAttempt.attempt_ordinal,
+            )
+        ).all()
         return ResearchSourceListResponse(
-            items=[research_source_response(snapshot) for snapshot in snapshots]
+            items=[
+                research_source_response(
+                    snapshot,
+                    [
+                        attempt
+                        for attempt in attempts
+                        if attempt.source_ordinal == snapshot.ordinal
+                    ],
+                )
+                for snapshot in snapshots
+            ]
         )
 
     @app.get("/api/v1/sources/{source_id}", response_model=ResearchSourceDetailResponse)
@@ -2776,7 +2847,15 @@ def create_app(
         if snapshot is None:
             raise HTTPException(status_code=404, detail="研究来源不存在")
         accessible_run(session, user, snapshot.run_id)
-        summary = research_source_response(snapshot)
+        attempts = session.scalars(
+            select(WebAcquisitionAttempt)
+            .where(
+                WebAcquisitionAttempt.run_id == snapshot.run_id,
+                WebAcquisitionAttempt.source_ordinal == snapshot.ordinal,
+            )
+            .order_by(WebAcquisitionAttempt.attempt_ordinal)
+        ).all()
+        summary = research_source_response(snapshot, list(attempts))
         return ResearchSourceDetailResponse(**summary.model_dump(), content=snapshot.content)
 
     def sandbox_output_path(storage_key: str) -> Path:

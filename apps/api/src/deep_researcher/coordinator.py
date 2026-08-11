@@ -42,6 +42,7 @@ from deep_researcher.models import (
     SourceSnapshot,
     StopDecision,
     Todo,
+    WebAcquisitionAttempt,
     WorkspaceSkillGrant,
 )
 from deep_researcher.quota import QuotaService
@@ -57,7 +58,7 @@ from deep_researcher.retrieval import (
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
 from deep_researcher.tool_execution import ToolExecutionService
-from deep_researcher.web_page import WebPageGateway
+from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
 from deep_researcher.web_search import SearchResult, SearchUnavailableError, WebSearchGateway
 
 
@@ -70,7 +71,7 @@ class ResearchCoordinator:
         *,
         model_gateway: ModelGateway,
         web_search_gateway: WebSearchGateway,
-        web_page_gateway: WebPageGateway,
+        web_page_gateway: WebAcquisitionGateway,
         quota_service: QuotaService,
         tool_execution: ToolExecutionService,
         run_token_budget: int,
@@ -91,7 +92,7 @@ class ResearchCoordinator:
         self._projector = RunEventProjector(self._event_log)
         self._model_gateway = model_gateway
         self._web_search_gateway = web_search_gateway
-        self._web_page_gateway = web_page_gateway
+        self._web_acquisition = web_page_gateway
         self._quota_service = quota_service
         self._tool_execution = tool_execution
         self._run_token_budget = run_token_budget
@@ -1198,12 +1199,15 @@ class ResearchCoordinator:
             )
             return []
 
-        prepared: list[tuple[int, SearchResult, object | None]] = []
+        prepared: list[tuple[int, SearchResult, WebAcquisitionResult | None]] = []
         for ordinal, result in enumerate(results[:5], start=1):
-            page: object | None = None
+            acquisition: WebAcquisitionResult | None = None
             if ordinal <= 3:
-                page = self._web_page_gateway.fetch(result["url"])
-            prepared.append((ordinal, result, page))
+                acquisition = self._web_acquisition.acquire(
+                    result["url"],
+                    should_stop=lambda: self._is_cancel_requested(run_id, lease_owner),
+                )
+            prepared.append((ordinal, result, acquisition))
 
         chunks: list[SourceChunk] = []
         discovered: list[dict[str, object]] = []
@@ -1211,16 +1215,22 @@ class ResearchCoordinator:
             run = session.get(ResearchRun, run_id)
             if run is None or run.cancel_requested_at is not None:
                 return []
-            for ordinal, result, page in prepared:
-                page_data = page if isinstance(page, dict) else None
-                page_content = (
-                    str(page_data.get("content", "")) if page_data is not None else ""
-                )
-                page_title = str(page_data.get("title", "")) if page_data is not None else ""
+            ledger = session.scalar(
+                select(ResearchLedger).where(ResearchLedger.run_id == run.id)
+            )
+            for ordinal, result, acquisition in prepared:
+                selected = acquisition.selected if acquisition is not None else None
+                page_content = selected.content if selected is not None else ""
+                page_title = selected.title if selected is not None else ""
                 content_kind = "web_page" if page_content else "search_snippet"
                 content = page_content or result["snippet"]
                 title = page_title or result["title"]
                 content_hash = hashlib.sha256(content.encode()).hexdigest()
+                source_url = (
+                    selected.final_url
+                    if selected is not None and selected.final_url is not None
+                    else result["url"]
+                )
                 snapshot = SourceSnapshot(
                     workspace_id=run.workspace_id,
                     run_id=run.id,
@@ -1228,12 +1238,51 @@ class ResearchCoordinator:
                     content_kind=content_kind,
                     ordinal=ordinal,
                     title=title,
-                    url=result["url"],
+                    url=source_url,
                     content=content,
                     content_hash=content_hash,
                 )
                 session.add(snapshot)
                 session.flush()
+                if acquisition is not None:
+                    for attempt_ordinal, attempt in enumerate(acquisition.attempts, start=1):
+                        session.add(
+                            WebAcquisitionAttempt(
+                                workspace_id=run.workspace_id,
+                                run_id=run.id,
+                                source_snapshot_id=(
+                                    snapshot.id if attempt is selected else None
+                                ),
+                                source_ordinal=ordinal,
+                                attempt_ordinal=attempt_ordinal,
+                                adapter_id=attempt.adapter_id,
+                                adapter_version=attempt.adapter_version,
+                                requested_url=attempt.requested_url,
+                                final_url=attempt.final_url,
+                                status=attempt.status,
+                                http_status=attempt.http_status,
+                                content_type=attempt.content_type,
+                                warning_category=attempt.warning_category,
+                                error_category=attempt.error_category,
+                                retryable=attempt.retryable,
+                                completeness=attempt.completeness,
+                                truncated=attempt.truncated,
+                                content_hash=attempt.content_hash,
+                            )
+                        )
+                    if acquisition.selected is None and acquisition.attempts and ledger is not None:
+                        failure_summary = ", ".join(
+                            f"{attempt.adapter_id}={attempt.error_category or attempt.status}"
+                            for attempt in acquisition.attempts
+                        )
+                        session.add(
+                            EvidenceGap(
+                                workspace_id=run.workspace_id,
+                                ledger_id=ledger.id,
+                                description=f"网页正文获取失败：{failure_summary}",
+                                status="open",
+                            )
+                        )
                 if content_kind == "web_page":
                     chunk = SourceChunk(
                         workspace_id=run.workspace_id,
@@ -1256,7 +1305,7 @@ class ResearchCoordinator:
                         "source_id": str(snapshot.id),
                         "ordinal": ordinal,
                         "title": title,
-                        "url": result["url"],
+                        "url": source_url,
                         "content_kind": content_kind,
                     }
                 )

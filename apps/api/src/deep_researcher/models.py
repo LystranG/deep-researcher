@@ -739,6 +739,42 @@ class SourceSnapshot(Base):
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class WebAcquisitionAttempt(Base):
+    """保存一次网页正文 Adapter 获取尝试的审计事实"""
+
+    __tablename__ = "web_acquisition_attempts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "source_ordinal", "attempt_ordinal"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    source_snapshot_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_snapshots.id", ondelete="SET NULL"), index=True, default=None
+    )
+    source_ordinal: Mapped[int] = mapped_column(Integer)
+    attempt_ordinal: Mapped[int] = mapped_column(Integer)
+    adapter_id: Mapped[str] = mapped_column(String(100))
+    adapter_version: Mapped[str] = mapped_column(String(100))
+    requested_url: Mapped[str] = mapped_column(String(4000))
+    final_url: Mapped[str | None] = mapped_column(String(4000), default=None)
+    status: Mapped[str] = mapped_column(String(32))
+    http_status: Mapped[int | None] = mapped_column(Integer, default=None)
+    content_type: Mapped[str | None] = mapped_column(String(200), default=None)
+    warning_category: Mapped[str | None] = mapped_column(String(100), default=None)
+    error_category: Mapped[str | None] = mapped_column(String(100), default=None)
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False)
+    completeness: Mapped[str] = mapped_column(String(32), default="none")
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    content_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Citation(Base):
     __tablename__ = "citations"
     __table_args__ = (UniqueConstraint("message_id", "label"),)

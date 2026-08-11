@@ -1,13 +1,24 @@
+import hashlib
 import ipaddress
+import json
 import socket
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from html.parser import HTMLParser
-from typing import Protocol, TypedDict
+from typing import Protocol, TypedDict, cast
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
 _FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+_MUST_STOP_CATEGORIES = {
+    "cancelled",
+    "unsafe_url",
+    "policy_rejected",
+    "acl_rejected",
+    "constraint_exhausted",
+}
 
 
 class FetchedWebPage(TypedDict):
@@ -18,10 +29,275 @@ class FetchedWebPage(TypedDict):
     truncated: bool
 
 
+@dataclass(frozen=True)
+class WebPageAttempt:
+    """记录单个正文 Adapter 的规范化获取结果"""
+
+    adapter_id: str
+    adapter_version: str
+    requested_url: str
+    final_url: str | None
+    status: str
+    http_status: int | None
+    content_type: str | None
+    warning_category: str | None
+    error_category: str | None
+    retryable: bool
+    completeness: str
+    truncated: bool
+    content_hash: str | None
+    title: str | None
+    content: str | None
+    fallback_allowed: bool
+
+    @classmethod
+    def success(
+        cls,
+        *,
+        adapter_id: str,
+        adapter_version: str,
+        requested_url: str,
+        final_url: str,
+        http_status: int | None,
+        content_type: str | None,
+        title: str,
+        content: str,
+        complete: bool,
+        truncated: bool,
+        warning_category: str | None = None,
+    ) -> "WebPageAttempt":
+        """构造可持久化正文的成功尝试"""
+        return cls(
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            requested_url=requested_url,
+            final_url=final_url,
+            status="success",
+            http_status=http_status,
+            content_type=content_type,
+            warning_category=warning_category,
+            error_category=None,
+            retryable=False,
+            completeness="complete" if complete else "partial",
+            truncated=truncated,
+            content_hash=hashlib.sha256(content.encode()).hexdigest(),
+            title=title,
+            content=content,
+            fallback_allowed=False,
+        )
+
+    @classmethod
+    def failure(
+        cls,
+        *,
+        adapter_id: str,
+        adapter_version: str,
+        requested_url: str,
+        final_url: str | None = None,
+        http_status: int | None = None,
+        content_type: str | None = None,
+        error_category: str,
+        retryable: bool,
+        fallback_allowed: bool,
+        warning_category: str | None = None,
+    ) -> "WebPageAttempt":
+        """构造不产生正文快照的失败尝试"""
+        return cls(
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            requested_url=requested_url,
+            final_url=final_url,
+            status="failed",
+            http_status=http_status,
+            content_type=content_type,
+            warning_category=warning_category,
+            error_category=error_category,
+            retryable=retryable,
+            completeness="none",
+            truncated=False,
+            content_hash=None,
+            title=None,
+            content=None,
+            fallback_allowed=fallback_allowed,
+        )
+
+
+@dataclass(frozen=True)
+class WebAcquisitionResult:
+    """向调用方返回正文选择与全部 Adapter 尝试"""
+
+    selected: WebPageAttempt | None
+    attempts: tuple[WebPageAttempt, ...]
+    stopped_reason: str | None = None
+
+
 class WebPageGateway(Protocol):
     """读取单个公开网页正文的受限 Adapter"""
 
-    def fetch(self, url: str) -> FetchedWebPage | None: ...
+    def fetch(self, url: str) -> WebPageAttempt | FetchedWebPage | None: ...
+
+
+class WebAcquisitionGateway(Protocol):
+    """通过统一 Interface 获取正文与审计尝试"""
+
+    def acquire(
+        self, url: str, *, should_stop: Callable[[], bool] | None = None
+    ) -> WebAcquisitionResult: ...
+
+
+class WebAcquisition:
+    """集中执行 URL 安全校验、Jina 主读取与 Local HTTP fallback"""
+
+    def __init__(
+        self,
+        *,
+        jina_reader: WebPageGateway,
+        local_reader: WebPageGateway | None,
+        url_validator: Callable[[str], None] | None = None,
+    ) -> None:
+        """注入两个正文 Adapter 与公共 URL 校验函数"""
+        self._jina_reader = jina_reader
+        self._local_reader = local_reader
+        self._url_validator = url_validator or _validate_public_url
+
+    def acquire(
+        self, url: str, *, should_stop: Callable[[], bool] | None = None
+    ) -> WebAcquisitionResult:
+        """按安全策略选择正文并保留每次尝试"""
+        try:
+            self._url_validator(url)
+        except ValueError:
+            return WebAcquisitionResult(selected=None, attempts=(), stopped_reason="unsafe_url")
+        if should_stop is not None and should_stop():
+            return WebAcquisitionResult(selected=None, attempts=(), stopped_reason="cancelled")
+
+        jina_attempt = _normalize_attempt(
+            self._jina_reader.fetch(url),
+            adapter_id="jina_reader",
+            adapter_version="legacy",
+            requested_url=url,
+        )
+        jina_attempt = _reject_unsafe_final_url(jina_attempt, self._url_validator)
+        attempts = [jina_attempt]
+        if jina_attempt.status == "success":
+            return WebAcquisitionResult(selected=jina_attempt, attempts=tuple(attempts))
+        if (
+            jina_attempt.error_category in _MUST_STOP_CATEGORIES
+            or not jina_attempt.fallback_allowed
+            or self._local_reader is None
+        ):
+            return WebAcquisitionResult(
+                selected=None,
+                attempts=tuple(attempts),
+                stopped_reason=jina_attempt.error_category,
+            )
+        if should_stop is not None and should_stop():
+            return WebAcquisitionResult(
+                selected=None, attempts=tuple(attempts), stopped_reason="cancelled"
+            )
+        local_attempt = _normalize_attempt(
+            self._local_reader.fetch(url),
+            adapter_id="local_http",
+            adapter_version="legacy",
+            requested_url=url,
+        )
+        local_attempt = _reject_unsafe_final_url(local_attempt, self._url_validator)
+        attempts.append(local_attempt)
+        return WebAcquisitionResult(
+            selected=local_attempt if local_attempt.status == "success" else None,
+            attempts=tuple(attempts),
+            stopped_reason=(
+                None if local_attempt.status == "success" else local_attempt.error_category
+            ),
+        )
+
+
+class JinaReaderWebPageAdapter:
+    """将 Jina Hosted Reader 响应规范化为正文获取尝试"""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        client: httpx.Client | None = None,
+        adapter_version: str = "hosted-v1",
+    ) -> None:
+        """配置 Jina 凭证、HTTP 客户端和审计版本"""
+        self._api_key = api_key
+        self._client = client or httpx.Client(timeout=30.0, follow_redirects=False)
+        self._adapter_version = adapter_version
+
+    def fetch(self, url: str) -> WebPageAttempt:
+        """读取公开 URL 并隔离 Jina wire response"""
+        headers = {
+            "Accept": "application/json",
+            "X-Preset": "research",
+            "X-Markdown-Chunking": "h3",
+            "X-Retain-Images": "alt",
+            "X-Retain-Media": "none",
+            "X-Retain-Links": "text",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        try:
+            response = self._client.get(f"https://r.jina.ai/{url}", headers=headers)
+            if response.status_code >= 400:
+                return WebPageAttempt.failure(
+                    adapter_id="jina_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    content_type=response.headers.get("content-type"),
+                    error_category=_jina_error_category(response),
+                    retryable=(
+                        response.status_code in {408, 409, 429}
+                        or response.status_code >= 500
+                    ),
+                    fallback_allowed=_jina_fallback_allowed(response),
+                )
+            payload = cast(dict[str, object], response.json())
+            data = payload.get("data")
+            record = data if isinstance(data, dict) else payload
+            content = data if isinstance(data, str) else record.get("content")
+            content_text = str(content or "").strip()
+            if len(content_text) < 80:
+                return WebPageAttempt.failure(
+                    adapter_id="jina_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    content_type=_optional_string(record.get("contentType")),
+                    error_category="unusable_extraction",
+                    retryable=False,
+                    fallback_allowed=True,
+                )
+            final_url = _optional_string(record.get("url")) or url
+            title = _optional_string(record.get("title")) or urlparse(final_url).netloc
+            warning = record.get("warning") or record.get("warnings")
+            truncated = bool(record.get("truncated", False))
+            completeness = (_optional_string(record.get("completeness")) or "complete").casefold()
+            return WebPageAttempt.success(
+                adapter_id="jina_reader",
+                adapter_version=self._adapter_version,
+                requested_url=url,
+                final_url=final_url,
+                http_status=response.status_code,
+                content_type=_optional_string(record.get("contentType")) or "text/markdown",
+                title=title,
+                content=content_text,
+                complete=not truncated and completeness == "complete",
+                truncated=truncated,
+                warning_category="provider_warning" if warning else None,
+            )
+        except (httpx.HTTPError, OSError, ValueError, json.JSONDecodeError):
+            return WebPageAttempt.failure(
+                adapter_id="jina_reader",
+                adapter_version=self._adapter_version,
+                requested_url=url,
+                error_category="provider_unavailable",
+                retryable=True,
+                fallback_allowed=True,
+            )
 
 
 class _VisibleTextExtractor(HTMLParser):
@@ -70,7 +346,7 @@ class HttpWebPageGateway:
         self._max_response_bytes = max_response_bytes
         self._max_content_chars = max_content_chars
 
-    def fetch(self, url: str) -> FetchedWebPage | None:
+    def fetch(self, url: str) -> WebPageAttempt:
         """抓取公开文本网页并限制重定向与响应大小"""
         current_url = url
         try:
@@ -87,27 +363,174 @@ class HttpWebPageGateway:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         if not location:
-                            return None
+                            return WebPageAttempt.failure(
+                                adapter_id="local_http",
+                                adapter_version="stdlib-html-v1",
+                                requested_url=url,
+                                final_url=current_url,
+                                http_status=response.status_code,
+                                error_category="invalid_redirect",
+                                retryable=False,
+                                fallback_allowed=False,
+                            )
                         current_url = urljoin(current_url, location)
                         continue
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").casefold()
                     if "text/html" not in content_type and "text/plain" not in content_type:
-                        return None
+                        return WebPageAttempt.failure(
+                            adapter_id="local_http",
+                            adapter_version="stdlib-html-v1",
+                            requested_url=url,
+                            final_url=current_url,
+                            http_status=response.status_code,
+                            content_type=content_type or None,
+                            error_category="unsupported_content_type",
+                            retryable=False,
+                            fallback_allowed=False,
+                        )
                     body = _read_limited_body(response, self._max_response_bytes)
                     raw_text = body.decode(response.encoding or "utf-8", errors="replace")
                     content = _extract_content(raw_text, content_type)
                     if len(content) < 80:
-                        return None
+                        return WebPageAttempt.failure(
+                            adapter_id="local_http",
+                            adapter_version="stdlib-html-v1",
+                            requested_url=url,
+                            final_url=current_url,
+                            http_status=response.status_code,
+                            content_type=content_type,
+                            error_category="unusable_extraction",
+                            retryable=False,
+                            fallback_allowed=False,
+                        )
                     truncated = len(content) > self._max_content_chars
-                    return {
-                        "title": _extract_title(raw_text) or urlparse(current_url).netloc,
-                        "content": content[: self._max_content_chars],
-                        "truncated": truncated,
-                    }
-        except (httpx.HTTPError, OSError, ValueError):
-            return None
+                    return WebPageAttempt.success(
+                        adapter_id="local_http",
+                        adapter_version="stdlib-html-v1",
+                        requested_url=url,
+                        final_url=current_url,
+                        http_status=response.status_code,
+                        content_type=content_type,
+                        title=_extract_title(raw_text) or urlparse(current_url).netloc,
+                        content=content[: self._max_content_chars],
+                        complete=not truncated,
+                        truncated=truncated,
+                    )
+        except ValueError:
+            return WebPageAttempt.failure(
+                adapter_id="local_http",
+                adapter_version="stdlib-html-v1",
+                requested_url=url,
+                final_url=current_url,
+                error_category="unsafe_url",
+                retryable=False,
+                fallback_allowed=False,
+            )
+        except (httpx.HTTPError, OSError):
+            return WebPageAttempt.failure(
+                adapter_id="local_http",
+                adapter_version="stdlib-html-v1",
+                requested_url=url,
+                final_url=current_url,
+                error_category="network_failure",
+                retryable=True,
+                fallback_allowed=False,
+            )
+        return WebPageAttempt.failure(
+            adapter_id="local_http",
+            adapter_version="stdlib-html-v1",
+            requested_url=url,
+            final_url=current_url,
+            error_category="redirect_limit",
+            retryable=False,
+            fallback_allowed=False,
+        )
+
+
+def _normalize_attempt(
+    result: WebPageAttempt | FetchedWebPage | None,
+    *,
+    adapter_id: str,
+    adapter_version: str,
+    requested_url: str,
+) -> WebPageAttempt:
+    """兼容旧测试 Adapter 并统一为获取尝试"""
+    if isinstance(result, WebPageAttempt):
+        return result
+    if isinstance(result, dict) and result.get("content"):
+        content = str(result["content"])
+        truncated = bool(result.get("truncated", False))
+        return WebPageAttempt.success(
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            requested_url=requested_url,
+            final_url=requested_url,
+            http_status=None,
+            content_type=None,
+            title=str(result.get("title") or urlparse(requested_url).netloc),
+            content=content,
+            complete=not truncated,
+            truncated=truncated,
+        )
+    return WebPageAttempt.failure(
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+        requested_url=requested_url,
+        error_category="unusable_extraction",
+        retryable=False,
+        fallback_allowed=True,
+    )
+
+
+def _reject_unsafe_final_url(
+    attempt: WebPageAttempt,
+    validator: Callable[[str], None],
+) -> WebPageAttempt:
+    """拒绝 Adapter 成功后指向非公开地址的正文"""
+    if attempt.status != "success" or attempt.final_url is None:
+        return attempt
+    try:
+        validator(attempt.final_url)
+    except ValueError:
+        return WebPageAttempt.failure(
+            adapter_id=attempt.adapter_id,
+            adapter_version=attempt.adapter_version,
+            requested_url=attempt.requested_url,
+            final_url=attempt.final_url,
+            http_status=attempt.http_status,
+            content_type=attempt.content_type,
+            error_category="unsafe_url",
+            retryable=False,
+            fallback_allowed=False,
+            warning_category=attempt.warning_category,
+        )
+    return attempt
+
+
+def _optional_string(value: object) -> str | None:
+    """将 Provider 可选字段规范化为非空字符串"""
+    if value is None:
         return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _jina_error_category(response: httpx.Response) -> str:
+    """将 Jina 错误响应归一为稳定类别"""
+    text = response.text.casefold()
+    if "budgetexceeded" in text or response.status_code == 409:
+        return "constraint_exhausted"
+    if any(marker in text for marker in ("robots", "restricted", "authentication_required")):
+        return "access_restricted"
+    if response.status_code in {408, 429} or response.status_code >= 500:
+        return "provider_unavailable"
+    return "provider_rejected"
+
+
+def _jina_fallback_allowed(response: httpx.Response) -> bool:
+    """判断 Jina 失败后是否仍允许安全本地读取"""
+    return _jina_error_category(response) not in {"constraint_exhausted", "access_restricted"}
 
 
 def _validate_public_url(url: str) -> None:

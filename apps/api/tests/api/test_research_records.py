@@ -5,6 +5,7 @@ from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import ExtractiveModelGateway
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
+from deep_researcher.web_page import WebAcquisition
 from deep_researcher.web_search import DisabledWebSearchGateway, SearchResult
 
 
@@ -330,7 +331,11 @@ def test_research_record_recall_in_another_conversation_cites_original_web_span(
         settings,
         model_gateway=ExtractiveModelGateway(),
         web_search_gateway=ResearchRecordWebSearchGateway(),
-        web_page_gateway=ResearchRecordWebPageGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=ResearchRecordWebPageGateway(),
+            local_reader=None,
+            url_validator=lambda _: None,
+        ),
         embedding_gateway=DeterministicEmbeddingGateway(),
         rerank_gateway=StableRerankGateway(),
     ) as client:
