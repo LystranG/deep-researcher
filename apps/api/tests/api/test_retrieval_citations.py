@@ -58,6 +58,23 @@ class ConversationLeadGateway:
         yield "未召回历史会话线索"
 
 
+class EvidenceAndConversationLeadGateway:
+    """优先展示证据，否则展示召回的历史会话线索"""
+
+    def stream_answer(self, context):
+        """返回带引用的证据或明确标注的低信任线索"""
+        evidences = getattr(context, "evidences", ())
+        evidence = evidences[0] if evidences else getattr(context, "evidence", None)
+        if evidence is not None:
+            yield f"根据资料：{evidence} [1]"
+            return
+        leads = getattr(context, "conversation_leads", ())
+        if leads:
+            yield f"根据历史会话线索：{leads[0]}"
+            return
+        yield "未召回历史会话线索"
+
+
 def test_indexed_workspace_document_is_cited_from_another_conversation(tmp_path) -> None:
     """验证异步索引后的空间文档可跨会话回读并引用原文"""
     evidence = "混合检索验收编号为 VECTOR-2048。"
@@ -209,6 +226,98 @@ def test_other_conversation_is_recalled_only_as_lead_without_citation(tmp_path) 
     assert "历史会话线索" in answer
     assert "LEAD-731" in answer
     assert citations == []
+
+
+def test_private_attachment_answer_stays_out_of_workspace_retrieval(tmp_path) -> None:
+    """验证私有附件回答不会提升为研究记录或泄漏到其他会话线索"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=EvidenceAndConversationLeadGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "private-lead@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "私有附件隔离"}
+        ).json()["id"]
+        source_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "私有资料"},
+        ).json()["id"]
+        query_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "隔离验证"},
+        ).json()["id"]
+        attachment = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("private.txt", "私有验收码为 PRIVATE-887。", "text/plain")},
+        ).json()
+        for _ in range(50):
+            attachment = client.get(
+                f"/api/v1/attachments/{attachment['id']}", headers=headers
+            ).json()
+            if attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+
+        source_run = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "private-lead-source"},
+            json={"content": "私有验收码是什么？"},
+        ).json()
+        client.get(f"/api/v1/runs/{source_run['run_id']}/events", headers=headers)
+        source_answer = client.get(
+            f"/api/v1/conversations/{source_conversation_id}/messages", headers=headers
+        ).json()["items"][-1]["content"]
+        source_citations = client.get(
+            f"/api/v1/messages/{source_run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+        ready_segment = None
+        for _ in range(50):
+            with client.app.state.session_factory() as session:
+                ready_segment = session.scalar(
+                    select(ConversationSegment).where(
+                        ConversationSegment.conversation_id == UUID(source_conversation_id),
+                        ConversationSegment.embedding_status == "ready",
+                        ConversationSegment.text.contains("PRIVATE-887"),
+                    )
+                )
+            if ready_segment is not None:
+                break
+            time.sleep(0.01)
+        records = client.get(
+            f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
+        ).json()["items"]
+
+        query_run = client.post(
+            f"/api/v1/conversations/{query_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "private-lead-query"},
+            json={"content": "PRIVATE-887 是什么？"},
+        ).json()
+        client.get(f"/api/v1/runs/{query_run['run_id']}/events", headers=headers)
+        query_answer = client.get(
+            f"/api/v1/conversations/{query_conversation_id}/messages", headers=headers
+        ).json()["items"][-1]["content"]
+
+    assert "PRIVATE-887" in source_answer
+    assert source_citations
+    assert ready_segment is not None
+    assert ready_segment.visibility_scope == "conversation"
+    assert records == []
+    assert "PRIVATE-887" not in query_answer
 
 
 def test_unknown_citation_falls_back_to_frozen_evidence(tmp_path) -> None:

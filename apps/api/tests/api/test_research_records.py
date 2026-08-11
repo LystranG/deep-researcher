@@ -33,6 +33,21 @@ class StableRerankGateway:
         return [(index, 1.0 - index / 100) for index in range(min(len(documents), top_n))]
 
 
+class ResearchRecordFirstRerankGateway:
+    """优先返回 ResearchRecord 格式的候选"""
+
+    def rerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> list[tuple[int, float]]:
+        """按研究记录格式和原始顺序返回候选下标"""
+        del query
+        ranked = sorted(
+            range(len(documents)),
+            key=lambda index: (not documents[index].startswith("根据资料："), index),
+        )
+        return [(index, 1.0 - rank / 100) for rank, index in enumerate(ranked[:top_n])]
+
+
 class FailingResearchRecordEmbeddingGateway(DeterministicEmbeddingGateway):
     """让来源文档成功索引后模拟后续 embedding Provider 故障"""
 
@@ -99,6 +114,23 @@ class ContradictSecondRunGraphRunner:
         return state
 
 
+class InsufficientGraphRunner:
+    """让研究运行保留引用但返回证据不足的核验结果"""
+
+    def __init__(self) -> None:
+        """初始化确定性 Graph 委托"""
+        self._delegate = ResearchGraphRunner()
+
+    def run(self, *args, **kwargs):
+        """执行真实 Graph 并将核验结果改为证据不足"""
+        state = self._delegate.run(*args, **kwargs)
+        state["verification"] = {
+            "status": "insufficient",
+            "summary": "现有证据不足以核验结论",
+        }
+        return state
+
+
 def test_verified_research_record_becomes_searchable_after_run_commit(tmp_path) -> None:
     """验证已核验研究记录在运行提交后完成异步索引"""
     settings = Settings(
@@ -159,6 +191,64 @@ def test_verified_research_record_becomes_searchable_after_run_commit(tmp_path) 
     assert record is not None
     assert record.get("embedding_status") == "ready"
     assert record.get("embedding_model") == "test-record-embedding-v1"
+
+
+def test_insufficient_result_with_citation_is_not_promoted(tmp_path) -> None:
+    """验证证据不足的回答即使带引用也不会成为空间研究记录"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+        graph_runner=InsufficientGraphRunner(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "insufficient@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "证据不足研究"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "不足核验"},
+        ).json()["id"]
+        attachment = client.post(
+            f"/api/v1/conversations/{conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("metric.txt", "暂定指标为 MAYBE-17。", "text/plain")},
+        ).json()
+        for _ in range(50):
+            attachment = client.get(
+                f"/api/v1/attachments/{attachment['id']}", headers=headers
+            ).json()
+            if attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+        client.post(f"/api/v1/attachments/{attachment['id']}/promote", headers=headers)
+
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "insufficient-record"},
+            json={"content": "暂定指标是什么？"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        citations = client.get(
+            f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+        records = client.get(
+            f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
+        ).json()["items"]
+
+    assert citations
+    assert records == []
 
 
 def test_research_record_index_failure_preserves_verified_evidence(tmp_path) -> None:
@@ -301,6 +391,100 @@ def test_research_record_recall_in_another_conversation_cites_original_web_span(
     assert second_citations[0]["source_hash"] == first_citation["source_hash"]
 
 
+def test_research_record_from_replaced_document_version_cannot_be_cited(tmp_path) -> None:
+    """验证旧文档版本产生的研究记录不能在后续会话继续生成引用"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=ResearchRecordFirstRerankGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "stale-record@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "旧版本研究记录"}
+        ).json()["id"]
+        source_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "旧版来源"},
+        ).json()["id"]
+        reuse_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "跨会话复用"},
+        ).json()["id"]
+        attachment = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("version.txt", "旧版本编号为 LEGACY-41。", "text/plain")},
+        ).json()
+        for _ in range(50):
+            attachment = client.get(
+                f"/api/v1/attachments/{attachment['id']}", headers=headers
+            ).json()
+            if attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+        document = client.post(
+            f"/api/v1/attachments/{attachment['id']}/promote", headers=headers
+        ).json()
+
+        first_run = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "stale-record-source"},
+            json={"content": "LEGACY-41"},
+        ).json()
+        client.get(f"/api/v1/runs/{first_run['run_id']}/events", headers=headers)
+        for _ in range(50):
+            records = client.get(
+                f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
+            ).json()["items"]
+            if records and records[0]["embedding_status"] == "ready":
+                break
+            time.sleep(0.01)
+
+        client.post(
+            f"/api/v1/documents/{document['id']}/versions",
+            headers=headers,
+            files={"file": ("version.txt", "当前版本编号为 CURRENT-99。", "text/plain")},
+        )
+        fallback_attachment = client.post(
+            f"/api/v1/conversations/{reuse_conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("fallback.txt", "当前有效编号为 CURRENT-99。", "text/plain")},
+        ).json()
+        for _ in range(50):
+            fallback_attachment = client.get(
+                f"/api/v1/attachments/{fallback_attachment['id']}", headers=headers
+            ).json()
+            if fallback_attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+        second_run = client.post(
+            f"/api/v1/conversations/{reuse_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "stale-record-reuse"},
+            json={"content": "LEGACY-41"},
+        ).json()
+        client.get(f"/api/v1/runs/{second_run['run_id']}/events", headers=headers)
+        citations = client.get(
+            f"/api/v1/messages/{second_run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert len(citations) == 1
+    assert citations[0]["source_type"] == "conversation_attachment"
+    assert citations[0]["evidence_text"] == "当前有效编号为 CURRENT-99。"
+
+
 def test_new_verified_result_supersedes_record_without_changing_old_evidence(
     tmp_path,
 ) -> None:
@@ -367,6 +551,18 @@ def test_new_verified_result_supersedes_record_without_changing_old_evidence(
             json={"content": "核心指标是多少？"},
         ).json()
         client.get(f"/api/v1/runs/{second_run['run_id']}/events", headers=headers)
+
+        client.post(
+            f"/api/v1/documents/{document['id']}/versions",
+            headers=headers,
+            files={"file": ("metric.txt", "核心指标为 10。", "text/plain")},
+        )
+        third_run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "record-version-three"},
+            json={"content": "核心指标是多少？"},
+        ).json()
+        client.get(f"/api/v1/runs/{third_run['run_id']}/events", headers=headers)
         records = client.get(
             f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
         ).json()["items"]
@@ -375,14 +571,17 @@ def test_new_verified_result_supersedes_record_without_changing_old_evidence(
         ).json()
 
     assert replaced.status_code == 201
-    assert len(records) == 2
-    old_record = next(record for record in records if "10" in record["claim_text"])
-    new_record = next(record for record in records if "20" in record["claim_text"])
-    assert old_record["record_key"] == new_record["record_key"]
+    assert len(records) == 3
+    old_record = next(record for record in records if record["version"] == 1)
+    changed_record = next(record for record in records if record["version"] == 2)
+    repeated_record = next(record for record in records if record["version"] == 3)
+    assert {record["record_key"] for record in records} == {old_record["record_key"]}
     assert old_record["version"] == 1
     assert old_record["status"] == "superseded"
-    assert new_record["version"] == 2
-    assert new_record["status"] == "verified"
+    assert "20" in changed_record["claim_text"]
+    assert changed_record["status"] == "superseded"
+    assert "10" in repeated_record["claim_text"]
+    assert repeated_record["status"] == "verified"
     old_hash = hashlib.sha256("核心指标为 10。".encode()).hexdigest()
     assert old_record["evidence"][0]["source_hash"] == old_hash
     assert old_citation_after_replace["source_hash"] == old_hash

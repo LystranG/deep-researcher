@@ -5,7 +5,7 @@ import deep_researcher.retrieval as retrieval_module
 import pytest
 from deep_researcher.app import create_app
 from deep_researcher.model_gateway import ExtractiveModelGateway
-from deep_researcher.models import ResearchRecord
+from deep_researcher.models import ConversationSegment, ResearchRecord
 from deep_researcher.retrieval import HybridRetrieval, RetrievalCandidate
 from deep_researcher.settings import Settings
 from deep_researcher.web_search import DisabledWebSearchGateway
@@ -16,9 +16,11 @@ class FixedRerankGateway:
     """返回固定顺序的精排结果"""
 
     def __init__(self, order: list[int]) -> None:
+        """保存测试期望的候选下标顺序"""
         self.order = order
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        """按固定下标顺序返回确定性精排结果"""
         del query, documents
         return [(index, float(top_n - position)) for position, index in enumerate(self.order)]
 
@@ -27,11 +29,13 @@ class FailingRerankGateway:
     """模拟精排 Provider 失败"""
 
     def rerank(self, query: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        """始终抛出 Provider 不可用错误"""
         del query, documents, top_n
         raise RuntimeError("rerank provider unavailable")
 
 
 def _candidate(candidate_id: str, text: str, embedding: tuple[float, ...]) -> RetrievalCandidate:
+    """构造混合排序测试使用的候选"""
     return RetrievalCandidate(
         candidate_id=candidate_id,
         text=text,
@@ -164,3 +168,91 @@ def test_research_record_recall_filters_workspace_index_and_lifecycle(tmp_path) 
         "冲突结论 DISPUTED-2",
     }
     assert {candidate.source_kind for candidate in candidates} == {"research_record"}
+
+
+def test_conversation_segment_recall_excludes_conversation_private_content(tmp_path) -> None:
+    """验证跨会话召回只返回明确标记为空间可见的历史分段"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    )
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "segment-scope@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = UUID(
+            client.post(
+                "/api/v1/workspaces", headers=headers, json={"name": "分段隔离"}
+            ).json()["id"]
+        )
+        source_conversation_id = UUID(
+            client.post(
+                f"/api/v1/workspaces/{workspace_id}/conversations",
+                headers=headers,
+                json={"title": "历史会话"},
+            ).json()["id"]
+        )
+        query_conversation_id = UUID(
+            client.post(
+                f"/api/v1/workspaces/{workspace_id}/conversations",
+                headers=headers,
+                json={"title": "当前会话"},
+            ).json()["id"]
+        )
+        now = datetime.now(UTC)
+        with client.app.state.session_factory.begin() as session:
+            session.add_all(
+                [
+                    ConversationSegment(
+                        workspace_id=workspace_id,
+                        conversation_id=source_conversation_id,
+                        ordinal=1,
+                        text="可共享历史线索 SHARED-11",
+                        content_hash="shared-segment",
+                        visibility_scope="workspace",
+                        embedding=[1.0, 1.0],
+                        embedding_model="test-segment-v1",
+                        embedding_dimensions=2,
+                        embedding_status="ready",
+                        indexed_at=now,
+                    ),
+                    ConversationSegment(
+                        workspace_id=workspace_id,
+                        conversation_id=source_conversation_id,
+                        ordinal=2,
+                        text="私有附件线索 PRIVATE-22",
+                        content_hash="private-segment",
+                        visibility_scope="conversation",
+                        embedding=[1.0, 2.0],
+                        embedding_model="test-segment-v1",
+                        embedding_dimensions=2,
+                        embedding_status="ready",
+                        indexed_at=now,
+                    ),
+                ]
+            )
+
+        retrieval = HybridRetrieval(
+            FixedRerankGateway([]),
+            conversation_segment_adapter=(
+                retrieval_module.PostgresConversationSegmentRetrievalAdapter()
+            ),
+        )
+        with client.app.state.session_factory() as session:
+            candidates = retrieval.recall_conversation_segments(
+                session,
+                workspace_id=workspace_id,
+                conversation_id=query_conversation_id,
+                query="线索",
+                query_embedding=(1.0, 1.0),
+                limit=10,
+            )
+
+    assert {candidate.text for candidate in candidates} == {"可共享历史线索 SHARED-11"}

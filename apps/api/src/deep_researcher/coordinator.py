@@ -872,18 +872,26 @@ class ResearchCoordinator:
                 query_embedding=query_embedding,
                 limit=50,
             )
+            valid_record_sources: dict[str, FrozenSource] = {}
+            valid_record_candidates = []
+            for candidate in record_candidates:
+                frozen_source = self._frozen_research_record_source(
+                    session, run, UUID(candidate.candidate_id)
+                )
+                if frozen_source is None:
+                    continue
+                valid_record_sources[candidate.candidate_id] = frozen_source
+                valid_record_candidates.append(candidate)
             ranked_candidates = self._retrieval.rank(
                 query,
-                [*source_candidates, *record_candidates],
+                [*source_candidates, *valid_record_candidates],
                 limit=1,
                 query_embedding=query_embedding,
             )
             if ranked_candidates:
                 selected = ranked_candidates[0].candidate
                 if selected.source_kind == "research_record":
-                    return self._frozen_research_record_source(
-                        session, run, UUID(selected.candidate_id)
-                    )
+                    return valid_record_sources[selected.candidate_id]
                 selected_chunk = session.get(SourceChunk, UUID(selected.candidate_id))
                 return (
                     self._freeze_source_chunk(selected_chunk)
@@ -960,9 +968,11 @@ class ResearchCoordinator:
                     session.get(Document, version.document_id) if version is not None else None
                 )
                 if (
-                    document is None
+                    version is None
+                    or document is None
                     or document.workspace_id != run.workspace_id
                     or document.deleted_at is not None
+                    or version.version != document.current_version
                 ):
                     continue
             local_start = span.start_offset - chunk.start_offset
@@ -989,8 +999,20 @@ class ResearchCoordinator:
         verification_status: str,
     ) -> ResearchRecord | None:
         """将有精确 Citation 的已完成回答提升为不可变 Workspace Research Record"""
-        if not citations:
+        if not citations or verification_status not in {"supported", "contradicted"}:
             return None
+        for citation in citations:
+            source_chunk = session.get(SourceChunk, citation.source_chunk_id)
+            if source_chunk is None:
+                return None
+            if source_chunk.attachment_id is not None:
+                attachment = session.get(Attachment, source_chunk.attachment_id)
+                if (
+                    attachment is None
+                    or attachment.promoted_document_id is None
+                    or attachment.deleted_at is not None
+                ):
+                    return None
         content_hash = hashlib.sha256(claim_text.encode()).hexdigest()
         disputed = verification_status == "contradicted"
         claim = session.scalar(
@@ -1058,17 +1080,6 @@ class ResearchCoordinator:
                     "source_hash": span.content_hash,
                 }
             )
-        record = session.scalar(
-            select(ResearchRecord)
-            .where(
-                ResearchRecord.workspace_id == run.workspace_id,
-                ResearchRecord.record_key == record_key,
-                ResearchRecord.content_hash == content_hash,
-            )
-            .order_by(ResearchRecord.version.desc())
-        )
-        if record is not None:
-            return record
         latest_version = session.scalar(
             select(func.max(ResearchRecord.version)).where(
                 ResearchRecord.workspace_id == run.workspace_id,

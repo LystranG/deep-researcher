@@ -46,11 +46,17 @@ class EmbeddingGateway(Protocol):
     """生成文档和查询向量的 Adapter"""
 
     @property
-    def model_name(self) -> str: ...
+    def model_name(self) -> str:
+        """返回索引元数据使用的模型标识"""
+        ...
 
-    def embed_documents(self, texts: Sequence[str]) -> list[tuple[float, ...]]: ...
+    def embed_documents(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
+        """为一组文档文本生成等维向量"""
+        ...
 
-    def embed_query(self, text: str) -> tuple[float, ...]: ...
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        """为单条检索查询生成向量"""
+        ...
 
 
 class RerankGateway(Protocol):
@@ -58,7 +64,9 @@ class RerankGateway(Protocol):
 
     def rerank(
         self, query: str, documents: Sequence[str], top_n: int
-    ) -> list[tuple[int, float]]: ...
+    ) -> list[tuple[int, float]]:
+        """按查询相关性返回候选下标和分数"""
+        ...
 
 
 class SourceChunkRetrievalAdapter(Protocol):
@@ -73,7 +81,9 @@ class SourceChunkRetrievalAdapter(Protocol):
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
-    ) -> list[RetrievalCandidate]: ...
+    ) -> list[RetrievalCandidate]:
+        """召回当前 Workspace 与 Conversation 可访问的来源块"""
+        ...
 
 
 class ConversationSegmentRetrievalAdapter(Protocol):
@@ -88,7 +98,9 @@ class ConversationSegmentRetrievalAdapter(Protocol):
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
-    ) -> list[RetrievalCandidate]: ...
+    ) -> list[RetrievalCandidate]:
+        """召回当前会话之外可共享的历史消息分段"""
+        ...
 
 
 class MemoryRetrievalAdapter(Protocol):
@@ -104,7 +116,9 @@ class MemoryRetrievalAdapter(Protocol):
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
-    ) -> list[RetrievalCandidate]: ...
+    ) -> list[RetrievalCandidate]:
+        """召回调用者范围内仍有效的长期记忆"""
+        ...
 
 
 class ResearchRecordRetrievalAdapter(Protocol):
@@ -118,13 +132,16 @@ class ResearchRecordRetrievalAdapter(Protocol):
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
-    ) -> list[RetrievalCandidate]: ...
+    ) -> list[RetrievalCandidate]:
+        """召回当前 Workspace 可复用的已核验研究记录"""
+        ...
 
 
 class LiteLLMEmbeddingGateway:
     """通过 LiteLLM 直接调用配置的 embedding 模型"""
 
     def __init__(self, *, api_key: str, model: str, api_base: str | None = None) -> None:
+        """初始化 LiteLLM embedding Adapter 与 Provider 参数"""
         self._api_key = api_key
         self._model = model
         self._api_base = api_base
@@ -327,6 +344,7 @@ class PostgresConversationSegmentRetrievalAdapter:
                 ConversationSegment.workspace_id == workspace_id,
                 ConversationSegment.conversation_id != conversation_id,
                 ConversationSegment.embedding_status == "ready",
+                ConversationSegment.visibility_scope == "workspace",
                 ConversationSegment.deleted_at.is_(None),
                 Conversation.workspace_id == workspace_id,
                 Conversation.deleted_at.is_(None),
@@ -526,6 +544,7 @@ class LiteLLMRerankGateway:
     """通过 LiteLLM 调用 Qwen 或其他兼容 Provider 的 Rerank Adapter"""
 
     def __init__(self, *, api_key: str, model: str, api_base: str | None = None) -> None:
+        """初始化 LiteLLM rerank Adapter 与 Provider 参数"""
         self._api_key = api_key
         self._model = model
         self._api_base = api_base
@@ -561,6 +580,7 @@ class HybridRetrieval:
         memory_adapter: MemoryRetrievalAdapter | None = None,
         research_record_adapter: ResearchRecordRetrievalAdapter | None = None,
     ) -> None:
+        """初始化混合检索所需的精排与持久化 Adapter"""
         self._rerank_gateway = rerank_gateway
         self._rrf_k = rrf_k
         self._source_chunk_adapter = source_chunk_adapter

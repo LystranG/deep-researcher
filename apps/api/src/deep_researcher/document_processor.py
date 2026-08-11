@@ -11,9 +11,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.models import (
     Attachment,
+    Citation,
     ConversationSegment,
     Memory,
     Message,
+    MessageAttachment,
     ResearchRecord,
     SourceChunk,
 )
@@ -187,7 +189,31 @@ class ConversationSegmentProcessor:
             if not messages:
                 return
             conversation = messages[0].conversation_id
-            segment_texts: list[tuple[str, UUID, UUID]] = []
+            message_ids = [message.id for message in messages]
+            private_message_ids = set(
+                session.scalars(
+                    select(MessageAttachment.message_id)
+                    .join(Attachment, Attachment.id == MessageAttachment.attachment_id)
+                    .where(
+                        MessageAttachment.conversation_id == conversation,
+                        Attachment.promoted_document_id.is_(None),
+                        Attachment.deleted_at.is_(None),
+                    )
+                ).all()
+            )
+            private_message_ids.update(
+                session.scalars(
+                    select(Citation.message_id)
+                    .join(SourceChunk, SourceChunk.id == Citation.source_chunk_id)
+                    .join(Attachment, Attachment.id == SourceChunk.attachment_id)
+                    .where(
+                        Citation.message_id.in_(message_ids),
+                        Attachment.promoted_document_id.is_(None),
+                        Attachment.deleted_at.is_(None),
+                    )
+                ).all()
+            )
+            segment_texts: list[tuple[str, UUID, UUID, str]] = []
             current: list[Message] = []
             current_size = 0
             for message in messages:
@@ -200,6 +226,11 @@ class ConversationSegmentProcessor:
                             ),
                             current[0].id,
                             current[-1].id,
+                            (
+                                "conversation"
+                                if any(item.id in private_message_ids for item in current)
+                                else "workspace"
+                            ),
                         )
                     )
                     current = []
@@ -212,6 +243,11 @@ class ConversationSegmentProcessor:
                         "\n".join(f"{item.role}: {item.content}" for item in current),
                         current[0].id,
                         current[-1].id,
+                        (
+                            "conversation"
+                            if any(item.id in private_message_ids for item in current)
+                            else "workspace"
+                        ),
                     )
                 )
             existing = {
@@ -226,7 +262,7 @@ class ConversationSegmentProcessor:
             if self._embedding_gateway is not None:
                 try:
                     embeddings = self._embedding_gateway.embed_documents(
-                        [text for text, _, _ in segment_texts]
+                        [text for text, _, _, _ in segment_texts]
                     )
                     if len(embeddings) != len(segment_texts):
                         raise ValueError("会话分段 embedding 返回数量不一致")
@@ -241,7 +277,7 @@ class ConversationSegmentProcessor:
                     )
                     embeddings = []
                     failed_at = datetime.now(UTC)
-                    for ordinal, (text, first_id, last_id) in enumerate(
+                    for ordinal, (text, first_id, last_id, visibility_scope) in enumerate(
                         segment_texts, start=1
                     ):
                         failed_segment = existing.get(ordinal)
@@ -256,6 +292,7 @@ class ConversationSegmentProcessor:
                         failed_segment.last_message_id = last_id
                         failed_segment.text = text
                         failed_segment.content_hash = hashlib.sha256(text.encode()).hexdigest()
+                        failed_segment.visibility_scope = visibility_scope
                         failed_segment.embedding = None
                         failed_segment.embedding_model = None
                         failed_segment.embedding_dimensions = None
@@ -268,7 +305,9 @@ class ConversationSegmentProcessor:
                             stale_segment.deleted_at = failed_at
                     return
             indexed_at = datetime.now(UTC)
-            for ordinal, (text, first_id, last_id) in enumerate(segment_texts, start=1):
+            for ordinal, (text, first_id, last_id, visibility_scope) in enumerate(
+                segment_texts, start=1
+            ):
                 current_segment = existing.get(ordinal)
                 if current_segment is None:
                     current_segment = ConversationSegment(
@@ -281,6 +320,7 @@ class ConversationSegmentProcessor:
                 current_segment.last_message_id = last_id
                 current_segment.text = text
                 current_segment.content_hash = hashlib.sha256(text.encode()).hexdigest()
+                current_segment.visibility_scope = visibility_scope
                 current_segment.deleted_at = None
                 if self._embedding_gateway is None:
                     continue

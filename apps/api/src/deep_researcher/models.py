@@ -519,6 +519,7 @@ class ConversationSegment(Base):
     ordinal: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(Text)
     content_hash: Mapped[str] = mapped_column(String(64))
+    visibility_scope: Mapped[str] = mapped_column(String(32), default="workspace")
     embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), default=None)
     embedding_model: Mapped[str | None] = mapped_column(String(200), default=None)
     embedding_dimensions: Mapped[int | None] = mapped_column(Integer, default=None)
