@@ -142,15 +142,7 @@ class ResearchCoordinator:
                 )
             sources: list[FrozenSource] = []
             if evidence is not None:
-                sources.append(
-                    {
-                        "source_chunk_id": str(evidence.id),
-                        "text": evidence.text,
-                        "start_offset": evidence.start_offset,
-                        "end_offset": evidence.end_offset,
-                        "content_hash": evidence.content_hash,
-                    }
-                )
+                sources.append(evidence)
             elif conversation_lead is None and memory is None and correction is None:
                 for discovered_chunk in self._search_web(
                     run_id, question, lease_owner=lease_owner
@@ -837,7 +829,8 @@ class ResearchCoordinator:
         session: Session,
         run: ResearchRun,
         query: str,
-    ) -> SourceChunk | None:
+    ) -> FrozenSource | None:
+        """统一召回直接来源与研究记录，并冻结最终可引用的原始证据"""
         private_chunks = session.scalars(
             select(SourceChunk)
             .join(Attachment, Attachment.id == SourceChunk.attachment_id)
@@ -864,7 +857,7 @@ class ResearchCoordinator:
             candidates.setdefault(chunk.content_hash, chunk)
         if self._retrieval is not None and self._embedding_gateway is not None:
             query_embedding = self._embedding_gateway.embed_query(query)
-            retrieved_candidates = self._retrieval.recall_source_chunks(
+            source_candidates = self._retrieval.recall_source_chunks(
                 session,
                 workspace_id=run.workspace_id,
                 conversation_id=run.conversation_id,
@@ -872,14 +865,31 @@ class ResearchCoordinator:
                 query_embedding=query_embedding,
                 limit=50,
             )
+            record_candidates = self._retrieval.recall_research_records(
+                session,
+                workspace_id=run.workspace_id,
+                query=query,
+                query_embedding=query_embedding,
+                limit=50,
+            )
             ranked_candidates = self._retrieval.rank(
                 query,
-                retrieved_candidates,
+                [*source_candidates, *record_candidates],
                 limit=1,
                 query_embedding=query_embedding,
             )
             if ranked_candidates:
-                return session.get(SourceChunk, UUID(ranked_candidates[0].candidate.candidate_id))
+                selected = ranked_candidates[0].candidate
+                if selected.source_kind == "research_record":
+                    return self._frozen_research_record_source(
+                        session, run, UUID(selected.candidate_id)
+                    )
+                selected_chunk = session.get(SourceChunk, UUID(selected.candidate_id))
+                return (
+                    self._freeze_source_chunk(selected_chunk)
+                    if selected_chunk is not None
+                    else None
+                )
             return None
         lexical_ranked = sorted(
             ((self._lexical_score(query, chunk.text), chunk) for chunk in candidates.values()),
@@ -888,7 +898,85 @@ class ResearchCoordinator:
         )
         if not lexical_ranked or lexical_ranked[0][0] <= 0:
             return None
-        return lexical_ranked[0][1]
+        return self._freeze_source_chunk(lexical_ranked[0][1])
+
+    @staticmethod
+    def _freeze_source_chunk(chunk: SourceChunk) -> FrozenSource:
+        """将可访问 SourceChunk 冻结成当前运行的引用输入"""
+        return {
+            "source_chunk_id": str(chunk.id),
+            "text": chunk.text,
+            "start_offset": chunk.start_offset,
+            "end_offset": chunk.end_offset,
+            "content_hash": chunk.content_hash,
+        }
+
+    def _frozen_research_record_source(
+        self,
+        session: Session,
+        run: ResearchRun,
+        record_id: UUID,
+    ) -> FrozenSource | None:
+        """把 ResearchRecord 命中回溯为仍可访问的不可变 EvidenceSpan"""
+        record = session.get(ResearchRecord, record_id)
+        if (
+            record is None
+            or record.workspace_id != run.workspace_id
+            or record.status not in {"verified", "disputed"}
+            or record.embedding_status != "ready"
+            or record.deleted_at is not None
+        ):
+            return None
+        for evidence_ref in record.evidence_refs:
+            span_id = evidence_ref.get("evidence_span_id")
+            if span_id is None:
+                continue
+            try:
+                span = session.get(EvidenceSpan, UUID(str(span_id)))
+            except ValueError:
+                continue
+            if span is None or span.workspace_id != run.workspace_id:
+                continue
+            chunk = session.get(SourceChunk, span.source_chunk_id)
+            if (
+                chunk is None
+                or chunk.workspace_id != run.workspace_id
+                or chunk.content_hash != span.content_hash
+                or evidence_ref.get("source_hash") != span.content_hash
+            ):
+                continue
+            if chunk.attachment_id is not None:
+                attachment = session.get(Attachment, chunk.attachment_id)
+                if (
+                    attachment is None
+                    or attachment.status != "ready"
+                    or attachment.deleted_at is not None
+                    or chunk.conversation_id != run.conversation_id
+                ):
+                    continue
+            if chunk.document_version_id is not None:
+                version = session.get(DocumentVersion, chunk.document_version_id)
+                document = (
+                    session.get(Document, version.document_id) if version is not None else None
+                )
+                if (
+                    document is None
+                    or document.workspace_id != run.workspace_id
+                    or document.deleted_at is not None
+                ):
+                    continue
+            local_start = span.start_offset - chunk.start_offset
+            local_end = span.end_offset - chunk.start_offset
+            if local_start < 0 or local_end > len(chunk.text) or local_start >= local_end:
+                continue
+            return {
+                "source_chunk_id": str(chunk.id),
+                "text": chunk.text[local_start:local_end],
+                "start_offset": span.start_offset,
+                "end_offset": span.end_offset,
+                "content_hash": span.content_hash,
+            }
+        return None
 
     def _promote_research_record(
         self,

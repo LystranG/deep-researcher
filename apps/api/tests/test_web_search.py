@@ -1,5 +1,6 @@
 import httpx
 import pytest
+from deep_researcher.model_gateway import ExtractiveModelGateway
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
 from deep_researcher.web_search import (
@@ -143,6 +144,7 @@ def test_research_without_local_evidence_uses_web_snapshot_and_citation(tmp_path
     )
     with running_worker_client(
         settings,
+        model_gateway=ExtractiveModelGateway(),
         web_search_gateway=FakeWebSearchGateway(),
         web_page_gateway=SingleResultWebPageGateway(),
     ) as client:

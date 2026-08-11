@@ -5,7 +5,7 @@ from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import ExtractiveModelGateway
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
-from deep_researcher.web_search import DisabledWebSearchGateway
+from deep_researcher.web_search import DisabledWebSearchGateway, SearchResult
 
 
 class DeterministicEmbeddingGateway:
@@ -22,6 +22,17 @@ class DeterministicEmbeddingGateway:
         return (1.0, float(len(text)))
 
 
+class StableRerankGateway:
+    """按候选顺序返回稳定精排分数"""
+
+    def rerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> list[tuple[int, float]]:
+        """返回预算内的候选下标"""
+        del query
+        return [(index, 1.0 - index / 100) for index in range(min(len(documents), top_n))]
+
+
 class FailingResearchRecordEmbeddingGateway(DeterministicEmbeddingGateway):
     """让来源文档成功索引后模拟后续 embedding Provider 故障"""
 
@@ -35,6 +46,37 @@ class FailingResearchRecordEmbeddingGateway(DeterministicEmbeddingGateway):
         if self._calls > 1:
             raise RuntimeError("provider unavailable")
         return super().embed_documents(texts)
+
+
+class ResearchRecordWebSearchGateway:
+    """仅为第一轮研究返回可核验网页来源"""
+
+    def search(self, query: str, *, count: int = 5) -> list[SearchResult]:
+        """第一轮返回发现结果，后续语义查询不再提供外部结果"""
+        del count
+        if query != "首次调查天穹协议的认证编号":
+            return []
+        return [
+            {
+                "title": "天穹协议公告",
+                "url": "https://example.com/sky-protocol",
+                "snippet": "认证编号已发布",
+            }
+        ]
+
+
+class ResearchRecordWebPageGateway:
+    """为第一轮搜索结果提供不可变网页正文"""
+
+    def fetch(self, url: str) -> dict[str, object] | None:
+        """返回天穹协议公告的完整证据"""
+        if url != "https://example.com/sky-protocol":
+            return None
+        return {
+            "title": "天穹协议公告",
+            "content": "天穹协议的认证编号为 ORBIT-7319。",
+            "truncated": False,
+        }
 
 
 class ContradictSecondRunGraphRunner:
@@ -182,6 +224,81 @@ def test_research_record_index_failure_preserves_verified_evidence(tmp_path) -> 
     assert record["embedding_error"] == "ResearchRecord embedding 失败"
     assert evidence in record["claim_text"]
     assert record["evidence"][0]["source_hash"] == hashlib.sha256(evidence.encode()).hexdigest()
+
+
+def test_research_record_recall_in_another_conversation_cites_original_web_span(
+    tmp_path,
+) -> None:
+    """验证跨会话研究记录召回仍引用原始网页证据而非记录自身"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    evidence = "天穹协议的认证编号为 ORBIT-7319。"
+
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=ResearchRecordWebSearchGateway(),
+        web_page_gateway=ResearchRecordWebPageGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "record-recall@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "研究记录复用"}
+        ).json()["id"]
+        source_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "首次核验"},
+        ).json()["id"]
+        reuse_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "跨会话复用"},
+        ).json()["id"]
+
+        first_run = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "record-source-web"},
+            json={"content": "首次调查天穹协议的认证编号"},
+        ).json()
+        client.get(f"/api/v1/runs/{first_run['run_id']}/events", headers=headers)
+        first_citation = client.get(
+            f"/api/v1/messages/{first_run['assistant_message_id']}/citations",
+            headers=headers,
+        ).json()["items"][0]
+        for _ in range(50):
+            records = client.get(
+                f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
+            ).json()["items"]
+            if records and records[0]["embedding_status"] == "ready":
+                break
+            time.sleep(0.01)
+
+        second_run = client.post(
+            f"/api/v1/conversations/{reuse_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "record-reuse-semantic"},
+            json={"content": "请复述此前核验的协议凭证代号"},
+        ).json()
+        client.get(f"/api/v1/runs/{second_run['run_id']}/events", headers=headers)
+        answer = client.get(
+            f"/api/v1/conversations/{reuse_conversation_id}/messages", headers=headers
+        ).json()["items"][-1]["content"]
+        second_citations = client.get(
+            f"/api/v1/messages/{second_run['assistant_message_id']}/citations",
+            headers=headers,
+        ).json()["items"]
+
+    assert "ORBIT-7319" in answer
+    assert second_citations[0]["source_type"] == "web"
+    assert second_citations[0]["evidence_text"] == evidence
+    assert second_citations[0]["source_hash"] == first_citation["source_hash"]
 
 
 def test_new_verified_result_supersedes_record_without_changing_old_evidence(
