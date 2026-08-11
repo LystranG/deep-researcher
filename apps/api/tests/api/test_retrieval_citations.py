@@ -1,9 +1,15 @@
+import hashlib
 import time
 from io import BytesIO
+from uuid import UUID
 
+from deep_researcher.model_gateway import ExtractiveModelGateway
+from deep_researcher.models import ConversationSegment
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
+from deep_researcher.web_search import DisabledWebSearchGateway
 from reportlab.pdfgen import canvas
+from sqlalchemy import select
 
 
 class UnknownCitationGateway:
@@ -12,6 +18,197 @@ class UnknownCitationGateway:
     def stream_answer(self, context):
         """返回一个无法由当前 SourceSet 支持的回答"""
         yield "未经证据支持的结论 [2]"
+
+
+class DeterministicEmbeddingGateway:
+    """为端到端检索测试生成稳定向量"""
+
+    model_name = "test-embedding-v1"
+
+    def embed_documents(self, texts: list[str]) -> list[tuple[float, ...]]:
+        """按输入顺序返回固定维度向量"""
+        return [(1.0, float(index + 1)) for index, _ in enumerate(texts)]
+
+    def embed_query(self, text: str) -> tuple[float, ...]:
+        """为查询返回同维度向量"""
+        del text
+        return (1.0, 1.0)
+
+
+class StableRerankGateway:
+    """按召回顺序稳定返回精排结果"""
+
+    def rerank(
+        self, query: str, documents: list[str], top_n: int
+    ) -> list[tuple[int, float]]:
+        """返回预算内的候选下标和稳定分数"""
+        del query
+        return [(index, 1.0 - index / 100) for index in range(min(len(documents), top_n))]
+
+
+class ConversationLeadGateway:
+    """将召回到的历史会话线索原样展示给端到端测试"""
+
+    def stream_answer(self, context):
+        """返回第一条明确标注为低信任的历史会话线索"""
+        leads = getattr(context, "conversation_leads", ())
+        if leads:
+            yield f"根据历史会话线索：{leads[0]}"
+            return
+        yield "未召回历史会话线索"
+
+
+def test_indexed_workspace_document_is_cited_from_another_conversation(tmp_path) -> None:
+    """验证异步索引后的空间文档可跨会话回读并引用原文"""
+    evidence = "混合检索验收编号为 VECTOR-2048。"
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "researcher@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "混合检索"}
+        ).json()["id"]
+        upload_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "资料上传"},
+        ).json()["id"]
+        query_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "资料查询"},
+        ).json()["id"]
+        uploaded = client.post(
+            f"/api/v1/conversations/{upload_conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("retrieval.txt", evidence, "text/plain")},
+        ).json()
+        for _ in range(50):
+            attachment = client.get(
+                f"/api/v1/attachments/{uploaded['id']}", headers=headers
+            ).json()
+            if attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+        promoted = client.post(
+            f"/api/v1/attachments/{uploaded['id']}/promote", headers=headers
+        )
+
+        run = client.post(
+            f"/api/v1/conversations/{query_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "hybrid-retrieval-query"},
+            json={"content": "混合检索验收编号是什么？"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        answer = client.get(
+            f"/api/v1/conversations/{query_conversation_id}/messages", headers=headers
+        ).json()["items"][-1]["content"]
+        citations = client.get(
+            f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+        records = client.get(
+            f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
+        )
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers)
+
+    assert attachment["status"] == "ready"
+    assert promoted.status_code == 201
+    assert "VECTOR-2048" in answer
+    assert citations[0]["source_type"] == "workspace_document"
+    assert citations[0]["evidence_text"] == evidence
+    assert citations[0]["source_hash"] == hashlib.sha256(evidence.encode()).hexdigest()
+    assert records.status_code == 200
+    assert len(records.json()["items"]) == 1
+    assert records.json()["items"][0]["status"] == "verified"
+    assert "VECTOR-2048" in records.json()["items"][0]["claim_text"]
+    assert records.json()["items"][0]["evidence"][0]["source_hash"] == citations[0]["source_hash"]
+    assert ledger.status_code == 200
+    assert ledger.json()["status"] == "completed"
+    assert ledger.json()["stop_decision"]["completeness"] == "complete"
+    assert ledger.json()["coverage"]["citation_count"] == 1
+
+
+def test_other_conversation_is_recalled_only_as_lead_without_citation(tmp_path) -> None:
+    """验证同空间旧会话只能作为低信任线索且不能形成 Citation"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=ConversationLeadGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "lead@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "历史线索"}
+        ).json()["id"]
+        source_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "旧会话"},
+        ).json()["id"]
+        query_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "新会话"},
+        ).json()["id"]
+        source_run = client.post(
+            f"/api/v1/conversations/{source_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "conversation-lead-source"},
+            json={"content": "历史会话验收编号为 LEAD-731。"},
+        ).json()
+        client.get(f"/api/v1/runs/{source_run['run_id']}/events", headers=headers)
+        ready_segment = None
+        for _ in range(50):
+            with client.app.state.session_factory() as session:
+                ready_segment = session.scalar(
+                    select(ConversationSegment).where(
+                        ConversationSegment.conversation_id == UUID(source_conversation_id),
+                        ConversationSegment.embedding_status == "ready",
+                    )
+                )
+            if ready_segment is not None:
+                break
+            time.sleep(0.01)
+
+        run = client.post(
+            f"/api/v1/conversations/{query_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "conversation-lead-query"},
+            json={"content": "LEAD-731 是什么？"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        answer = client.get(
+            f"/api/v1/conversations/{query_conversation_id}/messages", headers=headers
+        ).json()["items"][-1]["content"]
+        citations = client.get(
+            f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert ready_segment is not None
+    assert "历史会话线索" in answer
+    assert "LEAD-731" in answer
+    assert citations == []
 
 
 def test_unknown_citation_falls_back_to_frozen_evidence(tmp_path) -> None:
@@ -74,7 +271,13 @@ def test_promoting_attachment_changes_cross_conversation_retrieval_and_adds_cita
         object_store_root=tmp_path / "objects",
     )
 
-    with running_worker_client(settings) as client:
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
         registered = client.post(
             "/api/v1/auth/register",
             json={"email": "researcher@example.com", "password": "correct horse battery"},
@@ -147,7 +350,13 @@ def test_same_named_documents_never_cross_workspace_boundary(tmp_path) -> None:
         object_store_root=tmp_path / "objects",
     )
 
-    with running_worker_client(settings) as client:
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
         registered = client.post(
             "/api/v1/auth/register",
             json={"email": "researcher@example.com", "password": "correct horse battery"},
@@ -207,7 +416,13 @@ def test_pdf_citation_opens_exact_page_and_evidence_span(tmp_path) -> None:
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )
-    with running_worker_client(settings) as client:
+    with running_worker_client(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
         registered = client.post(
             "/api/v1/auth/register",
             json={"email": "researcher@example.com", "password": "correct horse battery"},

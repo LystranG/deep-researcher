@@ -15,6 +15,7 @@ dependencies = [
   "mcp>=2.0,<3",
   "openai>=2.21,<3",
   "pillow>=11,<13",
+  "pgvector>=0.4,<1",
   "psycopg[binary]>=3.2,<4",
   "pydantic-settings>=2.10,<3",
   "pypdf>=6,<7",

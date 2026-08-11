@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -10,11 +11,40 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from deep_researcher.database import Base
+
+PgVector: Any = None
+try:
+    from pgvector.sqlalchemy import Vector
+
+    PgVector = Vector
+except ImportError:  # pragma: no cover - installed in PostgreSQL deployments
+    pass
+
+
+class EmbeddingVector(TypeDecorator[list[float] | None]):
+    """PostgreSQL 使用 pgvector，SQLite 测试使用 JSON 保存 embedding"""
+
+    impl = JSON
+    cache_ok = True
+    if PgVector is not None:
+        comparator_factory = PgVector.comparator_factory
+
+    def __init__(self, dimensions: int | None = None) -> None:
+        """初始化可选维度的 embedding 类型"""
+        self.dimensions = dimensions
+        super().__init__()
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        """按数据库方言选择 pgvector 或 JSON 实现"""
+        if dialect.name == "postgresql" and PgVector is not None:
+            return dialect.type_descriptor(PgVector(self.dimensions))
+        return dialect.type_descriptor(JSON())
 
 
 def utc_now() -> datetime:
@@ -425,7 +455,10 @@ class DocumentVersion(Base):
 
 class SourceChunk(Base):
     __tablename__ = "source_chunks"
-    __table_args__ = (UniqueConstraint("attachment_id", "ordinal"),)
+    __table_args__ = (
+        UniqueConstraint("attachment_id", "ordinal"),
+        Index("ix_source_chunks_workspace_embedding_status", "workspace_id", "embedding_status"),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     workspace_id: Mapped[UUID] = mapped_column(
@@ -449,6 +482,239 @@ class SourceChunk(Base):
     start_offset: Mapped[int] = mapped_column(Integer)
     end_offset: Mapped[int] = mapped_column(Integer)
     content_hash: Mapped[str] = mapped_column(String(64))
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), default=None)
+    embedding_model: Mapped[str | None] = mapped_column(String(200), default=None)
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer, default=None)
+    embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
+    embedding_error: Mapped[str | None] = mapped_column(Text, default=None)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class ConversationSegment(Base):
+    """保存可跨会话检索的确定性消息分段"""
+
+    __tablename__ = "conversation_segments"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "ordinal"),
+        Index(
+            "ix_conversation_segments_workspace_embedding_status",
+            "workspace_id",
+            "embedding_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    conversation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    first_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), index=True, default=None
+    )
+    last_message_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), index=True, default=None
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), default=None)
+    embedding_model: Mapped[str | None] = mapped_column(String(200), default=None)
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer, default=None)
+    embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
+    embedding_error: Mapped[str | None] = mapped_column(Text, default=None)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class ResearchRecord(Base):
+    """保存已经核验、可跨会话复用的不可变研究记录版本"""
+
+    __tablename__ = "research_records"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "record_key", "version"),
+        Index("ix_research_records_workspace_status", "workspace_id", "status"),
+        Index(
+            "ix_research_records_workspace_embedding_status",
+            "workspace_id",
+            "embedding_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="SET NULL"), index=True, default=None
+    )
+    claim_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("research_claims.id", ondelete="SET NULL"), index=True, default=None
+    )
+    record_key: Mapped[str] = mapped_column(String(200))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    claim_text: Mapped[str] = mapped_column(Text)
+    claim_kind: Mapped[str] = mapped_column(String(32), default="fact")
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    supersedes_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("research_records.id", ondelete="SET NULL"), index=True, default=None
+    )
+    content_hash: Mapped[str] = mapped_column(String(64))
+    evidence_refs: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), default=None)
+    embedding_model: Mapped[str | None] = mapped_column(String(200), default=None)
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer, default=None)
+    embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
+    embedding_error: Mapped[str | None] = mapped_column(Text, default=None)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class ResearchClaim(Base):
+    """保存研究运行中通过证据核验的主张"""
+
+    __tablename__ = "research_claims"
+    __table_args__ = (
+        UniqueConstraint("run_id", "content_hash"),
+        Index("ix_research_claims_workspace_status", "workspace_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    claim_text: Mapped[str] = mapped_column(Text)
+    verdict: Mapped[str] = mapped_column(String(32), default="verified")
+    status: Mapped[str] = mapped_column(String(32), default="verified")
+    content_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class EvidenceSpan(Base):
+    """保存来源快照中可精确回读的独立证据片段"""
+
+    __tablename__ = "evidence_spans"
+    __table_args__ = (
+        UniqueConstraint("run_id", "source_chunk_id", "start_offset", "end_offset"),
+        Index("ix_evidence_spans_workspace_run", "workspace_id", "run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    source_chunk_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_chunks.id", ondelete="CASCADE"), index=True
+    )
+    start_offset: Mapped[int] = mapped_column(Integer)
+    end_offset: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ResearchClaimEvidence(Base):
+    """区分主张与证据片段之间的支持或反驳关系"""
+
+    __tablename__ = "research_claim_evidence"
+    __table_args__ = (
+        UniqueConstraint("claim_id", "evidence_span_id", "relation"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    claim_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_claims.id", ondelete="CASCADE"), index=True
+    )
+    evidence_span_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evidence_spans.id", ondelete="CASCADE"), index=True
+    )
+    relation: Mapped[str] = mapped_column(String(32), default="supports")
+
+
+class ResearchLedger(Base):
+    """保存单次 Research Run 的可恢复研究账本"""
+
+    __tablename__ = "research_ledgers"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    goal: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class CoverageSnapshot(Base):
+    """记录账本在终态时的证据覆盖判断"""
+
+    __tablename__ = "coverage_snapshots"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    ledger_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_ledgers.id", ondelete="CASCADE"), index=True
+    )
+    citation_count: Mapped[int] = mapped_column(Integer, default=0)
+    verified_claim_count: Mapped[int] = mapped_column(Integer, default=0)
+    complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class EvidenceGap(Base):
+    """记录研究目标尚未覆盖的证据缺口"""
+
+    __tablename__ = "evidence_gaps"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    ledger_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_ledgers.id", ondelete="CASCADE"), index=True
+    )
+    description: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class StopDecision(Base):
+    """记录由覆盖快照和运行状态形成的停止裁决"""
+
+    __tablename__ = "stop_decisions"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    ledger_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_ledgers.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    reason: Mapped[str] = mapped_column(String(64))
+    completeness: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class SourceSnapshot(Base):
@@ -513,6 +779,12 @@ class Memory(Base):
     category: Mapped[str] = mapped_column(String(32))
     risk_level: Mapped[str] = mapped_column(String(32))
     content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), default=None)
+    embedding_model: Mapped[str | None] = mapped_column(String(200), default=None)
+    embedding_dimensions: Mapped[int | None] = mapped_column(Integer, default=None)
+    embedding_status: Mapped[str] = mapped_column(String(32), default="pending")
+    embedding_error: Mapped[str | None] = mapped_column(Text, default=None)
+    indexed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     status: Mapped[str] = mapped_column(String(32), default="candidate")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

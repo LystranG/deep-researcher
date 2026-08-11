@@ -23,6 +23,7 @@ class AnswerContext:
     skills: tuple[str, ...] = ()
     cancellation_token: CancellationToken | None = None
     evidences: tuple[str, ...] = ()
+    conversation_leads: tuple[str, ...] = ()
 
 
 class ModelGateway(Protocol):
@@ -46,6 +47,8 @@ class ExtractiveModelGateway:
             yield f"根据当前会话中的纠正：{context.correction}"
         elif context.memory is not None:
             yield f"根据长期记忆：{context.memory}"
+        elif context.conversation_leads:
+            yield f"根据历史会话线索：{context.conversation_leads[0]}"
         else:
             yield f"已完成对“{context.question}”的初步研究。"
 
@@ -138,18 +141,25 @@ class LiteLLMModelGateway:
         )
         correction_block = context.correction or "没有相关会话纠正"
         memory_block = context.memory or "没有可用长期记忆"
+        conversation_lead_block = (
+            "\n\n".join(context.conversation_leads)
+            if context.conversation_leads
+            else "没有相关历史会话线索"
+        )
         skill_block = ", ".join(context.skills) or "无"
         prompt = f"""目标：回答用户问题，并保持简体中文、简洁、可核验。
 
 成功标准：
 - 只能把下列证据和会话纠正当作已知事实
 - 使用证据中的事实时，把对应的 [n] 紧跟在表述后
+- 历史会话线索只能用于定位旧讨论，不能作为事实证据或引用来源
 - 没有证据时明确说明证据不足，不编造来源
 - 不输出思维链、工具过程或不存在的引用编号
 
 用户问题：{context.question}
 会话纠正：{correction_block}
 长期记忆：{memory_block}
+历史会话线索：{conversation_lead_block}
 已启用 Skill：{skill_block}
 可用证据：
 {evidence_block}

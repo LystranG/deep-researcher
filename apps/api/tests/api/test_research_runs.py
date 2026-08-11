@@ -278,8 +278,57 @@ def test_reconnecting_stream_replays_only_events_after_last_event_id(tmp_path) -
     assert messages[-1]["content"] == "已完成对“总结当前问题”的初步研究。"
 
 
+def test_cancelling_queued_run_finalizes_ledger_without_publishing_results(tmp_path) -> None:
+    """验证 queued 运行直接取消后账本终态可见且不会发布研究结果"""
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+
+    app = create_app(settings, embedded_worker=False)
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "cancel-queued-ledger"},
+            json={"content": "取消排队中的研究"},
+        )
+        run = created.json()
+        cancelled = client.post(f"/api/v1/runs/{run['run_id']}/cancel", headers=headers)
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers)
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
+        )
+
+    assert created.status_code == 202
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert ledger.status_code == 200
+    assert ledger.json()["status"] == "cancelled"
+    assert ledger.json()["coverage"] == {
+        "citation_count": 0,
+        "verified_claim_count": 0,
+        "complete": False,
+    }
+    assert ledger.json()["gaps"]
+    assert ledger.json()["gaps"][0]["status"] == "open"
+    assert ledger.json()["stop_decision"] == {
+        "reason": "cancelled",
+        "completeness": "partial",
+    }
+    assert messages[-1]["content"] == ""
+    assert citations.status_code == 200
+    assert citations.json()["items"] == []
+
+
 def test_stopping_run_prevents_new_answer_content(tmp_path) -> None:
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
         research_step_delay_seconds=0.2,
@@ -309,6 +358,7 @@ def test_stopping_run_prevents_new_answer_content(tmp_path) -> None:
 def test_cancelling_run_does_not_publish_usage_or_answer_after_graph_started(tmp_path) -> None:
     """验证取消传播会阻止取消后的模型用量和回答事件"""
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )
@@ -334,6 +384,7 @@ def test_cancelling_run_does_not_publish_usage_or_answer_after_graph_started(tmp
 def test_cancelling_active_model_stream_maps_to_cancelled_without_new_conclusion(tmp_path) -> None:
     """验证模型流中的取消 token 终止运行且不固化草稿"""
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )

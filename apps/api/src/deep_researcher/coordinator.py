@@ -8,7 +8,7 @@ from threading import Lock
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.agents.planner import TaskSpec
@@ -20,10 +20,17 @@ from deep_researcher.models import (
     Attachment,
     Citation,
     ConversationSkillOverride,
+    CoverageSnapshot,
     Document,
     DocumentVersion,
+    EvidenceGap,
+    EvidenceSpan,
     Memory,
     Message,
+    ResearchClaim,
+    ResearchClaimEvidence,
+    ResearchLedger,
+    ResearchRecord,
     ResearchRun,
     ResearchTask,
     RunEvent,
@@ -33,6 +40,7 @@ from deep_researcher.models import (
     SkillVersion,
     SourceChunk,
     SourceSnapshot,
+    StopDecision,
     Todo,
     WorkspaceSkillGrant,
 )
@@ -41,6 +49,10 @@ from deep_researcher.research_context import (
     FrozenMemory,
     FrozenSource,
     freeze_research_context,
+)
+from deep_researcher.retrieval import (
+    EmbeddingGateway,
+    HybridRetrieval,
 )
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
@@ -68,6 +80,9 @@ class ResearchCoordinator:
         graph_runner: ResearchGraphRunner | None = None,
         sandbox_submitter: Callable[[UUID], object] | None = None,
         sandbox_canceller: Callable[[UUID], object] | None = None,
+        embedding_gateway: EmbeddingGateway | None = None,
+        retrieval: HybridRetrieval | None = None,
+        conversation_segment_submitter: Callable[[UUID], object] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._sequence_lock = Lock()
@@ -85,6 +100,9 @@ class ResearchCoordinator:
         self._graph_runner = graph_runner or ResearchGraphRunner()
         self._sandbox_submitter = sandbox_submitter
         self._sandbox_canceller = sandbox_canceller
+        self._embedding_gateway = embedding_gateway
+        self._retrieval = retrieval
+        self._conversation_segment_submitter = conversation_segment_submitter
 
     def execute_run(self, run_id: UUID, *, lease_owner: str | None = None) -> None:
         """执行持有有效租约的研究运行"""
@@ -108,6 +126,9 @@ class ResearchCoordinator:
                 evidence = self._best_evidence(session, run, question)
                 correction = self._latest_relevant_correction(session, run, trigger)
                 memory = self._best_memory(session, run, question)
+                conversation_lead = self._best_conversation_lead(
+                    session, run, question
+                )
 
             if resume is None:
                 self._append_event(
@@ -128,7 +149,7 @@ class ResearchCoordinator:
                         "content_hash": evidence.content_hash,
                     }
                 )
-            else:
+            elif conversation_lead is None and memory is None and correction is None:
                 for discovered_chunk in self._search_web(
                     run_id, question, lease_owner=lease_owner
                 ):
@@ -153,6 +174,9 @@ class ResearchCoordinator:
                 sources=sources,
                 correction=correction,
                 memory=frozen_memory,
+                conversation_leads=(
+                    [conversation_lead] if conversation_lead is not None else []
+                ),
                 skills=skill_slugs,
             )
             for skill_slug in research_context["skills"]:
@@ -230,6 +254,7 @@ class ResearchCoordinator:
                     lease_owner=lease_owner,
                 )
             citation_drafts = graph_state["citation_drafts"]
+            completed_conversation_id: UUID | None = None
 
             with self._sequence_lock, self._session_factory.begin() as session:
                 run = session.scalar(
@@ -273,6 +298,7 @@ class ResearchCoordinator:
                     self._quota_service.settle(session, run, usage_summary)
                     message.content = answer
                     citation_ids: list[str] = []
+                    persisted_citations: list[Citation] = []
                     for citation_draft in citation_drafts:
                         label = citation_draft["label"]
                         if label < 1 or label > len(research_context["sources"]):
@@ -292,6 +318,26 @@ class ResearchCoordinator:
                         session.add(citation)
                         session.flush()
                         citation_ids.append(str(citation.id))
+                        persisted_citations.append(citation)
+                    research_record = self._promote_research_record(
+                        session,
+                        run,
+                        answer,
+                        persisted_citations,
+                        record_key=hashlib.sha256(question.strip().casefold().encode()).hexdigest(),
+                        verification_status=(
+                            graph_state["verification"]["status"]
+                            if isinstance(graph_state.get("verification"), dict)
+                            else "supported"
+                        ),
+                    )
+                    self._finalize_ledger(
+                        session,
+                        run,
+                        status="completed",
+                        citation_count=len(persisted_citations),
+                        verified_claim_count=1 if research_record is not None else 0,
+                    )
                     for completed_task in completed_tasks:
                         if completed_task.status in {"pending", "running"}:
                             completed_task.status = "completed"
@@ -307,11 +353,15 @@ class ResearchCoordinator:
                         todo.completed_at = datetime.now(UTC)
                     run.status = "completed"
                     run.completed_at = datetime.now(UTC)
+                    completed_conversation_id = run.conversation_id
                     event_type = "run_completed"
                     event_payload = {
                         "assistant_message_id": str(message.id),
                         "content": answer,
                         "citation_ids": citation_ids,
+                        "research_record_id": (
+                            str(research_record.id) if research_record is not None else None
+                        ),
                     }
                 seq = run.next_event_seq
                 run.next_event_seq += 1
@@ -324,6 +374,11 @@ class ResearchCoordinator:
                         payload=event_payload,
                     )
                 )
+            if (
+                completed_conversation_id is not None
+                and self._conversation_segment_submitter is not None
+            ):
+                self._conversation_segment_submitter(completed_conversation_id)
         except RunCancelledError:
             self._cancel(run_id, lease_owner=lease_owner)
         except Exception as exc:
@@ -741,6 +796,32 @@ class ResearchCoordinator:
                 or (lease_owner is not None and run.lease_owner != lease_owner)
             )
 
+    def _best_conversation_lead(
+        self,
+        session: Session,
+        run: ResearchRun,
+        query: str,
+    ) -> str | None:
+        """返回同 Workspace 其他会话中最相关的低信任线索"""
+        if self._retrieval is None or self._embedding_gateway is None:
+            return None
+        query_embedding = self._embedding_gateway.embed_query(query)
+        candidates = self._retrieval.recall_conversation_segments(
+            session,
+            workspace_id=run.workspace_id,
+            conversation_id=run.conversation_id,
+            query=query,
+            query_embedding=query_embedding,
+            limit=50,
+        )
+        ranked = self._retrieval.rank(
+            query,
+            candidates,
+            limit=1,
+            query_embedding=query_embedding,
+        )
+        return ranked[0].candidate.text if ranked else None
+
     def _best_evidence(
         self,
         session: Session,
@@ -771,14 +852,159 @@ class ResearchCoordinator:
         candidates: dict[str, SourceChunk] = {}
         for chunk in [*workspace_chunks, *private_chunks]:
             candidates.setdefault(chunk.content_hash, chunk)
-        ranked = sorted(
+        if self._retrieval is not None and self._embedding_gateway is not None:
+            query_embedding = self._embedding_gateway.embed_query(query)
+            retrieved_candidates = self._retrieval.recall_source_chunks(
+                session,
+                workspace_id=run.workspace_id,
+                conversation_id=run.conversation_id,
+                query=query,
+                query_embedding=query_embedding,
+                limit=50,
+            )
+            ranked_candidates = self._retrieval.rank(
+                query,
+                retrieved_candidates,
+                limit=1,
+                query_embedding=query_embedding,
+            )
+            if ranked_candidates:
+                return session.get(SourceChunk, UUID(ranked_candidates[0].candidate.candidate_id))
+            return None
+        lexical_ranked = sorted(
             ((self._lexical_score(query, chunk.text), chunk) for chunk in candidates.values()),
             key=lambda item: item[0],
             reverse=True,
         )
-        if not ranked or ranked[0][0] <= 0:
+        if not lexical_ranked or lexical_ranked[0][0] <= 0:
             return None
-        return ranked[0][1]
+        return lexical_ranked[0][1]
+
+    def _promote_research_record(
+        self,
+        session: Session,
+        run: ResearchRun,
+        claim_text: str,
+        citations: list[Citation],
+        *,
+        record_key: str,
+        verification_status: str,
+    ) -> ResearchRecord | None:
+        """将有精确 Citation 的已完成回答提升为不可变 Workspace Research Record"""
+        if not citations:
+            return None
+        content_hash = hashlib.sha256(claim_text.encode()).hexdigest()
+        disputed = verification_status == "contradicted"
+        claim = session.scalar(
+            select(ResearchClaim).where(
+                ResearchClaim.run_id == run.id,
+                ResearchClaim.content_hash == content_hash,
+            )
+        )
+        if claim is None:
+            claim = ResearchClaim(
+                workspace_id=run.workspace_id,
+                run_id=run.id,
+                claim_text=claim_text,
+                verdict="contradicted" if disputed else "verified",
+                status="verified",
+                content_hash=content_hash,
+            )
+            session.add(claim)
+            session.flush()
+        evidence_refs: list[dict[str, object]] = []
+        for citation in citations:
+            span = session.scalar(
+                select(EvidenceSpan).where(
+                    EvidenceSpan.run_id == run.id,
+                    EvidenceSpan.source_chunk_id == citation.source_chunk_id,
+                    EvidenceSpan.start_offset == citation.evidence_start,
+                    EvidenceSpan.end_offset == citation.evidence_end,
+                )
+            )
+            if span is None:
+                span = EvidenceSpan(
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    source_chunk_id=citation.source_chunk_id,
+                    start_offset=citation.evidence_start,
+                    end_offset=citation.evidence_end,
+                    content_hash=citation.source_hash,
+                )
+                session.add(span)
+                session.flush()
+            relation = session.scalar(
+                select(ResearchClaimEvidence).where(
+                    ResearchClaimEvidence.claim_id == claim.id,
+                    ResearchClaimEvidence.evidence_span_id == span.id,
+                    ResearchClaimEvidence.relation == (
+                        "contradicts" if disputed else "supports"
+                    ),
+                )
+            )
+            if relation is None:
+                session.add(
+                    ResearchClaimEvidence(
+                        workspace_id=run.workspace_id,
+                        claim_id=claim.id,
+                        evidence_span_id=span.id,
+                        relation="contradicts" if disputed else "supports",
+                    )
+                )
+            evidence_refs.append(
+                {
+                    "evidence_span_id": str(span.id),
+                    "source_chunk_id": str(span.source_chunk_id),
+                    "start_offset": span.start_offset,
+                    "end_offset": span.end_offset,
+                    "source_hash": span.content_hash,
+                }
+            )
+        record = session.scalar(
+            select(ResearchRecord)
+            .where(
+                ResearchRecord.workspace_id == run.workspace_id,
+                ResearchRecord.record_key == record_key,
+                ResearchRecord.content_hash == content_hash,
+            )
+            .order_by(ResearchRecord.version.desc())
+        )
+        if record is not None:
+            return record
+        latest_version = session.scalar(
+            select(func.max(ResearchRecord.version)).where(
+                ResearchRecord.workspace_id == run.workspace_id,
+                ResearchRecord.record_key == record_key,
+            )
+        )
+        latest_record = session.scalar(
+            select(ResearchRecord)
+            .where(
+                ResearchRecord.workspace_id == run.workspace_id,
+                ResearchRecord.record_key == record_key,
+            )
+            .order_by(ResearchRecord.version.desc())
+        )
+        if latest_record is not None:
+            latest_record.status = "disputed" if disputed else "superseded"
+        record = ResearchRecord(
+            workspace_id=run.workspace_id,
+            run_id=run.id,
+            claim_id=claim.id,
+            record_key=record_key,
+            version=(latest_version or 0) + 1,
+            claim_text=claim_text,
+            claim_kind="fact",
+            status="disputed" if disputed else "verified",
+            supersedes_id=(
+                latest_record.id if latest_record is not None and not disputed else None
+            ),
+            content_hash=content_hash,
+            evidence_refs=evidence_refs,
+        )
+        session.add(record)
+        session.flush()
+        return record
 
     def _effective_skill_capabilities(
         self, session: Session, run: ResearchRun
@@ -975,6 +1201,31 @@ class ResearchCoordinator:
         run: ResearchRun,
         query: str,
     ) -> Memory | None:
+        initiated_by_user_id = run.initiated_by_user_id
+        if initiated_by_user_id is None:
+            raise RuntimeError("研究运行缺少发起用户")
+        if self._retrieval is not None and self._embedding_gateway is not None:
+            query_embedding = self._embedding_gateway.embed_query(query)
+            candidates = self._retrieval.recall_memories(
+                session,
+                workspace_id=run.workspace_id,
+                user_id=initiated_by_user_id,
+                conversation_id=run.conversation_id,
+                query=query,
+                query_embedding=query_embedding,
+                limit=50,
+            )
+            ranked_memories = self._retrieval.rank(
+                query,
+                candidates,
+                limit=1,
+                query_embedding=query_embedding,
+            )
+            if not ranked_memories:
+                return None
+            return session.get(
+                Memory, UUID(ranked_memories[0].candidate.candidate_id)
+            )
         now = datetime.now(UTC)
         memories = session.scalars(
             select(Memory).where(
@@ -984,7 +1235,7 @@ class ResearchCoordinator:
                 (Memory.expires_at.is_(None) | (Memory.expires_at > now)),
                 (
                     (Memory.scope == "workspace")
-                    | ((Memory.scope == "user") & (Memory.user_id == run.initiated_by_user_id))
+                    | ((Memory.scope == "user") & (Memory.user_id == initiated_by_user_id))
                     | (
                         (Memory.scope == "conversation")
                         & (Memory.conversation_id == run.conversation_id)
@@ -992,14 +1243,14 @@ class ResearchCoordinator:
                 ),
             )
         ).all()
-        ranked = sorted(
+        lexical_ranked = sorted(
             ((self._lexical_score(query, memory.content), memory) for memory in memories),
             key=lambda item: item[0],
             reverse=True,
         )
-        if not ranked or ranked[0][0] <= 0:
+        if not lexical_ranked or lexical_ranked[0][0] <= 0:
             return None
-        return ranked[0][1]
+        return lexical_ranked[0][1]
 
     @staticmethod
     def _lexical_score(query: str, text: str) -> int:
@@ -1029,74 +1280,43 @@ class ResearchCoordinator:
             if run.status in {"completed", "cancelled", "failed"}:
                 return run.status
             waiting_approval = run.status == "waiting_approval"
-            run.cancel_requested_at = datetime.now(UTC)
-            if run.status in {"queued", "waiting_approval"}:
-                self._quota_service.release(session, run)
-                tasks = session.scalars(
-                    select(ResearchTask).where(
-                        ResearchTask.run_id == run.id,
-                        ResearchTask.status.in_({"pending", "running"}),
-                    )
-                ).all()
-                for task in tasks:
-                    task.status = "cancelled"
-                    task.completed_at = datetime.now(UTC)
-                todos = session.scalars(
-                    select(Todo).where(
-                        Todo.run_id == run.id,
-                        Todo.status.in_({"pending", "running"}),
-                    )
-                ).all()
-                for todo in todos:
-                    todo.status = "cancelled"
-                    todo.completed_at = datetime.now(UTC)
-                    if todo.sandbox_execution_id is not None:
-                        sandbox_execution_ids.append(todo.sandbox_execution_id)
-                executions = session.scalars(
+            cancelled_at = datetime.now(UTC)
+            run.cancel_requested_at = cancelled_at
+            self._quota_service.release(session, run)
+            tasks = session.scalars(
+                select(ResearchTask).where(
+                    ResearchTask.run_id == run.id,
+                    ResearchTask.status.in_({"pending", "running"}),
+                )
+            ).all()
+            for task in tasks:
+                task.status = "cancelled"
+                task.completed_at = cancelled_at
+            todos = session.scalars(
+                select(Todo).where(
+                    Todo.run_id == run.id,
+                    Todo.status.in_({"pending", "running"}),
+                )
+            ).all()
+            for todo in todos:
+                todo.status = "cancelled"
+                todo.completed_at = cancelled_at
+                if todo.sandbox_execution_id is not None:
+                    sandbox_execution_ids.append(todo.sandbox_execution_id)
+            executions = (
+                session.scalars(
                     select(SandboxExecution).where(
                         SandboxExecution.id.in_(sandbox_execution_ids)
                     )
-                ).all() if sandbox_execution_ids else []
-                for execution in executions:
-                    execution.cancel_requested_at = datetime.now(UTC)
-                run.status = "cancelled"
-                run.completed_at = datetime.now(UTC)
-                event_type = "run_cancelled"
-                payload = {"message": "研究已停止"}
-            else:
-                self._quota_service.release(session, run)
-                todos = session.scalars(
-                    select(Todo).where(
-                        Todo.run_id == run.id,
-                        Todo.status.in_({"pending", "running"}),
-                    )
                 ).all()
-                for todo in todos:
-                    if todo.sandbox_execution_id is not None:
-                        sandbox_execution_ids.append(todo.sandbox_execution_id)
-                executions = session.scalars(
-                    select(SandboxExecution).where(
-                        SandboxExecution.id.in_(sandbox_execution_ids)
-                    )
-                ).all() if sandbox_execution_ids else []
-                for execution in executions:
-                    execution.cancel_requested_at = datetime.now(UTC)
-                tasks = session.scalars(
-                    select(ResearchTask).where(
-                        ResearchTask.run_id == run.id,
-                        ResearchTask.status.in_({"pending", "running"}),
-                    )
-                ).all()
-                for task in tasks:
-                    task.status = "cancelled"
-                    task.completed_at = datetime.now(UTC)
-                for todo in todos:
-                    todo.status = "cancelled"
-                    todo.completed_at = datetime.now(UTC)
-                run.status = "cancelled"
-                run.completed_at = datetime.now(UTC)
-                event_type = "run_cancelled"
-                payload = {"message": "研究已停止"}
+                if sandbox_execution_ids
+                else []
+            )
+            for execution in executions:
+                execution.cancel_requested_at = cancelled_at
+            run.status = "cancelled"
+            run.completed_at = cancelled_at
+            self._finalize_ledger(session, run, status="cancelled")
             seq = run.next_event_seq
             run.next_event_seq += 1
             session.add(
@@ -1104,8 +1324,8 @@ class ResearchCoordinator:
                     workspace_id=run.workspace_id,
                     run_id=run.id,
                     seq=seq,
-                    type=event_type,
-                    payload=payload,
+                    type="run_cancelled",
+                    payload={"message": "研究已停止"},
                 )
             )
             result_status = run.status
@@ -1196,6 +1416,7 @@ class ResearchCoordinator:
                 return
             run.status = "cancelled"
             self._quota_service.release(session, run)
+            self._finalize_ledger(session, run, status="cancelled")
             pending_tasks = session.scalars(
                 select(ResearchTask).where(
                     ResearchTask.run_id == run.id,
@@ -1238,6 +1459,7 @@ class ResearchCoordinator:
                 return
             run.status = "failed"
             self._quota_service.release(session, run)
+            self._finalize_ledger(session, run, status="failed")
             public_message: str | None = None
             if isinstance(error, SearchUnavailableError):
                 if safe_detail == "未配置 Brave Search API 凭证":
@@ -1291,6 +1513,50 @@ class ResearchCoordinator:
                     payload={"message": "研究失败", "detail": safe_detail},
                 )
             )
+
+    def _finalize_ledger(
+        self,
+        session: Session,
+        run: ResearchRun,
+        *,
+        status: str,
+        citation_count: int = 0,
+        verified_claim_count: int = 0,
+    ) -> None:
+        """根据终态和已固化 Citation 写入 Coverage Snapshot 与 Stop Decision"""
+        ledger = session.scalar(select(ResearchLedger).where(ResearchLedger.run_id == run.id))
+        if ledger is None:
+            return
+        complete = status == "completed" and citation_count > 0
+        ledger.status = status
+        session.add(
+            CoverageSnapshot(
+                workspace_id=run.workspace_id,
+                ledger_id=ledger.id,
+                citation_count=citation_count,
+                verified_claim_count=verified_claim_count,
+                complete=complete,
+            )
+        )
+        reason = "evidence_complete" if complete else status
+        completeness = "complete" if complete else "partial"
+        if not complete:
+            session.add(
+                EvidenceGap(
+                    workspace_id=run.workspace_id,
+                    ledger_id=ledger.id,
+                    description="运行未形成足够的可定位证据",
+                    status="open",
+                )
+            )
+        session.add(
+            StopDecision(
+                workspace_id=run.workspace_id,
+                ledger_id=ledger.id,
+                reason=reason,
+                completeness=completeness,
+            )
+        )
 
 
 def encode_event_data(payload: dict[str, object]) -> str:

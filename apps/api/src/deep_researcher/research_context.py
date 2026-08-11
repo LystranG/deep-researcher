@@ -26,6 +26,7 @@ class FrozenResearchContext(TypedDict):
     sources: list[FrozenSource]
     correction: str | None
     memory: FrozenMemory | None
+    conversation_leads: list[str]
     skills: list[str]
 
 
@@ -35,6 +36,7 @@ def freeze_research_context(
     sources: list[FrozenSource],
     correction: str | None,
     memory: FrozenMemory | None,
+    conversation_leads: list[str],
     skills: list[str],
 ) -> FrozenResearchContext:
     """复制当前可见能力数据形成单次 Run 的冻结快照"""
@@ -60,5 +62,6 @@ def freeze_research_context(
         "sources": frozen_sources,
         "correction": correction,
         "memory": frozen_memory,
+        "conversation_leads": list(conversation_leads),
         "skills": list(skills),
     }

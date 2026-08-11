@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     openai_api_base: str | None = None
     openai_model: str = "gpt-5.6-sol"
     openai_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh", "max"] = "medium"
+    embedding_api_key: str | None = None
+    embedding_api_base: str | None = None
+    embedding_model: str | None = None
+    rerank_api_key: str | None = None
+    rerank_api_base: str | None = None
+    rerank_model: str | None = None
     brave_search_api_key: str | None = None
     trusted_mcp_url: str | None = None
     trusted_mcp_timeout_seconds: float = 30.0

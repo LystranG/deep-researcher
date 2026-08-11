@@ -597,6 +597,7 @@ def test_expired_tool_approval_resumes_without_side_effect(tmp_path) -> None:
 def test_cancelling_waiting_approval_invalidates_call_without_side_effect(tmp_path) -> None:
     """验证等待审批时取消会立即失效调用且不再恢复 Worker"""
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )
@@ -628,12 +629,26 @@ def test_cancelling_waiting_approval_invalidates_call_without_side_effect(tmp_pa
         tool_runs = client.get(
             f"/api/v1/runs/{created.json()['run_id']}/tool-runs", headers=headers
         )
+        ledger = client.get(
+            f"/api/v1/runs/{created.json()['run_id']}/ledger", headers=headers
+        )
 
     assert cancelled.json()["status"] == "cancelled"
     assert no_resume is False
     assert approvals.json()["items"][0]["status"] == "cancelled"
     assert detail.json()["status"] == "cancelled"
     assert tool_runs.json()["items"] == []
+    assert ledger.json()["status"] == "cancelled"
+    assert ledger.json()["coverage"] == {
+        "citation_count": 0,
+        "verified_claim_count": 0,
+        "complete": False,
+    }
+    assert ledger.json()["gaps"][0]["status"] == "open"
+    assert ledger.json()["stop_decision"] == {
+        "reason": "cancelled",
+        "completeness": "partial",
+    }
 
 
 def test_disabling_workspace_mcp_invalidates_pending_and_new_calls(tmp_path) -> None:

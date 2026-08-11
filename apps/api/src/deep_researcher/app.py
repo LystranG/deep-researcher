@@ -22,7 +22,11 @@ from sqlalchemy.orm import Session
 
 from deep_researcher.coordinator import ResearchCoordinator, encode_event_data
 from deep_researcher.database import build_engine, build_session_factory, session_scope
-from deep_researcher.document_processor import DocumentProcessor
+from deep_researcher.document_processor import (
+    ConversationSegmentProcessor,
+    DocumentProcessor,
+    MemoryIndexer,
+)
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.mcp_adapter import LocalTrustedHttpMcpAdapter
 from deep_researcher.model_gateway import ModelGateway, build_model_gateway
@@ -33,13 +37,19 @@ from deep_researcher.models import (
     Citation,
     Conversation,
     ConversationSkillOverride,
+    CoverageSnapshot,
     Document,
     DocumentVersion,
+    EvidenceGap,
+    EvidenceSpan,
     Memory,
     MemoryConflict,
     MemoryRevision,
     Message,
     MessageAttachment,
+    ResearchClaimEvidence,
+    ResearchLedger,
+    ResearchRecord,
     ResearchRun,
     ResearchTask,
     RunEvent,
@@ -49,6 +59,7 @@ from deep_researcher.models import (
     SkillVersion,
     SourceChunk,
     SourceSnapshot,
+    StopDecision,
     Todo,
     ToolApproval,
     ToolCall,
@@ -64,6 +75,16 @@ from deep_researcher.models import (
     WorkspaceSkillGrant,
 )
 from deep_researcher.quota import QuotaService
+from deep_researcher.retrieval import (
+    EmbeddingGateway,
+    HybridRetrieval,
+    LiteLLMEmbeddingGateway,
+    LiteLLMRerankGateway,
+    PostgresConversationSegmentRetrievalAdapter,
+    PostgresMemoryRetrievalAdapter,
+    PostgresSourceChunkRetrievalAdapter,
+    RerankGateway,
+)
 from deep_researcher.run_queue import RunQueue
 from deep_researcher.sandbox import (
     DockerSandbox,
@@ -206,6 +227,33 @@ class RunDetailResponse(RunStatusResponse):
     usage: ModelUsageResponse | None
 
 
+class LedgerCoverageResponse(BaseModel):
+    citation_count: int
+    verified_claim_count: int
+    complete: bool
+
+
+class LedgerGapResponse(BaseModel):
+    id: str
+    description: str
+    status: str
+
+
+class LedgerStopDecisionResponse(BaseModel):
+    reason: str
+    completeness: str
+
+
+class ResearchLedgerResponse(BaseModel):
+    id: str
+    run_id: str
+    goal: str
+    status: str
+    coverage: LedgerCoverageResponse | None
+    gaps: list[LedgerGapResponse]
+    stop_decision: LedgerStopDecisionResponse | None
+
+
 class TodoResponse(BaseModel):
     """公开单个 Agent Todo 的安全状态摘要"""
 
@@ -250,6 +298,27 @@ class DocumentResponse(BaseModel):
 
 class DocumentListResponse(BaseModel):
     items: list[DocumentResponse]
+
+
+class ResearchRecordEvidenceResponse(BaseModel):
+    id: str
+    source_chunk_id: str
+    start_offset: int
+    end_offset: int
+    source_hash: str
+
+
+class ResearchRecordResponse(BaseModel):
+    id: str
+    record_key: str
+    version: int
+    claim_text: str
+    status: str
+    evidence: list[ResearchRecordEvidenceResponse]
+
+
+class ResearchRecordListResponse(BaseModel):
+    items: list[ResearchRecordResponse]
 
 
 class CitationResponse(BaseModel):
@@ -481,6 +550,8 @@ def create_app(
     web_page_gateway: WebPageGateway | None = None,
     graph_runner: ResearchGraphRunner | None = None,
     mcp_gateway: McpGateway | None = None,
+    embedding_gateway: EmbeddingGateway | None = None,
+    rerank_gateway: RerankGateway | None = None,
     embedded_worker: bool = False,
 ) -> FastAPI:
     resolved_settings = settings or Settings()
@@ -496,6 +567,43 @@ def create_app(
         api_key=resolved_settings.brave_search_api_key
     )
     resolved_web_page_gateway = web_page_gateway or HttpWebPageGateway()
+    resolved_embedding_gateway = embedding_gateway
+    resolved_rerank_gateway = rerank_gateway
+    retrieval_configured = any(
+        value is not None
+        for value in (
+            resolved_settings.embedding_api_key,
+            resolved_settings.embedding_model,
+            resolved_settings.rerank_api_key,
+            resolved_settings.rerank_model,
+        )
+    )
+    if resolved_embedding_gateway is None and retrieval_configured:
+        if not resolved_settings.embedding_api_key or not resolved_settings.embedding_model:
+            raise ValueError("embedding 配置不完整")
+        resolved_embedding_gateway = LiteLLMEmbeddingGateway(
+            api_key=resolved_settings.embedding_api_key,
+            model=resolved_settings.embedding_model,
+            api_base=resolved_settings.embedding_api_base,
+        )
+    if resolved_rerank_gateway is None and retrieval_configured:
+        if not resolved_settings.rerank_api_key or not resolved_settings.rerank_model:
+            raise ValueError("rerank 配置不完整")
+        resolved_rerank_gateway = LiteLLMRerankGateway(
+            api_key=resolved_settings.rerank_api_key,
+            model=resolved_settings.rerank_model,
+            api_base=resolved_settings.rerank_api_base,
+        )
+    retrieval = (
+        HybridRetrieval(
+            resolved_rerank_gateway,
+            source_chunk_adapter=PostgresSourceChunkRetrievalAdapter(),
+            conversation_segment_adapter=PostgresConversationSegmentRetrievalAdapter(),
+            memory_adapter=PostgresMemoryRetrievalAdapter(),
+        )
+        if resolved_rerank_gateway
+        else None
+    )
     resolved_mcp_gateway = mcp_gateway
     if resolved_mcp_gateway is None and resolved_settings.trusted_mcp_url:
         resolved_mcp_gateway = LocalTrustedHttpMcpAdapter(
@@ -522,13 +630,30 @@ def create_app(
         require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
         step_delay_seconds=resolved_settings.research_step_delay_seconds,
         graph_runner=graph_runner or ResearchGraphRunner(resolved_settings.database_url),
+        embedding_gateway=resolved_embedding_gateway,
+        retrieval=retrieval,
         sandbox_submitter=lambda execution_id: sandbox_executor.submit(
             run_sandbox_execution, execution_id
         ),
         sandbox_canceller=lambda execution_id: sandbox.cancel(str(execution_id)),
+        conversation_segment_submitter=lambda conversation_id: file_executor.submit(
+            conversation_segment_processor.process, conversation_id
+        ),
     )
     object_store = LocalObjectStore(resolved_settings.object_store_root)
-    document_processor = DocumentProcessor(session_factory, object_store)
+    document_processor = DocumentProcessor(
+        session_factory,
+        object_store,
+        embedding_gateway=resolved_embedding_gateway,
+    )
+    conversation_segment_processor = ConversationSegmentProcessor(
+        session_factory,
+        embedding_gateway=resolved_embedding_gateway,
+    )
+    memory_indexer = MemoryIndexer(
+        session_factory,
+        embedding_gateway=resolved_embedding_gateway,
+    )
     sandbox = DockerSandbox(image=resolved_settings.sandbox_image)
     file_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="document-process")
     sandbox_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sandbox")
@@ -1510,6 +1635,14 @@ def create_app(
         session.add(run)
         session.flush()
         session.add(
+            ResearchLedger(
+                workspace_id=conversation.workspace_id,
+                run_id=run.id,
+                goal=content,
+                status="running",
+            )
+        )
+        session.add(
             RunEvent(
                 workspace_id=conversation.workspace_id,
                 run_id=run.id,
@@ -1529,6 +1662,8 @@ def create_app(
             )
         conversation.updated_at = datetime.now(UTC)
         session.commit()
+        file_executor.submit(conversation_segment_processor.process, conversation.id)
+        file_executor.submit(memory_indexer.process_workspace, conversation.workspace_id)
         return RunCreatedResponse(
             run_id=str(run.id),
             assistant_message_id=str(assistant_message.id),
@@ -1629,6 +1764,60 @@ def create_app(
                     cost_usd=usage.cost_micros / 1_000_000,
                 )
                 if usage is not None
+                else None
+            ),
+        )
+
+    @app.get("/api/v1/runs/{run_id}/ledger", response_model=ResearchLedgerResponse)
+    def get_research_ledger(
+        run_id: UUID,
+        session: SessionDependency,
+        user: CurrentUser,
+    ) -> ResearchLedgerResponse:
+        """回读当前用户有权限的 Research Ledger 生命周期事实"""
+        run = accessible_run(session, user, run_id)
+        ledger = session.scalar(select(ResearchLedger).where(ResearchLedger.run_id == run.id))
+        if ledger is None:
+            raise HTTPException(status_code=404, detail="研究账本不存在")
+        coverage = session.scalar(
+            select(CoverageSnapshot)
+            .where(CoverageSnapshot.ledger_id == ledger.id)
+            .order_by(CoverageSnapshot.created_at.desc())
+        )
+        stop_decision = session.scalar(
+            select(StopDecision).where(StopDecision.ledger_id == ledger.id)
+        )
+        gaps = session.scalars(
+            select(EvidenceGap)
+            .where(EvidenceGap.ledger_id == ledger.id)
+            .order_by(EvidenceGap.created_at)
+        ).all()
+        return ResearchLedgerResponse(
+            id=str(ledger.id),
+            run_id=str(ledger.run_id),
+            goal=ledger.goal,
+            status=ledger.status,
+            coverage=(
+                LedgerCoverageResponse(
+                    citation_count=coverage.citation_count,
+                    verified_claim_count=coverage.verified_claim_count,
+                    complete=coverage.complete,
+                )
+                if coverage is not None
+                else None
+            ),
+            gaps=[
+                LedgerGapResponse(
+                    id=str(gap.id), description=gap.description, status=gap.status
+                )
+                for gap in gaps
+            ],
+            stop_decision=(
+                LedgerStopDecisionResponse(
+                    reason=stop_decision.reason,
+                    completeness=stop_decision.completeness,
+                )
+                if stop_decision is not None
                 else None
             ),
         )
@@ -1844,10 +2033,71 @@ def create_app(
                     start_offset=chunk.start_offset,
                     end_offset=chunk.end_offset,
                     content_hash=chunk.content_hash,
+                    embedding=list(chunk.embedding) if chunk.embedding is not None else None,
+                    embedding_model=chunk.embedding_model,
+                    embedding_dimensions=chunk.embedding_dimensions,
+                    embedding_status=chunk.embedding_status,
+                    embedding_error=chunk.embedding_error,
+                    indexed_at=chunk.indexed_at,
                 )
             )
         attachment.promoted_document_id = document.id
         return document_response(document, version)
+
+    @app.get(
+        "/api/v1/workspaces/{workspace_id}/research-records",
+        response_model=ResearchRecordListResponse,
+    )
+    def list_research_records(
+        workspace_id: UUID,
+        session: SessionDependency,
+        user: CurrentUser,
+    ) -> ResearchRecordListResponse:
+        """列出当前 Workspace 已核验的不可变 Research Record"""
+        accessible_workspace(session, user, workspace_id)
+        records = session.scalars(
+            select(ResearchRecord)
+            .where(
+                ResearchRecord.workspace_id == workspace_id,
+                ResearchRecord.deleted_at.is_(None),
+            )
+            .order_by(ResearchRecord.created_at.desc())
+        ).all()
+        items: list[ResearchRecordResponse] = []
+        for record in records:
+            spans = session.scalars(
+                select(EvidenceSpan)
+                .join(
+                    ResearchClaimEvidence,
+                    ResearchClaimEvidence.evidence_span_id == EvidenceSpan.id,
+                )
+                .where(
+                    ResearchClaimEvidence.claim_id == record.claim_id,
+                    ResearchClaimEvidence.workspace_id == workspace_id,
+                    ResearchClaimEvidence.relation.in_({"supports", "contradicts"}),
+                )
+                .order_by(EvidenceSpan.start_offset)
+            ).all()
+            items.append(
+                ResearchRecordResponse(
+                    id=str(record.id),
+                    record_key=record.record_key,
+                    version=record.version,
+                    claim_text=record.claim_text,
+                    status=record.status,
+                    evidence=[
+                        ResearchRecordEvidenceResponse(
+                            id=str(span.id),
+                            source_chunk_id=str(span.source_chunk_id),
+                            start_offset=span.start_offset,
+                            end_offset=span.end_offset,
+                            source_hash=span.content_hash,
+                        )
+                        for span in spans
+                    ],
+                )
+            )
+        return ResearchRecordListResponse(items=items)
 
     @app.get(
         "/api/v1/workspaces/{workspace_id}/documents",
@@ -2150,7 +2400,12 @@ def create_app(
         memory = accessible_memory(session, user, memory_id)
         if memory.status not in {"candidate", "inactive"}:
             raise HTTPException(status_code=409, detail="当前记忆状态不能确认")
-        return transition_memory(memory, session, next_status="active", reason="confirmed")
+        response = transition_memory(memory, session, next_status="active", reason="confirmed")
+        memory.embedding_status = "pending"
+        memory.embedding_error = None
+        session.commit()
+        file_executor.submit(memory_indexer.process_workspace, memory.workspace_id)
+        return response
 
     @app.post("/api/v1/memories/{memory_id}/deactivate", response_model=MemoryResponse)
     def deactivate_memory(
@@ -2171,7 +2426,15 @@ def create_app(
         memory = accessible_memory(session, user, memory_id)
         memory.content = payload.content.strip()
         memory.expires_at = payload.expires_at
-        return transition_memory(memory, session, next_status=memory.status, reason="edited")
+        should_reindex = memory.status == "active"
+        response = transition_memory(memory, session, next_status=memory.status, reason="edited")
+        if not should_reindex:
+            return response
+        memory.embedding_status = "pending"
+        memory.embedding_error = None
+        session.commit()
+        file_executor.submit(memory_indexer.process_workspace, memory.workspace_id)
+        return response
 
     @app.post(
         "/api/v1/memories/{memory_id}/resolve-conflict",
@@ -2224,8 +2487,17 @@ def create_app(
         conflict.resolution = payload.action
         conflict.resolved_by_user_id = user.id
         conflict.resolved_at = datetime.now(UTC)
+        should_reindex = memory.status == "active"
+        if should_reindex:
+            memory.embedding_status = "pending"
+            memory.embedding_error = None
         session.flush()
-        return memory_response(session, memory)
+        response = memory_response(session, memory)
+        if not should_reindex:
+            return response
+        session.commit()
+        file_executor.submit(memory_indexer.process_workspace, memory.workspace_id)
+        return response
 
     @app.delete("/api/v1/memories/{memory_id}", status_code=204)
     def delete_memory(memory_id: UUID, session: SessionDependency, user: CurrentUser) -> Response:

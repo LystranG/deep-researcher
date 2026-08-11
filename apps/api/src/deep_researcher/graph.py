@@ -244,6 +244,7 @@ class ResearchGraphRunner:
             sources=[],
             correction=None,
             memory=None,
+            conversation_leads=[],
             skills=[],
         )
         initial: ResearchState = {
