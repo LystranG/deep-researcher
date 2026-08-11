@@ -37,6 +37,7 @@ from deep_researcher.models import (
     AuthSession,
     Citation,
     Conversation,
+    ConversationSegment,
     ConversationSkillOverride,
     CoverageSnapshot,
     Document,
@@ -1531,7 +1532,16 @@ def create_app(
         user: CurrentUser,
     ) -> Response:
         conversation = accessible_conversation(session, user, conversation_id)
-        conversation.deleted_at = datetime.now(UTC)
+        deleted_at = datetime.now(UTC)
+        conversation.deleted_at = deleted_at
+        indexed_segments = session.scalars(
+            select(ConversationSegment).where(
+                ConversationSegment.conversation_id == conversation.id,
+                ConversationSegment.deleted_at.is_(None),
+            )
+        ).all()
+        for segment in indexed_segments:
+            segment.deleted_at = deleted_at
         sourced_candidates = session.scalars(
             select(Memory)
             .join(Message, Message.id == Memory.source_message_id)

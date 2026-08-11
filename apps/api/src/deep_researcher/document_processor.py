@@ -240,23 +240,32 @@ class ConversationSegmentProcessor:
                         else "会话分段 embedding 失败"
                     )
                     embeddings = []
-                    for failed_segment in existing.values():
-                        failed_segment.embedding_status = "failed"
-                        failed_segment.embedding_error = failure
-                    if not existing:
-                        for ordinal in range(1, len(segment_texts) + 1):
+                    failed_at = datetime.now(UTC)
+                    for ordinal, (text, first_id, last_id) in enumerate(
+                        segment_texts, start=1
+                    ):
+                        failed_segment = existing.get(ordinal)
+                        if failed_segment is None:
                             failed_segment = ConversationSegment(
                                 workspace_id=messages[0].workspace_id,
                                 conversation_id=conversation,
                                 ordinal=ordinal,
-                                text=segment_texts[ordinal - 1][0],
-                                content_hash=hashlib.sha256(
-                                    segment_texts[ordinal - 1][0].encode()
-                                ).hexdigest(),
-                                embedding_status="failed",
-                                embedding_error=failure,
                             )
                             session.add(failed_segment)
+                        failed_segment.first_message_id = first_id
+                        failed_segment.last_message_id = last_id
+                        failed_segment.text = text
+                        failed_segment.content_hash = hashlib.sha256(text.encode()).hexdigest()
+                        failed_segment.embedding = None
+                        failed_segment.embedding_model = None
+                        failed_segment.embedding_dimensions = None
+                        failed_segment.embedding_status = "failed"
+                        failed_segment.embedding_error = failure
+                        failed_segment.indexed_at = None
+                        failed_segment.deleted_at = None
+                    for ordinal, stale_segment in existing.items():
+                        if ordinal > len(segment_texts):
+                            stale_segment.deleted_at = failed_at
                     return
             indexed_at = datetime.now(UTC)
             for ordinal, (text, first_id, last_id) in enumerate(segment_texts, start=1):

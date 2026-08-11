@@ -1,3 +1,4 @@
+import hashlib
 import time
 from collections.abc import Sequence
 from uuid import UUID
@@ -5,7 +6,7 @@ from uuid import UUID
 from deep_researcher.app import create_app
 from deep_researcher.document_processor import ConversationSegmentProcessor
 from deep_researcher.model_gateway import ExtractiveModelGateway
-from deep_researcher.models import ConversationSegment
+from deep_researcher.models import Conversation, ConversationSegment, Message
 from deep_researcher.settings import Settings
 from deep_researcher.web_search import DisabledWebSearchGateway
 from fastapi.testclient import TestClient
@@ -165,6 +166,126 @@ def test_embedding_failure_marks_conversation_segment_failed(tmp_path) -> None:
         "Provider 拒绝会话分段批次",
         "user: 需要保留的历史消息\nassistant: ",
     )
+
+
+def test_embedding_failure_keeps_latest_segment_text_and_message_boundary(tmp_path) -> None:
+    """验证重建索引失败时仍同步最新分段文本和消息边界"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+        embedded_worker=False,
+    )
+
+    with TestClient(app) as client:
+        _, conversation_id = create_conversation(client, "segment-refresh-failure@example.com")
+        with app.state.session_factory.begin() as session:
+            conversation = session.get(Conversation, conversation_id)
+            assert conversation is not None
+            first_message = Message(
+                workspace_id=conversation.workspace_id,
+                conversation_id=conversation_id,
+                role="user",
+                content="旧的研究问题",
+            )
+            session.add(first_message)
+        ConversationSegmentProcessor(
+            app.state.session_factory,
+            embedding_gateway=DeterministicEmbeddingGateway(),
+        ).process(conversation_id)
+
+        with app.state.session_factory.begin() as session:
+            conversation = session.get(Conversation, conversation_id)
+            assert conversation is not None
+            latest_message = Message(
+                workspace_id=conversation.workspace_id,
+                conversation_id=conversation_id,
+                role="assistant",
+                content="新的已核验结论",
+            )
+            session.add(latest_message)
+            session.flush()
+            latest_message_id = latest_message.id
+        ConversationSegmentProcessor(
+            app.state.session_factory,
+            embedding_gateway=FailingEmbeddingGateway(),
+        ).process(conversation_id)
+
+        with app.state.session_factory() as session:
+            segment = session.scalar(
+                select(ConversationSegment).where(
+                    ConversationSegment.conversation_id == conversation_id,
+                    ConversationSegment.ordinal == 1,
+                )
+            )
+            assert segment is not None
+            snapshot = (
+                segment.embedding_status,
+                segment.embedding_error,
+                segment.text,
+                segment.last_message_id,
+                segment.content_hash,
+            )
+
+    expected_text = "user: 旧的研究问题\nassistant: 新的已核验结论"
+    assert snapshot == (
+        "failed",
+        "Provider 拒绝会话分段批次",
+        expected_text,
+        latest_message_id,
+        hashlib.sha256(expected_text.encode()).hexdigest(),
+    )
+
+
+def test_deleting_conversation_soft_deletes_indexed_segments(tmp_path) -> None:
+    """验证删除会话会同步软删除已建立的历史分段"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(
+        settings,
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+        embedded_worker=False,
+    )
+
+    with TestClient(app) as client:
+        headers, conversation_id = create_conversation(client, "segment-delete@example.com")
+        with app.state.session_factory.begin() as session:
+            conversation = session.get(Conversation, conversation_id)
+            assert conversation is not None
+            session.add(
+                Message(
+                    workspace_id=conversation.workspace_id,
+                    conversation_id=conversation_id,
+                    role="user",
+                    content="删除前可检索的讨论",
+                )
+            )
+        ConversationSegmentProcessor(
+            app.state.session_factory,
+            embedding_gateway=DeterministicEmbeddingGateway(),
+        ).process(conversation_id)
+
+        deleted = client.delete(
+            f"/api/v1/conversations/{conversation_id}", headers=headers
+        )
+        with app.state.session_factory() as session:
+            segment = session.scalar(
+                select(ConversationSegment).where(
+                    ConversationSegment.conversation_id == conversation_id
+                )
+            )
+            assert segment is not None
+            segment_deleted_at = segment.deleted_at
+
+    assert deleted.status_code == 204
+    assert segment_deleted_at is not None
 
 
 def test_assistant_final_message_is_reindexed_into_conversation_segment(tmp_path) -> None:
