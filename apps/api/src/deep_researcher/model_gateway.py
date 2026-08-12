@@ -2,7 +2,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from jsonschema import ValidationError, validate
 from openai.types.shared.reasoning_effort import ReasoningEffort
@@ -10,6 +10,13 @@ from openai.types.shared.reasoning_effort import ReasoningEffort
 from deep_researcher.research_context import SourceWindowContext
 from deep_researcher.run_control import CancellationToken
 from deep_researcher.source_manifest import SourceManifest
+from deep_researcher.source_map import (
+    MAP_RESPONSE_SCHEMA,
+    SourceMapContext,
+    SourceMapDigest,
+    SourceMapSpanLocator,
+    source_map_prompt,
+)
 
 
 class BudgetExceededError(RuntimeError):
@@ -31,9 +38,15 @@ class AnswerContext:
 
 
 class ModelGateway(Protocol):
+    """统一回答生成与 bounded source map 的模型 Adapter interface"""
+
     def astream_answer(self, context: AnswerContext) -> AsyncIterator[str]: ...
 
     def stream_answer(self, context: AnswerContext) -> Iterator[str]: ...
+
+    async def acomplete_map_work(self, context: SourceMapContext) -> SourceMapDigest:
+        """根据有界 Chunk group 返回派生 digest"""
+        ...
 
 
 class ExtractiveModelGateway:
@@ -63,6 +76,24 @@ class ExtractiveModelGateway:
                 context.cancellation_token.raise_if_cancelled()
             yield delta
 
+    async def acomplete_map_work(self, context: SourceMapContext) -> SourceMapDigest:
+        """从有界 Chunk group 产生只用于导航和后续核验的确定性 digest"""
+        locators = [
+            SourceMapSpanLocator(
+                chunk_id=str(chunk.chunk_id),
+                start_offset=chunk.start_offset,
+                end_offset=chunk.end_offset,
+                content_hash=chunk.content_hash,
+            )
+            for chunk in context.chunks
+        ]
+        return {
+            "summary": "\n\n".join(chunk.text[:240] for chunk in context.chunks),
+            "candidate_claims": [],
+            "candidate_span_locators": locators,
+            "unresolved_questions": [],
+        }
+
 
 class LiteLLMModelGateway:
     """使用进程内 LiteLLM SDK 的受控模型 Adapter"""
@@ -86,6 +117,14 @@ class LiteLLMModelGateway:
     def last_usage(self) -> dict[str, int | float] | None:
         """返回最近一次调用的安全用量摘要"""
         return self._last_usage
+
+    async def acomplete_map_work(self, context: SourceMapContext) -> SourceMapDigest:
+        """使用 structured output 分析单个预算内 Chunk group"""
+        answer_context = AnswerContext(
+            question=source_map_prompt(context), evidence=None, correction=None
+        )
+        value = await self.acomplete_structured(answer_context, MAP_RESPONSE_SCHEMA)
+        return cast(SourceMapDigest, value)
 
     async def acomplete_structured(
         self, context: AnswerContext, response_schema: dict[str, object]

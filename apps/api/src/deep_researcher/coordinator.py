@@ -63,6 +63,7 @@ from deep_researcher.retrieval import (
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
 from deep_researcher.source_manifest import build_source_manifest, split_source_content
+from deep_researcher.source_map import SourceMapContext, SourceMapLedger
 from deep_researcher.source_reader import (
     SourceDescriptorRequest,
     SourceLedgerReader,
@@ -118,6 +119,7 @@ class ResearchCoordinator:
         self._model_context_safety_margin = model_context_safety_margin
         self._token_estimator = token_estimator
         self._source_reader = SourceLedgerReader(session_factory, token_estimator)
+        self._source_map_ledger = SourceMapLedger(session_factory, token_estimator)
         self._require_web_search_for_external_model = require_web_search_for_external_model
         self._step_delay_seconds = step_delay_seconds
         self._graph_runner = graph_runner or ResearchGraphRunner()
@@ -191,6 +193,18 @@ class ResearchCoordinator:
                 ),
                 skills=skill_slugs,
             )
+            map_contexts: tuple[SourceMapContext, ...] = ()
+            if self._requires_whole_page_map(question):
+                map_budget = ContextBudget(
+                    model_context_tokens=self._model_context_tokens,
+                    policy_and_prompt="提取 Chunk Digest、候选主张、原文 locator 与未解决问题",
+                    compact_conversation=question,
+                    tool_schema="source_map_work_v1",
+                    requested_output_reserve=self._model_output_token_reserve,
+                    safety_margin=self._model_context_safety_margin,
+                )
+                self._source_map_ledger.plan(run_id, map_budget)
+                map_contexts = self._source_map_ledger.pending_contexts(run_id, map_budget)
             for skill_slug in research_context["skills"]:
                 self._append_event(
                     run_id, "skill_applied", {"slug": skill_slug}, lease_owner=lease_owner
@@ -211,6 +225,8 @@ class ResearchCoordinator:
                 research_context=research_context,
                 model_gateway=self._model_gateway,
                 tool_execution=self._tool_execution,
+                map_contexts=map_contexts,
+                source_map_ledger=self._source_map_ledger,
                 resume=resume,
                 agent_role="researcher",
                 skill_allowed_tools=skill_allowed_tools,
@@ -413,6 +429,26 @@ class ResearchCoordinator:
             self._cancel(run_id, lease_owner=lease_owner)
         except Exception as exc:
             self._fail(run_id, str(exc), error=exc, lease_owner=lease_owner)
+
+    @staticmethod
+    def _requires_whole_page_map(question: str) -> bool:
+        """判断用户是否明确要求覆盖整页内容"""
+        normalized = question.casefold()
+        return any(
+            marker in normalized
+            for marker in (
+                "整页",
+                "全页",
+                "全文",
+                "完整报告",
+                "所有章节",
+                "各章节",
+                "whole page",
+                "full page",
+                "entire page",
+                "entire report",
+            )
+        )
 
     @staticmethod
     def _valid_citation_source(
@@ -1228,6 +1264,9 @@ class ResearchCoordinator:
         self, run_id: UUID, query: str, *, lease_owner: str | None = None
     ) -> list[FrozenSource]:
         """发现多个网页候选并持久化可读取的正文快照"""
+        persisted_sources = self._persisted_web_sources(run_id)
+        if persisted_sources:
+            return self._expand_long_source_context(run_id, query, persisted_sources)
         self._append_event(
             run_id,
             "tool_started",
@@ -1362,44 +1401,9 @@ class ResearchCoordinator:
                         session.add(chunk)
                         persisted_chunks.append(chunk)
                     session.flush()
-                    if len(persisted_chunks) == 1:
-                        sources.append(self._freeze_source_chunk(persisted_chunks[0]))
-                    else:
-                        selected_attempt = selected
-                        warnings = (
-                            (selected_attempt.warning_category,)
-                            if selected_attempt is not None
-                            and selected_attempt.warning_category is not None
-                            else ()
-                        )
-                        manifest = build_source_manifest(
-                            snapshot,
-                            persisted_chunks,
-                            token_estimator=self._token_estimator,
-                            adapter_id=(
-                                selected_attempt.adapter_id
-                                if selected_attempt is not None
-                                else None
-                            ),
-                            adapter_version=(
-                                selected_attempt.adapter_version
-                                if selected_attempt is not None
-                                else None
-                            ),
-                            completeness=(
-                                selected_attempt.completeness
-                                if selected_attempt is not None
-                                else "unknown"
-                            ),
-                            warnings=warnings,
-                        )
-                        sources.append(
-                            {
-                                "source_chunk_id": str(persisted_chunks[0].id),
-                                "source_snapshot_id": str(snapshot.id),
-                                "manifest": manifest,
-                            }
-                        )
+                    sources.append(
+                        self._project_web_source(snapshot, persisted_chunks, selected)
+                    )
                 discovered.append(
                     {
                         "source_id": str(snapshot.id),
@@ -1428,6 +1432,62 @@ class ResearchCoordinator:
             lease_owner=lease_owner,
         )
         return self._expand_long_source_context(run_id, query, sources)
+
+    def _persisted_web_sources(self, run_id: UUID) -> list[FrozenSource]:
+        """恢复时从既有 Snapshot/Chunk 重建来源引用，避免重复网页副作用"""
+        sources: list[FrozenSource] = []
+        with self._session_factory() as session:
+            snapshots = session.scalars(
+                select(SourceSnapshot)
+                .where(
+                    SourceSnapshot.run_id == run_id,
+                    SourceSnapshot.content_kind == "web_page",
+                    SourceSnapshot.invalidated_at.is_(None),
+                )
+                .order_by(SourceSnapshot.ordinal)
+            ).all()
+            for snapshot in snapshots:
+                chunks = session.scalars(
+                    select(SourceChunk)
+                    .where(SourceChunk.source_snapshot_id == snapshot.id)
+                    .order_by(SourceChunk.ordinal)
+                ).all()
+                if not chunks:
+                    continue
+                selected_attempt = session.scalar(
+                    select(WebAcquisitionAttempt)
+                    .where(WebAcquisitionAttempt.source_snapshot_id == snapshot.id)
+                    .order_by(WebAcquisitionAttempt.attempt_ordinal.desc())
+                )
+                sources.append(self._project_web_source(snapshot, list(chunks), selected_attempt))
+        return sources
+
+    def _project_web_source(
+        self,
+        snapshot: SourceSnapshot,
+        chunks: list[SourceChunk],
+        selected_attempt: object | None,
+    ) -> FrozenSource:
+        """把网页 Snapshot 与 Chunk 投影为单段引用或长页 Manifest"""
+        if len(chunks) == 1:
+            return self._freeze_source_chunk(chunks[0])
+        adapter_id = getattr(selected_attempt, "adapter_id", None)
+        adapter_version = getattr(selected_attempt, "adapter_version", None)
+        completeness = getattr(selected_attempt, "completeness", "unknown")
+        warning_category = getattr(selected_attempt, "warning_category", None)
+        return {
+            "source_chunk_id": str(chunks[0].id),
+            "source_snapshot_id": str(snapshot.id),
+            "manifest": build_source_manifest(
+                snapshot,
+                chunks,
+                token_estimator=self._token_estimator,
+                adapter_id=adapter_id if isinstance(adapter_id, str) else None,
+                adapter_version=adapter_version if isinstance(adapter_version, str) else None,
+                completeness=completeness if isinstance(completeness, str) else "unknown",
+                warnings=(warning_category,) if isinstance(warning_category, str) else (),
+            ),
+        }
 
     def _expand_long_source_context(
         self, run_id: UUID, query: str, sources: list[FrozenSource]

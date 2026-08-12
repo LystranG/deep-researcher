@@ -739,6 +739,40 @@ class SourceSnapshot(Base):
     invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class SourceMapWork(Base):
+    """记录一次可恢复的有界 Source Chunk map work"""
+
+    __tablename__ = "source_map_works"
+    __table_args__ = (
+        UniqueConstraint("run_id", "input_hash"),
+        Index("ix_source_map_works_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    ledger_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_ledgers.id", ondelete="CASCADE"), index=True
+    )
+    source_snapshot_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_snapshots.id", ondelete="CASCADE"), index=True
+    )
+    snapshot_hash: Mapped[str] = mapped_column(String(64))
+    chunk_ids: Mapped[list[str]] = mapped_column(JSON)
+    chunk_hashes: Mapped[list[str]] = mapped_column(JSON)
+    input_hash: Mapped[str] = mapped_column(String(64))
+    prompt_version: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    digest: Mapped[dict[str, object] | None] = mapped_column(JSON, default=None)
+    failure_reason: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
 class WebAcquisitionAttempt(Base):
     """保存一次网页正文 Adapter 获取尝试的审计事实"""
 

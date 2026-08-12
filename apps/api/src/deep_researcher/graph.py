@@ -27,7 +27,8 @@ from deep_researcher.research_context import (
     citable_sources,
     freeze_research_context,
 )
-from deep_researcher.run_control import CancellationToken
+from deep_researcher.run_control import CancellationToken, RunCancelledError
+from deep_researcher.source_map import SourceMapContext, SourceMapLedger
 from deep_researcher.tool_execution import ToolCallSnapshot, ToolExecutionService, ToolOutcome
 
 
@@ -40,6 +41,8 @@ class ResearchState(TypedDict):
     tasks: list[TaskSpec]
     research_briefs: list[ResearchBrief]
     research_results: Annotated[list[ResearchFinding], operator.add]
+    map_contexts: list[SourceMapContext]
+    map_results: Annotated[list[str], operator.add]
     verification: NotRequired[VerificationResult]
     draft_answer: NotRequired[str]
     draft_deltas: NotRequired[list[str]]
@@ -58,6 +61,7 @@ class GraphRuntimeContext:
     model_gateway: ModelGateway
     researcher_gateway: ResearcherGateway
     tool_execution: ToolExecutionService
+    source_map_ledger: SourceMapLedger | None = None
     cancellation_token: CancellationToken | None = None
     agent_role: str = "researcher"
     skill_allowed_tools: frozenset[str] | None = None
@@ -68,6 +72,46 @@ class ResearchBranchState(TypedDict):
 
     research_brief: ResearchBrief
     sources: list[FrozenSource]
+
+
+class SourceMapBranchState(TypedDict):
+    """单个 bounded map Send 分支携带的完整 Chunk group"""
+
+    map_context: SourceMapContext
+
+
+def _route_source_maps(state: ResearchState) -> str | list[Send]:
+    """把有限 map work fan-out 到现有 LangGraph 执行面"""
+    if not state["map_contexts"]:
+        return "planner"
+    return [Send("source_mapper", {"map_context": context}) for context in state["map_contexts"]]
+
+
+async def _run_source_mapper(
+    state: SourceMapBranchState, runtime: Runtime[GraphRuntimeContext]
+) -> dict[str, list[str]]:
+    """执行单个 map work 并通过领域账本幂等提交派生结果"""
+    context = state["map_context"]
+    if runtime.context.cancellation_token is not None:
+        runtime.context.cancellation_token.raise_if_cancelled()
+    ledger = runtime.context.source_map_ledger
+    if ledger is None:
+        return {"map_results": []}
+    if ledger.completed_digest(context) is not None:
+        return {"map_results": [context.snapshot_hash]}
+    gateway = runtime.context.model_gateway
+    try:
+        digest = await gateway.acomplete_map_work(context)
+        if runtime.context.cancellation_token is not None:
+            runtime.context.cancellation_token.raise_if_cancelled()
+        if ledger.complete(context, digest):
+            return {"map_results": [context.snapshot_hash]}
+    except RunCancelledError:
+        raise
+    except Exception as exc:
+        ledger.fail(context, str(exc))
+        raise RuntimeError("Source map work 执行失败") from exc
+    return {"map_results": []}
 
 
 def _run_planner(state: ResearchState) -> PlannerOutput:
@@ -196,6 +240,7 @@ def _run_citation_validator(state: ResearchState) -> dict[str, object]:
 def build_research_graph(checkpointer: Any | None = None) -> Any:
     """构建 Flat StateGraph 及其受限 fan-out/fan-in 分支"""
     builder = StateGraph(ResearchState, context_schema=GraphRuntimeContext)
+    builder.add_node("source_mapper", _run_source_mapper)
     builder.add_node("planner", _run_planner)
     builder.add_node("tool_prepare", _prepare_tool_call)
     builder.add_node("tool_execution", _run_tool_execution)
@@ -203,7 +248,8 @@ def build_research_graph(checkpointer: Any | None = None) -> Any:
     builder.add_node("verifier", _run_verifier)
     builder.add_node("writer", _run_writer)
     builder.add_node("citation_validator", _run_citation_validator)
-    builder.add_edge(START, "planner")
+    builder.add_conditional_edges(START, _route_source_maps)
+    builder.add_edge("source_mapper", "planner")
     builder.add_edge("planner", "tool_prepare")
     builder.add_conditional_edges("tool_prepare", _route_after_tool_prepare)
     builder.add_conditional_edges("tool_execution", _route_researchers)
@@ -221,9 +267,15 @@ class ResearchGraphRunner:
         self,
         database_url: str | None = None,
         researcher_gateway: ResearcherGateway | None = None,
+        *,
+        max_concurrency: int = 4,
     ) -> None:
+        """初始化 Graph 与单个 Research Run 的最大并发数"""
+        if max_concurrency < 1:
+            raise ValueError("Graph 最大并发数必须大于零")
         self._database_url = database_url
         self._researcher_gateway = researcher_gateway or DeterministicResearcherGateway()
+        self._max_concurrency = max_concurrency
         self._local_checkpointer = InMemorySaver()
         self._graph = build_research_graph(self._local_checkpointer)
 
@@ -233,6 +285,8 @@ class ResearchGraphRunner:
         question: str,
         *,
         tool_execution: ToolExecutionService,
+        map_contexts: tuple[SourceMapContext, ...] = (),
+        source_map_ledger: SourceMapLedger | None = None,
         research_context: FrozenResearchContext | None = None,
         model_gateway: ModelGateway | None = None,
         resume: dict[str, str] | None = None,
@@ -257,6 +311,8 @@ class ResearchGraphRunner:
             "tasks": [],
             "research_briefs": [],
             "research_results": [],
+            "map_contexts": list(map_contexts),
+            "map_results": [],
         }
         if self._database_url and self._database_url.startswith("postgres"):
             async with postgres_checkpointer(self._database_url) as checkpointer:
@@ -265,6 +321,7 @@ class ResearchGraphRunner:
                     checkpointer,
                     model_gateway or ExtractiveModelGateway(),
                     tool_execution,
+                    source_map_ledger,
                     resume,
                     cancellation_token,
                     agent_role,
@@ -276,6 +333,7 @@ class ResearchGraphRunner:
             self._local_checkpointer,
             model_gateway or ExtractiveModelGateway(),
             tool_execution,
+            source_map_ledger,
             resume,
             cancellation_token,
             agent_role,
@@ -289,6 +347,7 @@ class ResearchGraphRunner:
         checkpointer: Any | None,
         model_gateway: ModelGateway,
         tool_execution: ToolExecutionService,
+        source_map_ledger: SourceMapLedger | None,
         resume: dict[str, str] | None,
         cancellation_token: CancellationToken | None,
         agent_role: str,
@@ -307,11 +366,15 @@ class ResearchGraphRunner:
         )
         async for update in graph.astream(
             graph_input,
-            config={"configurable": {"thread_id": f"run:{initial['run_id']}"}},
+            config={
+                "configurable": {"thread_id": f"run:{initial['run_id']}"},
+                "max_concurrency": self._max_concurrency,
+            },
             context=GraphRuntimeContext(
                 model_gateway=model_gateway,
                 researcher_gateway=self._researcher_gateway,
                 tool_execution=tool_execution,
+                source_map_ledger=source_map_ledger,
                 cancellation_token=cancellation_token,
                 agent_role=agent_role,
                 skill_allowed_tools=skill_allowed_tools,
@@ -331,6 +394,8 @@ class ResearchGraphRunner:
                     state.setdefault("research_results", []).extend(
                         node_update["research_results"]
                     )
+                if "map_results" in node_update:
+                    state.setdefault("map_results", []).extend(node_update["map_results"])
                 if "verification" in node_update:
                     state["verification"] = node_update["verification"]
                 if "draft_answer" in node_update:
@@ -357,6 +422,8 @@ class ResearchGraphRunner:
         question: str,
         *,
         tool_execution: ToolExecutionService,
+        map_contexts: tuple[SourceMapContext, ...] = (),
+        source_map_ledger: SourceMapLedger | None = None,
         research_context: FrozenResearchContext | None = None,
         model_gateway: ModelGateway | None = None,
         resume: dict[str, str] | None = None,
@@ -373,6 +440,8 @@ class ResearchGraphRunner:
                 research_context=research_context,
                 model_gateway=model_gateway,
                 tool_execution=tool_execution,
+                map_contexts=map_contexts,
+                source_map_ledger=source_map_ledger,
                 resume=resume,
                 cancellation_token=cancellation_token,
                 agent_role=agent_role,

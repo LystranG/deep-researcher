@@ -60,6 +60,7 @@ from deep_researcher.models import (
     SkillPackage,
     SkillVersion,
     SourceChunk,
+    SourceMapWork,
     SourceSnapshot,
     StopDecision,
     Todo,
@@ -262,6 +263,27 @@ class ResearchLedgerResponse(BaseModel):
     coverage: LedgerCoverageResponse | None
     gaps: list[LedgerGapResponse]
     stop_decision: LedgerStopDecisionResponse | None
+
+
+class SourceMapWorkResponse(BaseModel):
+    """公开可审计的 bounded map work 与派生结果"""
+
+    id: str
+    source_snapshot_id: str
+    snapshot_hash: str
+    chunk_ids: list[str]
+    chunk_hashes: list[str]
+    input_hash: str
+    prompt_version: str
+    status: str
+    digest: dict[str, object] | None
+    failure_reason: str | None
+
+
+class SourceMapWorkListResponse(BaseModel):
+    """公开 Research Run 的有限 map work 列表"""
+
+    items: list[SourceMapWorkResponse]
 
 
 class TodoResponse(BaseModel):
@@ -675,7 +697,11 @@ def create_app(
         token_estimator=token_estimator,
         require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
         step_delay_seconds=resolved_settings.research_step_delay_seconds,
-        graph_runner=graph_runner or ResearchGraphRunner(resolved_settings.database_url),
+        graph_runner=graph_runner
+        or ResearchGraphRunner(
+            resolved_settings.database_url,
+            max_concurrency=resolved_settings.map_work_max_concurrency,
+        ),
         embedding_gateway=resolved_embedding_gateway,
         retrieval=retrieval,
         sandbox_submitter=lambda execution_id: sandbox_executor.submit(
@@ -1882,6 +1908,43 @@ def create_app(
                 if stop_decision is not None
                 else None
             ),
+        )
+
+    @app.get(
+        "/api/v1/runs/{run_id}/map-works",
+        response_model=SourceMapWorkListResponse,
+    )
+    def list_source_map_works(
+        run_id: UUID,
+        session: SessionDependency,
+        user: CurrentUser,
+    ) -> SourceMapWorkListResponse:
+        """返回当前用户可访问运行的 bounded map work 账本"""
+        run = accessible_run(session, user, run_id)
+        works = session.scalars(
+            select(SourceMapWork)
+            .where(
+                SourceMapWork.run_id == run.id,
+                SourceMapWork.workspace_id == run.workspace_id,
+            )
+            .order_by(SourceMapWork.created_at, SourceMapWork.id)
+        ).all()
+        return SourceMapWorkListResponse(
+            items=[
+                SourceMapWorkResponse(
+                    id=str(work.id),
+                    source_snapshot_id=str(work.source_snapshot_id),
+                    snapshot_hash=work.snapshot_hash,
+                    chunk_ids=work.chunk_ids,
+                    chunk_hashes=work.chunk_hashes,
+                    input_hash=work.input_hash,
+                    prompt_version=work.prompt_version,
+                    status=work.status,
+                    digest=work.digest,
+                    failure_reason=work.failure_reason,
+                )
+                for work in works
+            ]
         )
 
     @app.get("/api/v1/runs/{run_id}/todos", response_model=TodoListResponse)
