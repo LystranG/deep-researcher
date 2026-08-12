@@ -83,6 +83,7 @@ from deep_researcher.retrieval import (
     HybridRetrieval,
     LiteLLMEmbeddingGateway,
     LiteLLMRerankGateway,
+    LiteLLMTokenEstimator,
     PostgresConversationSegmentRetrievalAdapter,
     PostgresMemoryRetrievalAdapter,
     PostgresResearchRecordRetrievalAdapter,
@@ -633,6 +634,9 @@ def create_app(
     retrieval = (
         HybridRetrieval(
             resolved_rerank_gateway,
+            embedding_gateway=resolved_embedding_gateway,
+            token_estimator=LiteLLMTokenEstimator(resolved_settings.openai_model),
+            session_factory=session_factory,
             source_chunk_adapter=PostgresSourceChunkRetrievalAdapter(),
             conversation_segment_adapter=PostgresConversationSegmentRetrievalAdapter(),
             memory_adapter=PostgresMemoryRetrievalAdapter(),
@@ -664,6 +668,9 @@ def create_app(
         tool_execution=tool_execution,
         run_token_budget=resolved_settings.run_token_budget,
         run_cost_budget_usd=resolved_settings.run_cost_budget_usd,
+        model_context_tokens=resolved_settings.model_context_tokens,
+        model_output_token_reserve=resolved_settings.model_output_token_reserve,
+        model_context_safety_margin=resolved_settings.model_context_safety_margin,
         require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
         step_delay_seconds=resolved_settings.research_step_delay_seconds,
         graph_runner=graph_runner or ResearchGraphRunner(resolved_settings.database_url),

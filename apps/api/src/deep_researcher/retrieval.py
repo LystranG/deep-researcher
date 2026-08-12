@@ -1,13 +1,15 @@
 import math
+import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from threading import Lock
 from typing import Any, Protocol
 from uuid import UUID
 
 from sqlalchemy import and_, desc, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.models import (
     Attachment,
@@ -15,10 +17,13 @@ from deep_researcher.models import (
     ConversationSegment,
     Document,
     DocumentVersion,
+    EvidenceSpan,
     Memory,
     ResearchRecord,
     SourceChunk,
 )
+
+_litellm_import_lock = Lock()
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,99 @@ class RankedCandidate:
     rank: int
 
 
+class TokenEstimator(Protocol):
+    """按目标模型计算文本 token 数的 Adapter"""
+
+    def count_tokens(self, text: str) -> int:
+        """返回文本在目标模型下的 token 数"""
+        ...
+
+
+class LiteLLMTokenEstimator:
+    """使用目标模型兼容 tokenizer 统计本地文本 token"""
+
+    def __init__(self, model: str) -> None:
+        """保存需要匹配 tokenizer 的模型名"""
+        self._model = model
+
+    def count_tokens(self, text: str) -> int:
+        """使用 LiteLLM 匹配模型 tokenizer 并返回文本 token 数"""
+        with _litellm_import_lock:
+            prior_mode = os.environ.get("LITELLM_MODE")
+            os.environ["LITELLM_MODE"] = "PRODUCTION"
+            try:
+                from litellm import token_counter
+            finally:
+                if prior_mode is None:
+                    os.environ.pop("LITELLM_MODE", None)
+                else:
+                    os.environ["LITELLM_MODE"] = prior_mode
+
+        return int(token_counter(model=self._model, text=text))
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """描述单次模型输入的固定预留与 evidence 可用空间"""
+
+    model_context_tokens: int
+    policy_and_prompt: str
+    compact_conversation: str
+    tool_schema: str
+    requested_output_reserve: int
+    safety_margin: int
+
+    def evidence_capacity(self, estimator: TokenEstimator) -> int:
+        """扣除固定输入、输出预留和安全边际后返回 evidence 容量"""
+        fixed_input = sum(
+            estimator.count_tokens(text)
+            for text in (
+                self.policy_and_prompt,
+                self.compact_conversation,
+                self.tool_schema,
+            )
+        )
+        return max(
+            0,
+            self.model_context_tokens
+            - fixed_input
+            - self.requested_output_reserve
+            - self.safety_margin,
+        )
+
+
+@dataclass(frozen=True)
+class RetrievalRequest:
+    """封装一次 ACL 感知 Workspace 检索所需的调用方输入"""
+
+    workspace_id: UUID
+    user_id: UUID
+    conversation_id: UUID
+    query: str
+    context_budget: ContextBudget
+    source_kinds: tuple[str, ...] = (
+        "source_chunk",
+        "conversation_segment",
+        "memory",
+        "research_record",
+    )
+    candidate_limit: int = 50
+    result_limit: int = 10
+    cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class RetrievalPage:
+    """返回有界 evidence、预算余量和继续读取位置"""
+
+    items: tuple[RankedCandidate, ...]
+    consumed_tokens: int
+    remaining_tokens: int
+    cursor: str | None
+    omitted_ids: tuple[str, ...]
+    completeness: str
+
+
 class EmbeddingGateway(Protocol):
     """生成文档和查询向量的 Adapter"""
 
@@ -62,9 +160,7 @@ class EmbeddingGateway(Protocol):
 class RerankGateway(Protocol):
     """根据查询对候选文本进行精排的 Adapter"""
 
-    def rerank(
-        self, query: str, documents: Sequence[str], top_n: int
-    ) -> list[tuple[int, float]]:
+    def rerank(self, query: str, documents: Sequence[str], top_n: int) -> list[tuple[int, float]]:
         """按查询相关性返回候选下标和分数"""
         ...
 
@@ -129,6 +225,7 @@ class ResearchRecordRetrievalAdapter(Protocol):
         session: Session,
         *,
         workspace_id: UUID,
+        conversation_id: UUID,
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
@@ -195,19 +292,13 @@ class PostgresSourceChunkRetrievalAdapter:
             conversation_id=conversation_id,
         )
         if session.bind is None or session.bind.dialect.name != "postgresql":
-            chunks = session.scalars(
-                eligible.order_by(SourceChunk.ordinal).limit(limit)
-            ).all()
+            chunks = session.scalars(eligible.order_by(SourceChunk.ordinal).limit(limit)).all()
             return [self._candidate(chunk) for chunk in chunks]
 
         lexical_query = func.websearch_to_tsquery("simple", query)
-        lexical_rank = func.ts_rank_cd(
-            func.to_tsvector("simple", SourceChunk.text), lexical_query
-        )
+        lexical_rank = func.ts_rank_cd(func.to_tsvector("simple", SourceChunk.text), lexical_query)
         lexical_rows = session.execute(
-            eligible.where(
-                func.to_tsvector("simple", SourceChunk.text).op("@@")(lexical_query)
-            )
+            eligible.where(func.to_tsvector("simple", SourceChunk.text).op("@@")(lexical_query))
             .add_columns(lexical_rank.label("lexical_rank"))
             .order_by(desc(lexical_rank), SourceChunk.ordinal)
             .limit(limit)
@@ -306,17 +397,13 @@ class PostgresConversationSegmentRetrievalAdapter:
         )
         lexical_rows = session.execute(
             eligible.where(
-                func.to_tsvector("simple", ConversationSegment.text).op("@@")(
-                    lexical_query
-                )
+                func.to_tsvector("simple", ConversationSegment.text).op("@@")(lexical_query)
             )
             .add_columns(lexical_rank.label("lexical_rank"))
             .order_by(desc(lexical_rank), ConversationSegment.ordinal)
             .limit(limit)
         ).all()
-        vector_distance = ConversationSegment.embedding.cosine_distance(
-            list(query_embedding)
-        )
+        vector_distance = ConversationSegment.embedding.cosine_distance(list(query_embedding))
         vector_rows = session.execute(
             eligible.where(ConversationSegment.embedding.is_not(None))
             .add_columns(vector_distance.label("vector_distance"))
@@ -395,13 +482,9 @@ class PostgresMemoryRetrievalAdapter:
             return [self._candidate(memory) for memory in memories]
 
         lexical_query = func.websearch_to_tsquery("simple", query)
-        lexical_rank = func.ts_rank_cd(
-            func.to_tsvector("simple", Memory.content), lexical_query
-        )
+        lexical_rank = func.ts_rank_cd(func.to_tsvector("simple", Memory.content), lexical_query)
         lexical_rows = session.execute(
-            eligible.where(
-                func.to_tsvector("simple", Memory.content).op("@@")(lexical_query)
-            )
+            eligible.where(func.to_tsvector("simple", Memory.content).op("@@")(lexical_query))
             .add_columns(lexical_rank.label("lexical_rank"))
             .order_by(desc(lexical_rank), Memory.created_at)
             .limit(limit)
@@ -425,9 +508,7 @@ class PostgresMemoryRetrievalAdapter:
         return list(candidates.values())
 
     @staticmethod
-    def _eligible_query(
-        *, workspace_id: UUID, user_id: UUID, conversation_id: UUID
-    ) -> Any:
+    def _eligible_query(*, workspace_id: UUID, user_id: UUID, conversation_id: UUID) -> Any:
         """构建状态、有效期和可见范围过滤后的 Memory 查询"""
         now = datetime.now(UTC)
         return select(Memory).where(
@@ -467,6 +548,7 @@ class PostgresResearchRecordRetrievalAdapter:
         session: Session,
         *,
         workspace_id: UUID,
+        conversation_id: UUID,
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
@@ -475,6 +557,19 @@ class PostgresResearchRecordRetrievalAdapter:
         if limit <= 0:
             return []
         eligible = self._eligible_query(workspace_id=workspace_id)
+        visible_ids = [
+            record.id
+            for record in session.scalars(eligible).all()
+            if self._has_visible_evidence(
+                session,
+                record,
+                workspace_id=workspace_id,
+                conversation_id=conversation_id,
+            )
+        ]
+        if not visible_ids:
+            return []
+        eligible = eligible.where(ResearchRecord.id.in_(visible_ids))
         if session.bind is None or session.bind.dialect.name != "postgresql":
             records = session.scalars(
                 eligible.order_by(ResearchRecord.created_at).limit(limit)
@@ -487,9 +582,7 @@ class PostgresResearchRecordRetrievalAdapter:
         )
         lexical_rows = session.execute(
             eligible.where(
-                func.to_tsvector("simple", ResearchRecord.claim_text).op("@@")(
-                    lexical_query
-                )
+                func.to_tsvector("simple", ResearchRecord.claim_text).op("@@")(lexical_query)
             )
             .add_columns(lexical_rank.label("lexical_rank"))
             .order_by(desc(lexical_rank), ResearchRecord.created_at)
@@ -512,6 +605,63 @@ class PostgresResearchRecordRetrievalAdapter:
             candidates.setdefault(str(record.id), self._candidate(record))
             candidates[str(record.id)].metadata["vector_rank"] = str(rank)
         return list(candidates.values())
+
+    @staticmethod
+    def _has_visible_evidence(
+        session: Session,
+        record: ResearchRecord,
+        *,
+        workspace_id: UUID,
+        conversation_id: UUID,
+    ) -> bool:
+        """验证研究记录至少有一条当前调用方仍可访问的证据链"""
+        for evidence_ref in record.evidence_refs:
+            span_id = evidence_ref.get("evidence_span_id")
+            if span_id is None:
+                continue
+            try:
+                span = session.get(EvidenceSpan, UUID(str(span_id)))
+            except ValueError:
+                continue
+            if span is None or span.workspace_id != workspace_id:
+                continue
+            chunk = session.get(SourceChunk, span.source_chunk_id)
+            if (
+                chunk is None
+                or chunk.workspace_id != workspace_id
+                or chunk.content_hash != span.content_hash
+                or evidence_ref.get("source_hash") != span.content_hash
+            ):
+                continue
+            if chunk.attachment_id is not None:
+                attachment = session.get(Attachment, chunk.attachment_id)
+                if (
+                    attachment is None
+                    or attachment.workspace_id != workspace_id
+                    or attachment.status != "ready"
+                    or attachment.deleted_at is not None
+                    or chunk.conversation_id != conversation_id
+                ):
+                    continue
+            if chunk.document_version_id is not None:
+                version = session.get(DocumentVersion, chunk.document_version_id)
+                document = (
+                    session.get(Document, version.document_id) if version is not None else None
+                )
+                if (
+                    version is None
+                    or document is None
+                    or document.workspace_id != workspace_id
+                    or document.deleted_at is not None
+                    or version.version != document.current_version
+                ):
+                    continue
+            local_start = span.start_offset - chunk.start_offset
+            local_end = span.end_offset - chunk.start_offset
+            if local_start < 0 or local_end > len(chunk.text) or local_start >= local_end:
+                continue
+            return True
+        return False
 
     @staticmethod
     def _eligible_query(*, workspace_id: UUID) -> Any:
@@ -575,6 +725,9 @@ class HybridRetrieval:
         rerank_gateway: RerankGateway,
         *,
         rrf_k: int = 60,
+        embedding_gateway: EmbeddingGateway | None = None,
+        token_estimator: TokenEstimator | None = None,
+        session_factory: sessionmaker[Session] | None = None,
         source_chunk_adapter: SourceChunkRetrievalAdapter | None = None,
         conversation_segment_adapter: ConversationSegmentRetrievalAdapter | None = None,
         memory_adapter: MemoryRetrievalAdapter | None = None,
@@ -583,10 +736,111 @@ class HybridRetrieval:
         """初始化混合检索所需的精排与持久化 Adapter"""
         self._rerank_gateway = rerank_gateway
         self._rrf_k = rrf_k
+        self._embedding_gateway = embedding_gateway
+        self._token_estimator = token_estimator
+        self._session_factory = session_factory
         self._source_chunk_adapter = source_chunk_adapter
         self._conversation_segment_adapter = conversation_segment_adapter
         self._memory_adapter = memory_adapter
         self._research_record_adapter = research_record_adapter
+
+    def retrieve(self, request: RetrievalRequest) -> RetrievalPage:
+        """统一完成可见候选召回、融合精排、去重和 Context Budget 组页"""
+        if (
+            self._session_factory is None
+            or self._token_estimator is None
+            or self._embedding_gateway is None
+        ):
+            raise RuntimeError(
+                "RetrievalPage 需要 session factory、embedding gateway 与 token estimator"
+            )
+        query_embedding = self._embedding_gateway.embed_query(request.query)
+        candidates: list[RetrievalCandidate] = []
+        with self._session_factory() as session:
+            if "source_chunk" in request.source_kinds:
+                candidates.extend(
+                    self.recall_source_chunks(
+                        session,
+                        workspace_id=request.workspace_id,
+                        conversation_id=request.conversation_id,
+                        query=request.query,
+                        query_embedding=query_embedding,
+                        limit=request.candidate_limit,
+                    )
+                )
+            if "conversation_segment" in request.source_kinds:
+                candidates.extend(
+                    self.recall_conversation_segments(
+                        session,
+                        workspace_id=request.workspace_id,
+                        conversation_id=request.conversation_id,
+                        query=request.query,
+                        query_embedding=query_embedding,
+                        limit=request.candidate_limit,
+                    )
+                )
+            if "memory" in request.source_kinds:
+                candidates.extend(
+                    self.recall_memories(
+                        session,
+                        workspace_id=request.workspace_id,
+                        user_id=request.user_id,
+                        conversation_id=request.conversation_id,
+                        query=request.query,
+                        query_embedding=query_embedding,
+                        limit=request.candidate_limit,
+                    )
+                )
+            if "research_record" in request.source_kinds:
+                candidates.extend(
+                    self.recall_research_records(
+                        session,
+                        workspace_id=request.workspace_id,
+                        conversation_id=request.conversation_id,
+                        query=request.query,
+                        query_embedding=query_embedding,
+                        limit=request.candidate_limit,
+                    )
+                )
+
+        deduplicated: dict[str, RetrievalCandidate] = {}
+        for candidate in candidates:
+            deduplicated.setdefault(candidate.content_hash, candidate)
+        ranked = self.rank(
+            request.query,
+            list(deduplicated.values()),
+            limit=min(request.candidate_limit, len(deduplicated)),
+            query_embedding=query_embedding,
+            rerank_limit=request.candidate_limit,
+        )
+        offset = int(request.cursor or "0")
+        capacity = request.context_budget.evidence_capacity(self._token_estimator)
+        selected: list[RankedCandidate] = []
+        permanently_omitted: list[str] = []
+        consumed = 0
+        next_offset = offset
+        while next_offset < len(ranked):
+            item = ranked[next_offset]
+            item_tokens = self._token_estimator.count_tokens(item.candidate.text)
+            if item_tokens > capacity:
+                permanently_omitted.append(item.candidate.candidate_id)
+                next_offset += 1
+                continue
+            if consumed + item_tokens > capacity or len(selected) >= request.result_limit:
+                break
+            selected.append(item)
+            consumed += item_tokens
+            next_offset += 1
+        deferred = tuple(item.candidate.candidate_id for item in ranked[next_offset:])
+        omitted = (*permanently_omitted, *deferred)
+        return RetrievalPage(
+            items=tuple(selected),
+            consumed_tokens=consumed,
+            remaining_tokens=capacity - consumed,
+            cursor=str(next_offset) if deferred else None,
+            omitted_ids=omitted,
+            completeness="partial" if omitted else "complete",
+        )
 
     def recall_source_chunks(
         self,
@@ -661,6 +915,7 @@ class HybridRetrieval:
         session: Session,
         *,
         workspace_id: UUID,
+        conversation_id: UUID,
         query: str,
         query_embedding: tuple[float, ...],
         limit: int,
@@ -671,6 +926,7 @@ class HybridRetrieval:
         return self._research_record_adapter.recall(
             session,
             workspace_id=workspace_id,
+            conversation_id=conversation_id,
             query=query,
             query_embedding=query_embedding,
             limit=limit,
@@ -684,7 +940,6 @@ class HybridRetrieval:
         limit: int,
         query_embedding: tuple[float, ...] | None = None,
         rerank_limit: int | None = None,
-        token_budget: int | None = None,
     ) -> list[RankedCandidate]:
         """融合候选并返回不超过限制的结果"""
         if limit <= 0 or not candidates:
@@ -747,8 +1002,6 @@ class HybridRetrieval:
             if rerank_index < 0 or rerank_index >= len(rerank_indexes):
                 continue
             candidate = candidates[rerank_indexes[rerank_index]]
-            if token_budget is not None and self._token_size(output, candidate) > token_budget:
-                break
             output.append(RankedCandidate(candidate=candidate, score=score, rank=rank))
             if len(output) >= limit:
                 break
@@ -781,8 +1034,3 @@ class HybridRetrieval:
             if denominator
             else 0.0
         )
-
-    @staticmethod
-    def _token_size(output: Sequence[RankedCandidate], candidate: RetrievalCandidate) -> int:
-        """估算已选候选和新候选的 token 占用"""
-        return sum(len(item.candidate.text) for item in output) + len(candidate.text)

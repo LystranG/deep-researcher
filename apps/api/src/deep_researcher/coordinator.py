@@ -52,8 +52,11 @@ from deep_researcher.research_context import (
     freeze_research_context,
 )
 from deep_researcher.retrieval import (
+    ContextBudget,
     EmbeddingGateway,
     HybridRetrieval,
+    RetrievalPage,
+    RetrievalRequest,
 )
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
@@ -76,6 +79,9 @@ class ResearchCoordinator:
         tool_execution: ToolExecutionService,
         run_token_budget: int,
         run_cost_budget_usd: float,
+        model_context_tokens: int,
+        model_output_token_reserve: int,
+        model_context_safety_margin: int,
         require_web_search_for_external_model: bool,
         step_delay_seconds: float = 0.0,
         graph_runner: ResearchGraphRunner | None = None,
@@ -97,6 +103,9 @@ class ResearchCoordinator:
         self._tool_execution = tool_execution
         self._run_token_budget = run_token_budget
         self._run_cost_budget_usd = run_cost_budget_usd
+        self._model_context_tokens = model_context_tokens
+        self._model_output_token_reserve = model_output_token_reserve
+        self._model_context_safety_margin = model_context_safety_margin
         self._require_web_search_for_external_model = require_web_search_for_external_model
         self._step_delay_seconds = step_delay_seconds
         self._graph_runner = graph_runner or ResearchGraphRunner()
@@ -126,12 +135,16 @@ class ResearchCoordinator:
                 skill_slugs, skill_allowed_tools = self._effective_skill_capabilities(
                     session, run
                 )
-                evidence = self._best_evidence(session, run, question)
                 correction = self._latest_relevant_correction(session, run, trigger)
-                memory = self._best_memory(session, run, question)
-                conversation_lead = self._best_conversation_lead(
-                    session, run, question
+                retrieval_page = self._retrieve_workspace_context(
+                    run,
+                    question,
+                    compact_conversation=trigger.content,
+                    tool_schema=json.dumps(sorted(skill_allowed_tools or ())),
                 )
+                evidence = self._best_evidence(session, run, question, retrieval_page)
+                memory = self._best_memory(session, run, question, retrieval_page)
+                conversation_lead = self._best_conversation_lead(retrieval_page)
 
             if resume is None:
                 self._append_event(
@@ -799,39 +812,81 @@ class ResearchCoordinator:
                 or (lease_owner is not None and run.lease_owner != lease_owner)
             )
 
-    def _best_conversation_lead(
+    def _retrieve_workspace_context(
         self,
-        session: Session,
         run: ResearchRun,
         query: str,
-    ) -> str | None:
-        """返回同 Workspace 其他会话中最相关的低信任线索"""
-        if self._retrieval is None or self._embedding_gateway is None:
+        *,
+        compact_conversation: str,
+        tool_schema: str,
+    ) -> RetrievalPage | None:
+        """按单次模型 Context Budget 统一读取当前运行可见上下文"""
+        if self._retrieval is None:
             return None
-        query_embedding = self._embedding_gateway.embed_query(query)
-        candidates = self._retrieval.recall_conversation_segments(
-            session,
-            workspace_id=run.workspace_id,
-            conversation_id=run.conversation_id,
-            query=query,
-            query_embedding=query_embedding,
-            limit=50,
+        if run.initiated_by_user_id is None:
+            raise RuntimeError("研究运行缺少发起用户")
+        return self._retrieval.retrieve(
+            RetrievalRequest(
+                workspace_id=run.workspace_id,
+                user_id=run.initiated_by_user_id,
+                conversation_id=run.conversation_id,
+                query=query,
+                context_budget=ContextBudget(
+                    model_context_tokens=self._model_context_tokens,
+                    policy_and_prompt="仅使用可访问证据回答并保持 Citation 可核验",
+                    compact_conversation=compact_conversation,
+                    tool_schema=tool_schema,
+                    requested_output_reserve=self._model_output_token_reserve,
+                    safety_margin=self._model_context_safety_margin,
+                ),
+                candidate_limit=50,
+                result_limit=10,
+            )
         )
-        ranked = self._retrieval.rank(
-            query,
-            candidates,
-            limit=1,
-            query_embedding=query_embedding,
+
+    @staticmethod
+    def _best_conversation_lead(page: RetrievalPage | None) -> str | None:
+        """返回统一检索页中排名最高的低信任会话线索"""
+        if page is None:
+            return None
+        return next(
+            (
+                item.candidate.text
+                for item in page.items
+                if item.candidate.source_kind == "conversation_lead"
+            ),
+            None,
         )
-        return ranked[0].candidate.text if ranked else None
 
     def _best_evidence(
         self,
         session: Session,
         run: ResearchRun,
         query: str,
+        page: RetrievalPage | None,
     ) -> FrozenSource | None:
-        """统一召回直接来源与研究记录，并冻结最终可引用的原始证据"""
+        """从统一检索页选择排名最高的来源并冻结可引用原始证据"""
+        if page is not None:
+            selected = next(
+                (
+                    item.candidate
+                    for item in page.items
+                    if item.candidate.source_kind in {"source_chunk", "research_record"}
+                ),
+                None,
+            )
+            if selected is None:
+                return None
+            if selected.source_kind == "research_record":
+                return self._frozen_research_record_source(
+                    session, run, UUID(selected.candidate_id)
+                )
+            selected_chunk = session.get(SourceChunk, UUID(selected.candidate_id))
+            return (
+                self._freeze_source_chunk(selected_chunk)
+                if selected_chunk is not None
+                else None
+            )
         private_chunks = session.scalars(
             select(SourceChunk)
             .join(Attachment, Attachment.id == SourceChunk.attachment_id)
@@ -856,50 +911,6 @@ class ResearchCoordinator:
         candidates: dict[str, SourceChunk] = {}
         for chunk in [*workspace_chunks, *private_chunks]:
             candidates.setdefault(chunk.content_hash, chunk)
-        if self._retrieval is not None and self._embedding_gateway is not None:
-            query_embedding = self._embedding_gateway.embed_query(query)
-            source_candidates = self._retrieval.recall_source_chunks(
-                session,
-                workspace_id=run.workspace_id,
-                conversation_id=run.conversation_id,
-                query=query,
-                query_embedding=query_embedding,
-                limit=50,
-            )
-            record_candidates = self._retrieval.recall_research_records(
-                session,
-                workspace_id=run.workspace_id,
-                query=query,
-                query_embedding=query_embedding,
-                limit=50,
-            )
-            valid_record_sources: dict[str, FrozenSource] = {}
-            valid_record_candidates = []
-            for candidate in record_candidates:
-                frozen_source = self._frozen_research_record_source(
-                    session, run, UUID(candidate.candidate_id)
-                )
-                if frozen_source is None:
-                    continue
-                valid_record_sources[candidate.candidate_id] = frozen_source
-                valid_record_candidates.append(candidate)
-            ranked_candidates = self._retrieval.rank(
-                query,
-                [*source_candidates, *valid_record_candidates],
-                limit=1,
-                query_embedding=query_embedding,
-            )
-            if ranked_candidates:
-                selected = ranked_candidates[0].candidate
-                if selected.source_kind == "research_record":
-                    return valid_record_sources[selected.candidate_id]
-                selected_chunk = session.get(SourceChunk, UUID(selected.candidate_id))
-                return (
-                    self._freeze_source_chunk(selected_chunk)
-                    if selected_chunk is not None
-                    else None
-                )
-            return None
         lexical_ranked = sorted(
             ((self._lexical_score(query, chunk.text), chunk) for chunk in candidates.values()),
             key=lambda item: item[0],
@@ -1358,32 +1369,21 @@ class ResearchCoordinator:
         session: Session,
         run: ResearchRun,
         query: str,
+        page: RetrievalPage | None,
     ) -> Memory | None:
         initiated_by_user_id = run.initiated_by_user_id
         if initiated_by_user_id is None:
             raise RuntimeError("研究运行缺少发起用户")
-        if self._retrieval is not None and self._embedding_gateway is not None:
-            query_embedding = self._embedding_gateway.embed_query(query)
-            candidates = self._retrieval.recall_memories(
-                session,
-                workspace_id=run.workspace_id,
-                user_id=initiated_by_user_id,
-                conversation_id=run.conversation_id,
-                query=query,
-                query_embedding=query_embedding,
-                limit=50,
+        if page is not None:
+            selected = next(
+                (
+                    item.candidate
+                    for item in page.items
+                    if item.candidate.source_kind == "memory"
+                ),
+                None,
             )
-            ranked_memories = self._retrieval.rank(
-                query,
-                candidates,
-                limit=1,
-                query_embedding=query_embedding,
-            )
-            if not ranked_memories:
-                return None
-            return session.get(
-                Memory, UUID(ranked_memories[0].candidate.candidate_id)
-            )
+            return session.get(Memory, UUID(selected.candidate_id)) if selected else None
         now = datetime.now(UTC)
         memories = session.scalars(
             select(Memory).where(
@@ -1570,7 +1570,7 @@ class ResearchCoordinator:
                 run is None
                 or run.status in {"cancelled", "completed", "failed"}
                 or (lease_owner is not None and run.lease_owner != lease_owner)
-            ):
+                ):
                 return
             run.status = "cancelled"
             self._quota_service.release(session, run)
@@ -1613,7 +1613,7 @@ class ResearchCoordinator:
                 run is None
                 or run.status in {"cancelled", "completed", "failed"}
                 or (lease_owner is not None and run.lease_owner != lease_owner)
-                ):
+            ):
                 return
             run.status = "failed"
             self._quota_service.release(session, run)

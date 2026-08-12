@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     research_step_delay_seconds: float = 0.0
     run_token_budget: int = 10_000
     run_cost_budget_usd: float = 1.0
+    model_context_tokens: int = 128_000
+    model_output_token_reserve: int = 4_096
+    model_context_safety_margin: int = 1_024
     workspace_token_quota: int = 100_000
     workspace_cost_quota_usd: float = 50.0
     max_attachment_bytes: int = 50 * 1024 * 1024
