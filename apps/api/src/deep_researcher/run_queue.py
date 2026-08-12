@@ -71,6 +71,6 @@ class RunQueue:
             )
             if run is None:
                 return
-            if run.status in {"completed", "cancelled", "failed"}:
+            if run.status in {"completed", "partial", "cancelled", "failed"}:
                 run.lease_owner = None
                 run.lease_expires_at = None

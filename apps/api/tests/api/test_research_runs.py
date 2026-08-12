@@ -66,6 +66,23 @@ class OneBranchFailureResearcher:
         }
 
 
+class SupportedWithoutEvidenceGraphRunner:
+    """让无来源运行返回 supported 以验证账本仍拒绝无主张完成"""
+
+    def __init__(self) -> None:
+        """初始化确定性 Graph 委托"""
+        self._delegate = ResearchGraphRunner()
+
+    def run(self, *args, **kwargs):
+        """执行真实 Graph 并将核验结果改为 supported"""
+        state = self._delegate.run(*args, **kwargs)
+        state["verification"] = {
+            "status": "supported",
+            "summary": "模型认为回答充分",
+        }
+        return state
+
+
 def register(client: TestClient) -> dict[str, str]:
     response = client.post(
         "/api/v1/auth/register",
@@ -196,6 +213,9 @@ def test_complex_research_budget_failure_skips_downstream_work_and_exposes_impac
         detail = client.get(
             f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
         ).json()
+        ledger = client.get(
+            f"/api/v1/runs/{created['run_id']}/ledger", headers=headers
+        ).json()
 
     assert events.status_code == 200
     assert "event: run_failed" in events.text
@@ -204,6 +224,11 @@ def test_complex_research_budget_failure_skips_downstream_work_and_exposes_impac
     assert detail["tasks"][1]["status"] == "skipped"
     assert detail["tasks"][2]["status"] == "skipped"
     assert all(task["failure_impact"] for task in detail["tasks"])
+    assert ledger["gaps"][0]["description"] == "当前任务预算耗尽，研究无法继续"
+    assert ledger["stop_decision"] == {
+        "reason": "failed",
+        "completeness": "partial",
+    }
 
 
 def test_one_researcher_branch_failure_keeps_other_work_and_marks_evidence_insufficient(
@@ -231,17 +256,62 @@ def test_one_researcher_branch_failure_keeps_other_work_and_marks_evidence_insuf
         detail = client.get(
             f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
         ).json()
+        ledger = client.get(
+            f"/api/v1/runs/{run['run_id']}/ledger", headers=headers
+        ).json()
         messages = client.get(
             f"/api/v1/conversations/{conversation_id}/messages", headers=headers
         ).json()["items"]
 
-    assert detail["status"] == "completed"
+    assert detail["status"] == "partial"
     assert [task["status"] for task in detail["tasks"]] == ["failed", "completed", "completed"]
     assert detail["tasks"][0]["failure_impact"] == "部分研究分支失败，最终回答的证据可能不完整"
+    assert ledger["coverage"]["complete"] is False
+    assert ledger["gaps"][0]["description"] == "部分研究分支失败，最终回答的证据可能不完整"
+    assert ledger["stop_decision"] == {
+        "reason": "blocking_evidence_gap",
+        "completeness": "partial",
+    }
     assert "证据不足" in messages[-1]["content"]
     assert "event: run_completed" in events.text
     assert "event: run_failed" not in events.text
     assert "[" not in messages[-1]["content"]
+
+
+def test_supported_run_without_verified_claim_remains_partial(tmp_path) -> None:
+    """验证没有 verified Claim 时模型核验结果不能把运行标记为完成"""
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    with running_worker_client(
+        settings,
+        graph_runner=SupportedWithoutEvidenceGraphRunner(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "no-verified-claim"},
+            json={"content": "在没有来源时给出结论"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        ledger = client.get(
+            f"/api/v1/runs/{run['run_id']}/ledger", headers=headers
+        ).json()
+
+    assert detail["status"] == "partial"
+    assert ledger["coverage"]["verified_claim_count"] == 0
+    assert ledger["coverage"]["complete"] is False
+    assert ledger["gaps"][0]["description"] == "运行没有经过核验的 Claim"
+    assert ledger["stop_decision"] == {
+        "reason": "no_verified_claim",
+        "completeness": "partial",
+    }
 
 
 def test_reconnecting_stream_replays_only_events_after_last_event_id(tmp_path) -> None:

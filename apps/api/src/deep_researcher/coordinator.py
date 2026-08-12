@@ -60,6 +60,7 @@ from deep_researcher.retrieval import (
 )
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
+from deep_researcher.stop_policy import StopPolicyInput, decide_stop
 from deep_researcher.tool_execution import ToolExecutionService
 from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
 from deep_researcher.web_search import SearchResult, SearchUnavailableError, WebSearchGateway
@@ -271,7 +272,7 @@ class ResearchCoordinator:
                 )
                 if (
                     run is None
-                    or run.status in {"cancelled", "completed", "failed"}
+                    or run.status in {"cancelled", "completed", "partial", "failed"}
                     or (lease_owner is not None and run.lease_owner != lease_owner)
                 ):
                     return
@@ -328,26 +329,33 @@ class ResearchCoordinator:
                         session.flush()
                         citation_ids.append(str(citation.id))
                         persisted_citations.append(citation)
+                    verification_status = (
+                        graph_state["verification"]["status"]
+                        if isinstance(graph_state.get("verification"), dict)
+                        else "supported"
+                    )
                     research_record = self._promote_research_record(
                         session,
                         run,
                         answer,
                         persisted_citations,
                         record_key=hashlib.sha256(question.strip().casefold().encode()).hexdigest(),
-                        verification_status=(
-                            graph_state["verification"]["status"]
-                            if isinstance(graph_state.get("verification"), dict)
-                            else "supported"
-                        ),
+                        verification_status=verification_status,
                     )
                     if research_record is not None:
                         completed_research_record_id = research_record.id
-                    self._finalize_ledger(
+                    final_status = self._finalize_ledger(
                         session,
                         run,
                         status="completed",
                         citation_count=len(persisted_citations),
                         verified_claim_count=1 if research_record is not None else 0,
+                        verification_status=verification_status,
+                        blocking_gap_descriptions=tuple(
+                            task.failure_impact
+                            for task in completed_tasks
+                            if task.status in {"failed", "skipped"} and task.failure_impact
+                        ),
                     )
                     for completed_task in completed_tasks:
                         if completed_task.status in {"pending", "running"}:
@@ -362,7 +370,7 @@ class ResearchCoordinator:
                     for todo in remaining_todos:
                         todo.status = "completed"
                         todo.completed_at = datetime.now(UTC)
-                    run.status = "completed"
+                    run.status = final_status
                     run.completed_at = datetime.now(UTC)
                     completed_conversation_id = run.conversation_id
                     event_type = "run_completed"
@@ -1435,7 +1443,7 @@ class ResearchCoordinator:
             )
             if run is None:
                 return None
-            if run.status in {"completed", "cancelled", "failed"}:
+            if run.status in {"completed", "partial", "cancelled", "failed"}:
                 return run.status
             waiting_approval = run.status == "waiting_approval"
             cancelled_at = datetime.now(UTC)
@@ -1568,7 +1576,7 @@ class ResearchCoordinator:
             )
             if (
                 run is None
-                or run.status in {"cancelled", "completed", "failed"}
+                or run.status in {"cancelled", "completed", "partial", "failed"}
                 or (lease_owner is not None and run.lease_owner != lease_owner)
                 ):
                 return
@@ -1611,13 +1619,12 @@ class ResearchCoordinator:
             )
             if (
                 run is None
-                or run.status in {"cancelled", "completed", "failed"}
+                or run.status in {"cancelled", "completed", "partial", "failed"}
                 or (lease_owner is not None and run.lease_owner != lease_owner)
             ):
                 return
             run.status = "failed"
             self._quota_service.release(session, run)
-            self._finalize_ledger(session, run, status="failed")
             public_message: str | None = None
             if isinstance(error, SearchUnavailableError):
                 if safe_detail == "未配置 Brave Search API 凭证":
@@ -1648,6 +1655,18 @@ class ResearchCoordinator:
                         if budget_exhausted
                         else "研究运行失败，任务未能完成"
                     )
+            self._finalize_ledger(
+                session,
+                run,
+                status="failed",
+                blocking_gap_descriptions=tuple(
+                    dict.fromkeys(
+                        task.failure_impact
+                        for task in active_tasks
+                        if task.failure_impact
+                    )
+                ),
+            )
             if public_message is not None:
                 assistant_seq = run.next_event_seq
                 run.next_event_seq += 1
@@ -1680,41 +1699,53 @@ class ResearchCoordinator:
         status: str,
         citation_count: int = 0,
         verified_claim_count: int = 0,
-    ) -> None:
+        verification_status: str | None = None,
+        blocking_gap_descriptions: tuple[str, ...] = (),
+    ) -> str:
         """根据终态和已固化 Citation 写入 Coverage Snapshot 与 Stop Decision"""
         ledger = session.scalar(select(ResearchLedger).where(ResearchLedger.run_id == run.id))
         if ledger is None:
-            return
-        complete = status == "completed" and citation_count > 0
-        ledger.status = status
+            return status
+        outcome = decide_stop(
+            StopPolicyInput(
+                requested_status=status,
+                verification_status=verification_status,
+                verified_claim_count=verified_claim_count,
+                valid_citation_count=citation_count,
+                blocking_gap_descriptions=blocking_gap_descriptions,
+            )
+        )
+        ledger.status = outcome.status
         session.add(
             CoverageSnapshot(
                 workspace_id=run.workspace_id,
                 ledger_id=ledger.id,
                 citation_count=citation_count,
                 verified_claim_count=verified_claim_count,
-                complete=complete,
+                complete=outcome.complete,
             )
         )
-        reason = "evidence_complete" if complete else status
-        completeness = "complete" if complete else "partial"
-        if not complete:
-            session.add(
-                EvidenceGap(
-                    workspace_id=run.workspace_id,
-                    ledger_id=ledger.id,
-                    description="运行未形成足够的可定位证据",
-                    status="open",
-                )
+        if not outcome.complete:
+            session.add_all(
+                [
+                    EvidenceGap(
+                        workspace_id=run.workspace_id,
+                        ledger_id=ledger.id,
+                        description=description,
+                        status="open",
+                    )
+                    for description in outcome.gap_descriptions
+                ]
             )
         session.add(
             StopDecision(
                 workspace_id=run.workspace_id,
                 ledger_id=ledger.id,
-                reason=reason,
-                completeness=completeness,
+                reason=outcome.reason,
+                completeness="complete" if outcome.complete else "partial",
             )
         )
+        return outcome.status
 
 
 def encode_event_data(payload: dict[str, object]) -> str:

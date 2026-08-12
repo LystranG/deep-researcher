@@ -56,7 +56,7 @@ class RunEventLog:
                     return existing.seq
             if (
                 run is None
-                or run.status in {"cancelled", "failed", "completed"}
+                or run.status in {"cancelled", "failed", "completed", "partial"}
                 or run.cancel_requested_at is not None
                 or (lease_owner is not None and run.lease_owner != lease_owner)
             ):

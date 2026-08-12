@@ -154,6 +154,7 @@ class ToolExecutionService:
             if run.cancel_requested_at is not None or run.status in {
                 "cancelled",
                 "completed",
+                "partial",
                 "failed",
             }:
                 return None

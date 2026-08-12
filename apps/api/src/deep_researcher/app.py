@@ -3352,6 +3352,7 @@ def create_app(
                 )
             if run_status in {
                 "completed",
+                "partial",
                 "cancelled",
                 "failed",
                 "waiting_approval",

@@ -240,7 +240,7 @@ def test_rejecting_high_risk_tool_call_resumes_run_without_side_effect(tmp_path)
     assert "arguments" not in approval
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "rejected"
-    assert detail.json()["status"] == "completed"
+    assert detail.json()["status"] == "partial"
     assert tool_runs.json()["items"] == []
     assert "event: tool_approval_requested" in events.text
     assert "event: tool_call_rejected" in events.text
@@ -404,7 +404,7 @@ def test_approving_exact_tool_call_executes_once_across_retries(tmp_path) -> Non
     assert first_approval.json()["status"] == "approved"
     assert repeated_approval.json()["status"] == "approved"
     assert no_second_claim is False
-    assert detail.json()["status"] == "completed"
+    assert detail.json()["status"] == "partial"
     assert tool_runs.json()["items"] == [
         {
             "id": tool_runs.json()["items"][0]["id"],
@@ -590,7 +590,7 @@ def test_expired_tool_approval_resumes_without_side_effect(tmp_path) -> None:
         )
 
     assert expired.json()["status"] == "expired"
-    assert detail.json()["status"] == "completed"
+    assert detail.json()["status"] == "partial"
     assert tool_runs.json()["items"] == []
 
 
@@ -705,4 +705,4 @@ def test_disabling_workspace_mcp_invalidates_pending_and_new_calls(tmp_path) -> 
     assert pending_approvals.json()["items"][0]["status"] == "disabled"
     assert first_tool_runs.json()["items"] == []
     assert new_approvals.json()["items"] == []
-    assert second_detail.json()["status"] == "completed"
+    assert second_detail.json()["status"] == "partial"

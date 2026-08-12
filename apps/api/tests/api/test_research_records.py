@@ -244,11 +244,34 @@ def test_insufficient_result_with_citation_is_not_promoted(tmp_path) -> None:
         citations = client.get(
             f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
         ).json()["items"]
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        ledger = client.get(
+            f"/api/v1/runs/{run['run_id']}/ledger", headers=headers
+        ).json()
         records = client.get(
             f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
         ).json()["items"]
 
     assert citations
+    assert detail["status"] == "partial"
+    assert ledger["coverage"] == {
+        "citation_count": 1,
+        "verified_claim_count": 0,
+        "complete": False,
+    }
+    assert ledger["gaps"] == [
+        {
+            "id": ledger["gaps"][0]["id"],
+            "description": "Verifier 判定现有证据不足以核验结论",
+            "status": "open",
+        }
+    ]
+    assert ledger["stop_decision"] == {
+        "reason": "verifier_insufficient",
+        "completeness": "partial",
+    }
     assert records == []
 
 
