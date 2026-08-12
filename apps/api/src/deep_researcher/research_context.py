@@ -1,14 +1,18 @@
-from typing import TypedDict
+from typing import NotRequired, TypedDict
+
+from deep_researcher.source_manifest import SourceManifest
 
 
 class FrozenSource(TypedDict):
-    """Run 启动时冻结的可引用来源片段"""
+    """Run 启动时冻结的来源引用、Manifest 或可引用片段"""
 
     source_chunk_id: str
-    text: str
-    start_offset: int
-    end_offset: int
-    content_hash: str
+    source_snapshot_id: NotRequired[str]
+    manifest: NotRequired[SourceManifest]
+    text: NotRequired[str]
+    start_offset: NotRequired[int]
+    end_offset: NotRequired[int]
+    content_hash: NotRequired[str]
 
 
 class FrozenMemory(TypedDict):
@@ -41,13 +45,7 @@ def freeze_research_context(
 ) -> FrozenResearchContext:
     """复制当前可见能力数据形成单次 Run 的冻结快照"""
     frozen_sources: list[FrozenSource] = [
-        {
-            "source_chunk_id": source["source_chunk_id"],
-            "text": source["text"],
-            "start_offset": source["start_offset"],
-            "end_offset": source["end_offset"],
-            "content_hash": source["content_hash"],
-        }
+        FrozenSource(**source)
         for source in sources
     ]
     frozen_memory: FrozenMemory | None = None
@@ -65,3 +63,15 @@ def freeze_research_context(
         "conversation_leads": list(conversation_leads),
         "skills": list(skills),
     }
+
+
+def citable_sources(context: FrozenResearchContext) -> list[FrozenSource]:
+    """返回包含精确原文范围与 hash 的可引用来源"""
+    return [
+        source
+        for source in context["sources"]
+        if all(
+            key in source
+            for key in ("text", "start_offset", "end_offset", "content_hash")
+        )
+    ]

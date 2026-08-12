@@ -1,5 +1,8 @@
+import json
+
 import httpx
 import pytest
+from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import ExtractiveModelGateway
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
@@ -157,6 +160,169 @@ class LocalReaderMustNotRun:
     def fetch(self, url: str) -> WebPageAttempt:
         """若 fallback 被错误触发则立即失败"""
         raise AssertionError(f"Jina 成功后不应执行 Local HTTP: {url}")
+
+
+class LongPageWebSearchGateway:
+    """为长页上下文测试返回单个网页候选"""
+
+    def search(self, query: str, *, count: int = 5) -> list[SearchResult]:
+        """返回需要先浏览 Manifest 的长页入口"""
+        assert query == "浏览长篇研究报告"
+        assert count == 5
+        return [
+            {
+                "title": "长篇研究报告",
+                "url": "https://example.com/long-report",
+                "snippet": "报告包含方法、结果与附录。",
+            }
+        ]
+
+
+class LongPageJinaReader:
+    """返回带多个标题区段的完整长页"""
+
+    def __init__(self, content: str) -> None:
+        """保存要写入不可变 Snapshot 的长页正文"""
+        self._content = content
+
+    def fetch(self, url: str) -> WebPageAttempt:
+        """返回可生成 Source Manifest 的 Jina 正文"""
+        return WebPageAttempt.success(
+            adapter_id="jina_reader",
+            adapter_version="hosted-v1",
+            requested_url=url,
+            final_url=url,
+            http_status=200,
+            content_type="text/markdown",
+            title="长篇研究报告",
+            content=self._content,
+            complete=True,
+            truncated=False,
+        )
+
+
+class CapturingResearcherGateway:
+    """捕获 Researcher 可见的来源上下文"""
+
+    def __init__(self) -> None:
+        """初始化捕获列表"""
+        self.inputs = []
+
+    async def research(self, brief, sources):
+        """记录公开输入并返回确定性研究结果"""
+        self.inputs.append({"brief": brief, "sources": sources})
+        return {
+            "ordinal": brief["ordinal"],
+            "status": "completed",
+            "summary": "已浏览来源导航",
+            "source_ids": [source["source_chunk_id"] for source in sources],
+            "failure_impact": None,
+        }
+
+
+class CapturingGraphRunner:
+    """捕获进入可恢复 Graph state 的研究上下文"""
+
+    def __init__(self, researcher_gateway: CapturingResearcherGateway) -> None:
+        """初始化真实 Graph 委托与上下文捕获"""
+        self._delegate = ResearchGraphRunner(researcher_gateway=researcher_gateway)
+        self.research_context = None
+
+    def run(self, *args, **kwargs):
+        """捕获 Graph 输入后执行真实确定性流程"""
+        self.research_context = kwargs["research_context"]
+        return self._delegate.run(*args, **kwargs)
+
+
+class CapturingModelGateway(ExtractiveModelGateway):
+    """捕获 Writer 最终可见的模型输入"""
+
+    def __init__(self) -> None:
+        """初始化模型输入捕获"""
+        self.contexts = []
+
+    async def astream_answer(self, context):
+        """记录输入并复用确定性抽取回答"""
+        self.contexts.append(context)
+        async for delta in super().astream_answer(context):
+            yield delta
+
+
+def test_long_page_enters_graph_as_bounded_manifest_without_snapshot_text(tmp_path) -> None:
+    """验证长页只以稳定引用和有界 Manifest 进入 Agent 输入"""
+    hidden_snapshot_text = "不可泄漏的完整正文标记"
+    long_page = "\n\n".join(
+        [
+            f"## 第 {index} 节\n{hidden_snapshot_text}-{index} " + "研究内容" * 450
+            for index in range(1, 9)
+        ]
+    )
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    researcher = CapturingResearcherGateway()
+    graph_runner = CapturingGraphRunner(researcher)
+    model_gateway = CapturingModelGateway()
+
+    with running_worker_client(
+        settings,
+        graph_runner=graph_runner,
+        model_gateway=model_gateway,
+        web_search_gateway=LongPageWebSearchGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=LongPageJinaReader(long_page),
+            local_reader=LocalReaderMustNotRun(),
+            url_validator=lambda _: None,
+        ),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "manifest-first@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "长页 Manifest"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "长文上下文"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "manifest-first"},
+            json={"content": "浏览长篇研究报告"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+
+    assert graph_runner.research_context is not None
+    graph_input = json.dumps(graph_runner.research_context, ensure_ascii=False)
+    researcher_input = json.dumps(researcher.inputs, ensure_ascii=False)
+    model_input = json.dumps(
+        [
+            {
+                "evidence": context.evidence,
+                "evidences": context.evidences,
+                "conversation_leads": context.conversation_leads,
+                "source_manifests": context.source_manifests,
+            }
+            for context in model_gateway.contexts
+        ],
+        ensure_ascii=False,
+    )
+    assert hidden_snapshot_text not in graph_input
+    assert hidden_snapshot_text not in researcher_input
+    assert hidden_snapshot_text not in model_input
+    manifest = graph_runner.research_context["sources"][0]["manifest"]
+    assert model_gateway.contexts[0].source_manifests == (manifest,)
+    assert manifest["snapshot_id"]
+    assert manifest["completeness"] == "complete"
+    assert manifest["chunk_count"] > 1
+    assert manifest["token_profile"]["total"] > 0
+    assert manifest["heading_navigation"][0]["heading_path"] == ["第 1 节"]
+    assert len(graph_input) < len(long_page)
 
 
 def test_jina_success_creates_cited_snapshot_without_local_fallback(tmp_path) -> None:

@@ -8,6 +8,7 @@ from jsonschema import ValidationError, validate
 from openai.types.shared.reasoning_effort import ReasoningEffort
 
 from deep_researcher.run_control import CancellationToken
+from deep_researcher.source_manifest import SourceManifest
 
 
 class BudgetExceededError(RuntimeError):
@@ -24,6 +25,7 @@ class AnswerContext:
     cancellation_token: CancellationToken | None = None
     evidences: tuple[str, ...] = ()
     conversation_leads: tuple[str, ...] = ()
+    source_manifests: tuple[SourceManifest, ...] = ()
 
 
 class ModelGateway(Protocol):
@@ -146,6 +148,14 @@ class LiteLLMModelGateway:
             if context.conversation_leads
             else "没有相关历史会话线索"
         )
+        manifest_block = (
+            "\n\n".join(
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+                for manifest in context.source_manifests
+            )
+            if context.source_manifests
+            else "没有需要继续浏览的长来源"
+        )
         skill_block = ", ".join(context.skills) or "无"
         prompt = f"""目标：回答用户问题，并保持简体中文、简洁、可核验。
 
@@ -153,6 +163,7 @@ class LiteLLMModelGateway:
 - 只能把下列证据和会话纠正当作已知事实
 - 使用证据中的事实时，把对应的 [n] 紧跟在表述后
 - 历史会话线索只能用于定位旧讨论，不能作为事实证据或引用来源
+- Source Manifest 只用于选择后续读取位置，不能作为事实证据或引用来源
 - 没有证据时明确说明证据不足，不编造来源
 - 不输出思维链、工具过程或不存在的引用编号
 
@@ -160,6 +171,7 @@ class LiteLLMModelGateway:
 会话纠正：{correction_block}
 长期记忆：{memory_block}
 历史会话线索：{conversation_lead_block}
+Source Manifest 导航：{manifest_block}
 已启用 Skill：{skill_block}
 可用证据：
 {evidence_block}

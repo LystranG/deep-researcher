@@ -24,6 +24,7 @@ from deep_researcher.model_gateway import ExtractiveModelGateway, ModelGateway
 from deep_researcher.research_context import (
     FrozenResearchContext,
     FrozenSource,
+    citable_sources,
     freeze_research_context,
 )
 from deep_researcher.run_control import CancellationToken
@@ -181,8 +182,10 @@ async def _run_writer(
 
 def _run_citation_validator(state: ResearchState) -> dict[str, object]:
     """校验 Writer 草稿并只返回可公开的安全回答"""
-    sources = state["research_context"]["sources"]
-    validation = validate_answer(state["draft_answer"], [source["text"] for source in sources])
+    sources = citable_sources(state["research_context"])
+    validation = validate_answer(
+        state["draft_answer"], [source["text"] for source in sources if "text" in source]
+    )
     return {
         "answer": validation.answer,
         "answer_deltas": [validation.answer],

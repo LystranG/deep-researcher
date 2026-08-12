@@ -631,11 +631,12 @@ def create_app(
             model=resolved_settings.rerank_model,
             api_base=resolved_settings.rerank_api_base,
         )
+    token_estimator = LiteLLMTokenEstimator(resolved_settings.openai_model)
     retrieval = (
         HybridRetrieval(
             resolved_rerank_gateway,
             embedding_gateway=resolved_embedding_gateway,
-            token_estimator=LiteLLMTokenEstimator(resolved_settings.openai_model),
+            token_estimator=token_estimator,
             session_factory=session_factory,
             source_chunk_adapter=PostgresSourceChunkRetrievalAdapter(),
             conversation_segment_adapter=PostgresConversationSegmentRetrievalAdapter(),
@@ -671,6 +672,7 @@ def create_app(
         model_context_tokens=resolved_settings.model_context_tokens,
         model_output_token_reserve=resolved_settings.model_output_token_reserve,
         model_context_safety_margin=resolved_settings.model_context_safety_margin,
+        token_estimator=token_estimator,
         require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
         step_delay_seconds=resolved_settings.research_step_delay_seconds,
         graph_runner=graph_runner or ResearchGraphRunner(resolved_settings.database_url),

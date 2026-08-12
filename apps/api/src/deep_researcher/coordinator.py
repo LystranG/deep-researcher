@@ -49,6 +49,7 @@ from deep_researcher.quota import QuotaService
 from deep_researcher.research_context import (
     FrozenMemory,
     FrozenSource,
+    citable_sources,
     freeze_research_context,
 )
 from deep_researcher.retrieval import (
@@ -57,9 +58,11 @@ from deep_researcher.retrieval import (
     HybridRetrieval,
     RetrievalPage,
     RetrievalRequest,
+    TokenEstimator,
 )
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
+from deep_researcher.source_manifest import build_source_manifest, split_source_content
 from deep_researcher.stop_policy import StopPolicyInput, decide_stop
 from deep_researcher.tool_execution import ToolExecutionService
 from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
@@ -83,6 +86,7 @@ class ResearchCoordinator:
         model_context_tokens: int,
         model_output_token_reserve: int,
         model_context_safety_margin: int,
+        token_estimator: TokenEstimator,
         require_web_search_for_external_model: bool,
         step_delay_seconds: float = 0.0,
         graph_runner: ResearchGraphRunner | None = None,
@@ -107,6 +111,7 @@ class ResearchCoordinator:
         self._model_context_tokens = model_context_tokens
         self._model_output_token_reserve = model_output_token_reserve
         self._model_context_safety_margin = model_context_safety_margin
+        self._token_estimator = token_estimator
         self._require_web_search_for_external_model = require_web_search_for_external_model
         self._step_delay_seconds = step_delay_seconds
         self._graph_runner = graph_runner or ResearchGraphRunner()
@@ -162,15 +167,7 @@ class ResearchCoordinator:
                 for discovered_chunk in self._search_web(
                     run_id, question, lease_owner=lease_owner
                 ):
-                    sources.append(
-                        {
-                            "source_chunk_id": str(discovered_chunk.id),
-                            "text": discovered_chunk.text,
-                            "start_offset": discovered_chunk.start_offset,
-                            "end_offset": discovered_chunk.end_offset,
-                            "content_hash": discovered_chunk.content_hash,
-                        }
-                    )
+                    sources.append(discovered_chunk)
             frozen_memory: FrozenMemory | None = None
             if memory is not None:
                 frozen_memory = {
@@ -311,9 +308,10 @@ class ResearchCoordinator:
                     persisted_citations: list[Citation] = []
                     for citation_draft in citation_drafts:
                         label = citation_draft["label"]
-                        if label < 1 or label > len(research_context["sources"]):
+                        citable = citable_sources(research_context)
+                        if label < 1 or label > len(citable):
                             continue
-                        source = research_context["sources"][label - 1]
+                        source = citable[label - 1]
                         citation = Citation(
                             workspace_id=run.workspace_id,
                             message_id=message.id,
@@ -1185,7 +1183,7 @@ class ResearchCoordinator:
 
     def _search_web(
         self, run_id: UUID, query: str, *, lease_owner: str | None = None
-    ) -> list[SourceChunk]:
+    ) -> list[FrozenSource]:
         """发现多个网页候选并持久化可读取的正文快照"""
         self._append_event(
             run_id,
@@ -1228,7 +1226,7 @@ class ResearchCoordinator:
                 )
             prepared.append((ordinal, result, acquisition))
 
-        chunks: list[SourceChunk] = []
+        sources: list[FrozenSource] = []
         discovered: list[dict[str, object]] = []
         with self._session_factory.begin() as session:
             run = session.get(ResearchRun, run_id)
@@ -1303,22 +1301,62 @@ class ResearchCoordinator:
                             )
                         )
                 if content_kind == "web_page":
-                    chunk = SourceChunk(
-                        workspace_id=run.workspace_id,
-                        conversation_id=None,
-                        attachment_id=None,
-                        document_version_id=None,
-                        source_snapshot_id=snapshot.id,
-                        ordinal=1,
-                        text=content,
-                        page_number=None,
-                        start_offset=0,
-                        end_offset=len(content),
-                        content_hash=content_hash,
-                    )
-                    session.add(chunk)
+                    persisted_chunks: list[SourceChunk] = []
+                    for draft in split_source_content(content):
+                        chunk = SourceChunk(
+                            workspace_id=run.workspace_id,
+                            conversation_id=None,
+                            attachment_id=None,
+                            document_version_id=None,
+                            source_snapshot_id=snapshot.id,
+                            ordinal=draft.ordinal,
+                            text=draft.text,
+                            page_number=None,
+                            start_offset=draft.start_offset,
+                            end_offset=draft.end_offset,
+                            content_hash=draft.content_hash,
+                        )
+                        session.add(chunk)
+                        persisted_chunks.append(chunk)
                     session.flush()
-                    chunks.append(chunk)
+                    if len(persisted_chunks) == 1:
+                        sources.append(self._freeze_source_chunk(persisted_chunks[0]))
+                    else:
+                        selected_attempt = selected
+                        warnings = (
+                            (selected_attempt.warning_category,)
+                            if selected_attempt is not None
+                            and selected_attempt.warning_category is not None
+                            else ()
+                        )
+                        manifest = build_source_manifest(
+                            snapshot,
+                            persisted_chunks,
+                            token_estimator=self._token_estimator,
+                            adapter_id=(
+                                selected_attempt.adapter_id
+                                if selected_attempt is not None
+                                else None
+                            ),
+                            adapter_version=(
+                                selected_attempt.adapter_version
+                                if selected_attempt is not None
+                                else None
+                            ),
+                            completeness=(
+                                selected_attempt.completeness
+                                if selected_attempt is not None
+                                else "unknown"
+                            ),
+                            warnings=warnings,
+                        )
+                        sources.append(
+                            {
+                                "source_chunk_id": str(persisted_chunks[0].id),
+                                "source_snapshot_id": str(snapshot.id),
+                                "manifest": manifest,
+                            }
+                        )
                 discovered.append(
                     {
                         "source_id": str(snapshot.id),
@@ -1342,11 +1380,11 @@ class ResearchCoordinator:
             {
                 "tool": "brave_web_search",
                 "result_count": len(results),
-                "readable_count": len(chunks),
+                "readable_count": len(sources),
             },
             lease_owner=lease_owner,
         )
-        return chunks
+        return sources
 
     def _latest_relevant_correction(
         self,
