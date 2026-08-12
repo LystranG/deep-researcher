@@ -1,9 +1,12 @@
+import hashlib
 import json
+from uuid import UUID
 
 import httpx
 import pytest
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import ExtractiveModelGateway
+from deep_researcher.models import EvidenceSpan, SourceChunk, SourceSnapshot
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
 from deep_researcher.web_page import (
@@ -234,6 +237,22 @@ class CapturingGraphRunner:
         return self._delegate.run(*args, **kwargs)
 
 
+class TamperingGraphRunner:
+    """模拟恢复状态中的来源 hash 被篡改"""
+
+    def __init__(self) -> None:
+        """初始化真实 Graph 委托"""
+        self._delegate = ResearchGraphRunner()
+
+    def run(self, *args, **kwargs):
+        """执行 Graph 后篡改冻结 Citation locator"""
+        state = self._delegate.run(*args, **kwargs)
+        for source in kwargs["research_context"]["sources"]:
+            if "content_hash" in source:
+                source["content_hash"] = "tampered-source-hash"
+        return state
+
+
 class CapturingModelGateway(ExtractiveModelGateway):
     """捕获 Writer 最终可见的模型输入"""
 
@@ -246,6 +265,116 @@ class CapturingModelGateway(ExtractiveModelGateway):
         self.contexts.append(context)
         async for delta in super().astream_answer(context):
             yield delta
+
+
+class TailFactWebSearchGateway:
+    """返回事实位于长页尾部的网页候选"""
+
+    def search(self, query: str, *, count: int = 5) -> list[SearchResult]:
+        """返回需要 descriptor 检索才能定位的长页"""
+        assert query == "查找 TAIL-FACT"
+        assert count == 5
+        return [
+            {
+                "title": "尾部事实报告",
+                "url": "https://example.com/tail-report",
+                "snippet": "报告包含多个长章节。",
+            }
+        ]
+
+
+def test_research_run_discovers_tail_fact_and_cites_exact_snapshot_span(tmp_path) -> None:
+    """验证长页尾部事实经邻近窗口读取后形成精确 Citation"""
+    long_page = "\n\n".join(
+        [
+            "## 概览\n" + "背景材料 " * 900,
+            "## 方法\n" + "实验步骤 " * 900,
+            "## 结果\n" + "结果说明 " * 900,
+            "## 附录\nTAIL-FACT 页面尾部的关键结论。" + " 附录说明" * 300,
+        ]
+    )
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    model_gateway = CapturingModelGateway()
+    with running_worker_client(
+        settings,
+        model_gateway=model_gateway,
+        web_search_gateway=TailFactWebSearchGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=LongPageJinaReader(long_page),
+            local_reader=LocalReaderMustNotRun(),
+            url_validator=lambda _: None,
+        ),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "tail-fact@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "尾部事实"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "长页尾部"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tail-fact"},
+            json={"content": "查找 TAIL-FACT"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+        with client.app.state.session_factory() as session:
+            span = session.query(EvidenceSpan).filter_by(run_id=UUID(run["run_id"])).one()
+            chunk = session.get(SourceChunk, span.source_chunk_id)
+            snapshot = session.get(SourceSnapshot, chunk.source_snapshot_id)
+            persisted = {
+                "span_start": span.start_offset,
+                "span_end": span.end_offset,
+                "span_hash": span.content_hash,
+                "chunk_text": chunk.text,
+                "chunk_hash": chunk.content_hash,
+                "snapshot_content": snapshot.content,
+                "snapshot_hash": snapshot.content_hash,
+            }
+
+    assert "TAIL-FACT" in messages[-1]["content"]
+    assert len(citations) == 1
+    assert "TAIL-FACT" in citations[0]["evidence_text"]
+    assert persisted["snapshot_content"][
+        persisted["span_start"] : persisted["span_end"]
+    ] == persisted["chunk_text"]
+    assert persisted["span_hash"] == persisted["chunk_hash"]
+    assert hashlib.sha256(persisted["chunk_text"].encode()).hexdigest() == persisted[
+        "chunk_hash"
+    ]
+    assert hashlib.sha256(persisted["snapshot_content"].encode()).hexdigest() == persisted[
+        "snapshot_hash"
+    ]
+    captured = json.dumps(
+        [
+            {
+                "evidence": context.evidence,
+                "source_manifests": context.source_manifests,
+                "source_windows": context.source_windows,
+            }
+            for context in model_gateway.contexts
+        ],
+        ensure_ascii=False,
+    )
+    assert long_page not in captured
+    assert "## 结果" in captured
+    assert "TAIL-FACT" in captured
 
 
 def test_long_page_enters_graph_as_bounded_manifest_without_snapshot_text(tmp_path) -> None:
@@ -312,9 +441,9 @@ def test_long_page_enters_graph_as_bounded_manifest_without_snapshot_text(tmp_pa
         ],
         ensure_ascii=False,
     )
-    assert hidden_snapshot_text not in graph_input
-    assert hidden_snapshot_text not in researcher_input
-    assert hidden_snapshot_text not in model_input
+    assert long_page not in graph_input
+    assert long_page not in researcher_input
+    assert long_page not in model_input
     manifest = graph_runner.research_context["sources"][0]["manifest"]
     assert model_gateway.contexts[0].source_manifests == (manifest,)
     assert manifest["snapshot_id"]
@@ -393,6 +522,55 @@ def test_jina_success_creates_cited_snapshot_without_local_fallback(tmp_path) ->
             "selected_for_snapshot": True,
         }
     ]
+
+
+def test_tampered_frozen_source_hash_cannot_create_citation(tmp_path) -> None:
+    """验证 Citation 固化会回读并拒绝被篡改的来源 locator"""
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    acquisition = WebAcquisition(
+        jina_reader=SuccessfulJinaReader(),
+        local_reader=LocalReaderMustNotRun(),
+        url_validator=lambda _: None,
+    )
+
+    with running_worker_client(
+        settings,
+        graph_runner=TamperingGraphRunner(),
+        model_gateway=ExtractiveModelGateway(),
+        web_search_gateway=FakeWebSearchGateway(),
+        web_page_gateway=acquisition,
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "tampered-source@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "来源校验"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "篡改检测"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tampered-source"},
+            json={"content": "查找量子纠错最新进展"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert citations == []
 
 
 class UnavailableJinaReader:

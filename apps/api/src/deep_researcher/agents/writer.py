@@ -40,6 +40,11 @@ async def write(
             for source in context["sources"]
             if "manifest" in source
         ),
+        source_windows=tuple(
+            source["source_window"]
+            for source in sources
+            if "source_window" in source
+        ),
     )
     if hasattr(model_gateway, "astream_answer"):
         deltas = [delta async for delta in model_gateway.astream_answer(answer_context)]

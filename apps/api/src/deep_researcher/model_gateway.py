@@ -7,6 +7,7 @@ from typing import Protocol
 from jsonschema import ValidationError, validate
 from openai.types.shared.reasoning_effort import ReasoningEffort
 
+from deep_researcher.research_context import SourceWindowContext
 from deep_researcher.run_control import CancellationToken
 from deep_researcher.source_manifest import SourceManifest
 
@@ -26,6 +27,7 @@ class AnswerContext:
     evidences: tuple[str, ...] = ()
     conversation_leads: tuple[str, ...] = ()
     source_manifests: tuple[SourceManifest, ...] = ()
+    source_windows: tuple[SourceWindowContext, ...] = ()
 
 
 class ModelGateway(Protocol):
@@ -156,6 +158,14 @@ class LiteLLMModelGateway:
             if context.source_manifests
             else "没有需要继续浏览的长来源"
         )
+        source_window_block = (
+            "\n\n".join(
+                json.dumps(window, ensure_ascii=False, sort_keys=True)
+                for window in context.source_windows
+            )
+            if context.source_windows
+            else "没有已读取的邻近原文窗口"
+        )
         skill_block = ", ".join(context.skills) or "无"
         prompt = f"""目标：回答用户问题，并保持简体中文、简洁、可核验。
 
@@ -164,6 +174,7 @@ class LiteLLMModelGateway:
 - 使用证据中的事实时，把对应的 [n] 紧跟在表述后
 - 历史会话线索只能用于定位旧讨论，不能作为事实证据或引用来源
 - Source Manifest 只用于选择后续读取位置，不能作为事实证据或引用来源
+- 邻近原文窗口用于理解标题和解释，引用编号仍只对应可用证据
 - 没有证据时明确说明证据不足，不编造来源
 - 不输出思维链、工具过程或不存在的引用编号
 
@@ -172,6 +183,7 @@ class LiteLLMModelGateway:
 长期记忆：{memory_block}
 历史会话线索：{conversation_lead_block}
 Source Manifest 导航：{manifest_block}
+邻近原文窗口：{source_window_block}
 已启用 Skill：{skill_block}
 可用证据：
 {evidence_block}

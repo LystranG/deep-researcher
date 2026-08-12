@@ -63,6 +63,11 @@ from deep_researcher.retrieval import (
 from deep_researcher.run_control import CancellationToken, RunCancelledError
 from deep_researcher.run_event_projector import RunEventProjector
 from deep_researcher.source_manifest import build_source_manifest, split_source_content
+from deep_researcher.source_reader import (
+    SourceDescriptorRequest,
+    SourceLedgerReader,
+    SourceWindowRequest,
+)
 from deep_researcher.stop_policy import StopPolicyInput, decide_stop
 from deep_researcher.tool_execution import ToolExecutionService
 from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
@@ -112,6 +117,7 @@ class ResearchCoordinator:
         self._model_output_token_reserve = model_output_token_reserve
         self._model_context_safety_margin = model_context_safety_margin
         self._token_estimator = token_estimator
+        self._source_reader = SourceLedgerReader(session_factory, token_estimator)
         self._require_web_search_for_external_model = require_web_search_for_external_model
         self._step_delay_seconds = step_delay_seconds
         self._graph_runner = graph_runner or ResearchGraphRunner()
@@ -312,6 +318,8 @@ class ResearchCoordinator:
                         if label < 1 or label > len(citable):
                             continue
                         source = citable[label - 1]
+                        if not self._valid_citation_source(session, run, source):
+                            continue
                         citation = Citation(
                             workspace_id=run.workspace_id,
                             message_id=message.id,
@@ -405,6 +413,41 @@ class ResearchCoordinator:
             self._cancel(run_id, lease_owner=lease_owner)
         except Exception as exc:
             self._fail(run_id, str(exc), error=exc, lease_owner=lease_owner)
+
+    @staticmethod
+    def _valid_citation_source(
+        session: Session, run: ResearchRun, source: FrozenSource
+    ) -> bool:
+        """回读不可变 Chunk 与 Snapshot 验证 Citation locator、offset 和 hash"""
+        chunk = session.get(SourceChunk, UUID(source["source_chunk_id"]))
+        if (
+            chunk is None
+            or chunk.workspace_id != run.workspace_id
+            or chunk.content_hash != source.get("content_hash")
+            or chunk.start_offset != source.get("start_offset")
+            or chunk.end_offset != source.get("end_offset")
+            or chunk.text != source.get("text")
+            or hashlib.sha256(chunk.text.encode()).hexdigest() != chunk.content_hash
+        ):
+            return False
+        if chunk.source_snapshot_id is None:
+            return True
+        snapshot = session.get(SourceSnapshot, chunk.source_snapshot_id)
+        if (
+            snapshot is None
+            or snapshot.workspace_id != run.workspace_id
+            or snapshot.invalidated_at is not None
+            or hashlib.sha256(snapshot.content.encode()).hexdigest() != snapshot.content_hash
+            or snapshot.content[chunk.start_offset : chunk.end_offset] != chunk.text
+        ):
+            return False
+        source_window = source.get("source_window")
+        return source_window is None or (
+            source_window["snapshot_id"] == str(snapshot.id)
+            and source_window["selected_chunk_id"] == str(chunk.id)
+            and source_window["snapshot_hash"] == snapshot.content_hash
+            and source_window["selected_chunk_hash"] == chunk.content_hash
+        )
 
     def _handle_graph_update(
         self,
@@ -1384,7 +1427,67 @@ class ResearchCoordinator:
             },
             lease_owner=lease_owner,
         )
-        return sources
+        return self._expand_long_source_context(run_id, query, sources)
+
+    def _expand_long_source_context(
+        self, run_id: UUID, query: str, sources: list[FrozenSource]
+    ) -> list[FrozenSource]:
+        """通过 Descriptor 与邻近窗口为长来源选择精确可引用 Chunk"""
+        expanded = list(sources)
+        context_budget = ContextBudget(
+            model_context_tokens=self._model_context_tokens,
+            policy_and_prompt="检索长来源并保持 Citation 可核验",
+            compact_conversation=query,
+            tool_schema="search_source_chunks read_source_chunks",
+            requested_output_reserve=self._model_output_token_reserve,
+            safety_margin=self._model_context_safety_margin,
+        )
+        for source in sources:
+            manifest = source.get("manifest")
+            if manifest is None:
+                continue
+            descriptor_page = self._source_reader.search_source_chunks(
+                SourceDescriptorRequest(
+                    run_id=run_id,
+                    snapshot_ids=(UUID(manifest["snapshot_id"]),),
+                    query=query,
+                    context_budget=context_budget,
+                    result_limit=1,
+                )
+            )
+            if not descriptor_page.items:
+                continue
+            descriptor = descriptor_page.items[0]
+            window_page = self._source_reader.read_source_chunks(
+                SourceWindowRequest(
+                    run_id=run_id,
+                    chunk_ids=(descriptor.chunk_id,),
+                    context_budget=context_budget,
+                    neighbor_window=1,
+                )
+            )
+            if not window_page.items:
+                continue
+            window = window_page.items[0]
+            with self._session_factory() as session:
+                chunk = session.get(SourceChunk, descriptor.chunk_id)
+                if chunk is None:
+                    continue
+                exact_source = self._freeze_source_chunk(chunk)
+            exact_source["source_snapshot_id"] = str(window.snapshot_id)
+            exact_source["source_window"] = {
+                "snapshot_id": str(window.snapshot_id),
+                "selected_chunk_id": str(window.selected_chunk_id),
+                "chunk_ids": [str(chunk_id) for chunk_id in window.chunk_ids],
+                "heading_path": list(window.heading_path),
+                "text": window.text,
+                "start_offset": window.start_offset,
+                "end_offset": window.end_offset,
+                "snapshot_hash": window.snapshot_hash,
+                "selected_chunk_hash": window.selected_chunk_hash,
+            }
+            expanded.append(exact_source)
+        return expanded
 
     def _latest_relevant_correction(
         self,

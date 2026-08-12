@@ -13,6 +13,21 @@ class FrozenSource(TypedDict):
     start_offset: NotRequired[int]
     end_offset: NotRequired[int]
     content_hash: NotRequired[str]
+    source_window: NotRequired["SourceWindowContext"]
+
+
+class SourceWindowContext(TypedDict):
+    """描述模型可见但不直接成为 Citation 的邻近原文窗口"""
+
+    snapshot_id: str
+    selected_chunk_id: str
+    chunk_ids: list[str]
+    heading_path: list[str]
+    text: str
+    start_offset: int
+    end_offset: int
+    snapshot_hash: str
+    selected_chunk_hash: str
 
 
 class FrozenMemory(TypedDict):
