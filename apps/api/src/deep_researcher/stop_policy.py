@@ -11,6 +11,7 @@ class StopPolicyInput:
     valid_citation_count: int = 0
     blocking_gap_descriptions: tuple[str, ...] = ()
     missing_chunk_ids: tuple[str, ...] = ()
+    unsupported_claims: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -41,11 +42,19 @@ def decide_stop(facts: StopPolicyInput) -> StopPolicyOutcome:
             gap_descriptions=facts.blocking_gap_descriptions,
         )
     if facts.missing_chunk_ids:
+        missing = ", ".join(sorted(facts.missing_chunk_ids))
         return StopPolicyOutcome(
             status="partial",
             complete=False,
             reason="missing_required_map_work",
-            gap_descriptions=("仍有必需的来源 Chunk 未完成处理",),
+            gap_descriptions=(f"仍有必需的来源 Chunk 未完成处理：{missing}",),
+        )
+    if facts.unsupported_claims:
+        return StopPolicyOutcome(
+            status="partial",
+            complete=False,
+            reason="unsupported_claim",
+            gap_descriptions=("unsupported_claim：摘要候选无法由不可变来源原文支持",),
         )
     if facts.verification_status in {"insufficient", "not_checkable"}:
         return StopPolicyOutcome(

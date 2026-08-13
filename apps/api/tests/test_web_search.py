@@ -1,6 +1,7 @@
 import hashlib
 import json
 import pprint
+import re
 import time
 from asyncio import Lock, sleep
 from threading import Event, Thread
@@ -303,7 +304,66 @@ class CapturingMapModelGateway(CapturingModelGateway):
         }
 
 
-class CrashAfterFirstMapModelGateway(CapturingMapModelGateway):
+class WholePageReduceModelGateway(CapturingMapModelGateway):
+    """让每个 map work 返回原文支持的候选并综合全部已核验片段"""
+
+    async def acomplete_map_work(self, context):
+        """为当前 group 的每个 Chunk 返回原文直接支持的候选"""
+        self.map_inputs.append(context)
+        claims = []
+        locators = []
+        for chunk in context.chunks:
+            match = re.search(r"(?:SECTION-\d+-FACT|RECOVERY-\d+)", chunk.text)
+            claim = match.group() if match is not None else chunk.text
+            local_start = chunk.text.index(claim)
+            claims.append(claim)
+            locators.append(
+                {
+                    "chunk_id": str(chunk.chunk_id),
+                    "start_offset": chunk.start_offset + local_start,
+                    "end_offset": chunk.start_offset + local_start + len(claim),
+                    "content_hash": chunk.content_hash,
+                }
+            )
+        return {
+            "summary": "当前组包含一个可核验章节",
+            "candidate_claims": claims,
+            "candidate_span_locators": locators,
+            "unresolved_questions": [],
+        }
+
+    async def astream_answer(self, context):
+        """用全部已回读原文形成带独立标签的确定性回答"""
+        self.contexts.append(context)
+        yield "\n".join(
+            f"{evidence} [{index}]"
+            for index, evidence in enumerate(context.evidences, start=1)
+        )
+
+
+class UnsupportedClaimMapModelGateway(WholePageReduceModelGateway):
+    """返回 locator 合法但原文不支持的虚构候选主张"""
+
+    async def acomplete_map_work(self, context):
+        """保留合法 locator 并注入无法由原文核验的候选"""
+        self.map_inputs.append(context)
+        chunk = context.chunks[0]
+        return {
+            "summary": "摘要声称报告确认了虚构结论",
+            "candidate_claims": ["UNSUPPORTED-DIGEST-CLAIM"],
+            "candidate_span_locators": [
+                {
+                    "chunk_id": str(chunk.chunk_id),
+                    "start_offset": chunk.start_offset,
+                    "end_offset": chunk.end_offset,
+                    "content_hash": chunk.content_hash,
+                }
+            ],
+            "unresolved_questions": [],
+        }
+
+
+class CrashAfterFirstMapModelGateway(WholePageReduceModelGateway):
     """在一个 map work 成功后模拟 Worker 崩溃"""
 
     def __init__(self) -> None:
@@ -320,6 +380,30 @@ class CrashAfterFirstMapModelGateway(CapturingMapModelGateway):
             raise KeyboardInterrupt("模拟 map work 执行中的 Worker 崩溃")
         self.map_effects[identity] = self.map_effects.get(identity, 0) + 1
         return await super().acomplete_map_work(context)
+
+
+class CrashAfterAllMapsModelGateway(WholePageReduceModelGateway):
+    """在全部 map work 提交后、最终消息固化前模拟 Worker 崩溃"""
+
+    def __init__(self) -> None:
+        """初始化模型副作用计数与一次性终态崩溃开关"""
+        super().__init__()
+        self.map_effects = {}
+        self.crash_enabled = True
+
+    async def acomplete_map_work(self, context):
+        """记录稳定 work 的模型副作用并正常提交全部结果"""
+        identity = tuple(str(chunk.chunk_id) for chunk in context.chunks)
+        self.map_effects[identity] = self.map_effects.get(identity, 0) + 1
+        return await super().acomplete_map_work(context)
+
+    async def astream_answer(self, context):
+        """首次写作时崩溃，恢复后允许完成 Graph 输出"""
+        if self.crash_enabled:
+            self.crash_enabled = False
+            raise KeyboardInterrupt("模拟全部 map 提交后的 Worker 崩溃")
+        async for delta in super().astream_answer(context):
+            yield delta
 
 
 class FailingFirstMapModelGateway(CapturingMapModelGateway):
@@ -649,6 +733,156 @@ def test_research_run_maps_all_long_page_chunks_with_bounded_inputs(tmp_path) ->
     assert long_page not in captured
 
 
+def test_whole_page_reduce_covers_all_required_chunks_and_publishes_verified_citations(
+    tmp_path,
+) -> None:
+    """验证完整整页 reduce 消费全部结果并仅引用回读原文"""
+    long_page = "\n\n".join(
+        [f"## 第 {index} 节\nSECTION-{index}-FACT " + "章节材料" * 700 for index in range(1, 5)]
+    )
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+        model_context_tokens=5_000,
+        model_output_token_reserve=500,
+        model_context_safety_margin=500,
+    )
+    model_gateway = WholePageReduceModelGateway()
+
+    with running_worker_client(
+        settings,
+        model_gateway=model_gateway,
+        web_search_gateway=LongPageWebSearchGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=LongPageJinaReader(long_page),
+            local_reader=LocalReaderMustNotRun(),
+            url_validator=lambda _: None,
+        ),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "whole-page-reduce@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "整页 Reduce"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "完整覆盖"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "whole-page-reduce"},
+            json={"content": "综合完整报告的所有章节"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers).json()
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert detail["status"] == "completed"
+    assert ledger["missing_chunk_ids"] == []
+    assert ledger["coverage"]["complete"] is True
+    assert ledger["gaps"] == []
+    assert ledger["stop_decision"] == {
+        "reason": "evidence_complete",
+        "completeness": "complete",
+    }
+    assert all(
+        f"SECTION-{index}-FACT" in messages[-1]["content"] for index in range(1, 5)
+    )
+    assert all(
+        any(f"SECTION-{index}-FACT" in item["evidence_text"] for item in citations)
+        for index in range(1, 5)
+    )
+    assert {item["evidence_text"] for item in citations} == {
+        f"SECTION-{index}-FACT" for index in range(1, 5)
+    }
+    assert all(
+        item["source_hash"] == hashlib.sha256(item["evidence_text"].encode()).hexdigest()
+        for item in citations
+    )
+
+
+def test_digest_claim_unsupported_by_original_chunk_is_rejected_from_citations(
+    tmp_path,
+) -> None:
+    """验证合法 locator 上的虚构 Digest 主张不能越权形成 Citation"""
+    long_page = "\n\n".join(
+        [f"## 核验章节 {index}\nSUPPORTED-{index} " + "原始材料" * 700 for index in range(1, 4)]
+    )
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+        model_context_tokens=5_000,
+        model_output_token_reserve=500,
+        model_context_safety_margin=500,
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=UnsupportedClaimMapModelGateway(),
+        web_search_gateway=LongPageWebSearchGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=LongPageJinaReader(long_page),
+            local_reader=LocalReaderMustNotRun(),
+            url_validator=lambda _: None,
+        ),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "unsupported-digest@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "摘要越权"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "原文核验"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "unsupported-digest"},
+            json={"content": "综合完整报告的所有章节"},
+        ).json()
+        client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers).json()
+        works = client.get(
+            f"/api/v1/runs/{run['run_id']}/map-works", headers=headers
+        ).json()["items"]
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert all(work["status"] == "completed" for work in works)
+    assert all(work["digest"]["candidate_claims"] == ["UNSUPPORTED-DIGEST-CLAIM"] for work in works)
+    assert "UNSUPPORTED-DIGEST-CLAIM" not in messages[-1]["content"]
+    assert citations == []
+    assert detail["status"] == "partial"
+    assert ledger["coverage"]["complete"] is False
+    assert any("unsupported_claim" in gap["description"] for gap in ledger["gaps"])
+    assert ledger["stop_decision"]["completeness"] == "partial"
+
+
 def test_research_run_does_not_map_single_chunk_page(tmp_path) -> None:
     """验证普通单 Chunk 网页不创建长页 map work"""
     settings = Settings(
@@ -816,7 +1050,14 @@ def test_worker_recovery_reuses_committed_map_work_and_continues_remaining(tmp_p
         run_detail = client.get(
             f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
         ).json()
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers).json()
         events = client.get(f"/api/v1/runs/{run_id}/events", headers=headers).text
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
 
     assert any(work["status"] == "completed" for work in partially_committed)
     assert any(work["status"] != "completed" for work in partially_committed)
@@ -831,6 +1072,110 @@ def test_worker_recovery_reuses_committed_map_work_and_continues_remaining(tmp_p
     )
     assert all(effect_count == 1 for effect_count in model_gateway.map_effects.values())
     assert len(model_gateway.map_effects) == len(recovered)
+    assert run_detail["status"] == "completed"
+    assert ledger["missing_chunk_ids"] == []
+    assert ledger["coverage"]["complete"] is True
+    assert ledger["stop_decision"] == {
+        "reason": "evidence_complete",
+        "completeness": "complete",
+    }
+    assert all(f"RECOVERY-{index}" in messages[-1]["content"] for index in range(1, 8))
+    covered_chunk_ids = {
+        chunk_id for work in recovered for chunk_id in work["chunk_ids"]
+    }
+    assert len({citation["source_hash"] for citation in citations}) == len(covered_chunk_ids)
+
+
+def test_worker_recovery_reduces_committed_maps_after_all_map_work_completed(tmp_path) -> None:
+    """验证全部 map 已提交后恢复仍从领域账本形成稳定 reduce 结果"""
+    long_page = "\n\n".join(
+        [
+            f"## 终态恢复章节 {index}\nRECOVERY-{index} " + "recovery material " * 240
+            for index in range(1, 6)
+        ]
+    )
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+        model_context_tokens=3_000,
+        model_output_token_reserve=500,
+        model_context_safety_margin=500,
+    )
+    model_gateway = CrashAfterAllMapsModelGateway()
+    app = create_app(
+        settings,
+        model_gateway=model_gateway,
+        web_search_gateway=LongPageWebSearchGateway(),
+        web_page_gateway=WebAcquisition(
+            jina_reader=LongPageJinaReader(long_page),
+            local_reader=LocalReaderMustNotRun(),
+            url_validator=lambda _: None,
+        ),
+        embedded_worker=False,
+    )
+
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={
+                "email": "map-finalize-recovery@example.com",
+                "password": "correct horse battery",
+            },
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "Map 终态恢复"}
+        ).json()["id"]
+        conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "全部 Map 已提交"},
+        ).json()["id"]
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "map-finalize-recovery"},
+            json={"content": "综合完整报告的所有章节"},
+        ).json()
+        crashing_worker = RunWorker(
+            RunQueue(app.state.session_factory, lease_seconds=1),
+            app.state.run_coordinator,
+            owner="map-finalize-crashing-worker",
+        )
+        with pytest.raises(KeyboardInterrupt, match="全部 map 提交后"):
+            crashing_worker.run_once()
+        committed = client.get(
+            f"/api/v1/runs/{run['run_id']}/map-works", headers=headers
+        ).json()["items"]
+        time.sleep(1.1)
+        recovering_worker = RunWorker(
+            RunQueue(app.state.session_factory, lease_seconds=1),
+            app.state.run_coordinator,
+            owner="map-finalize-recovering-worker",
+        )
+        assert recovering_worker.run_once() is True
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert committed and all(work["status"] == "completed" for work in committed)
+    assert all(effect_count == 1 for effect_count in model_gateway.map_effects.values())
+    assert detail["status"] == "completed"
+    assert all(f"RECOVERY-{index}" in messages[-1]["content"] for index in range(1, 6))
+    assert {f"RECOVERY-{index}" for index in range(1, 6)}.issubset(
+        {citation["evidence_text"] for citation in citations}
+    )
+    assert all(
+        citation["source_hash"]
+        == hashlib.sha256(citation["evidence_text"].encode()).hexdigest()
+        for citation in citations
+    )
 
 
 def test_failed_map_work_remains_unfinished_while_other_digests_are_auditable(tmp_path) -> None:
@@ -883,6 +1228,7 @@ def test_failed_map_work_remains_unfinished_while_other_digests_are_auditable(tm
         run_detail = client.get(
             f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
         ).json()
+        ledger = client.get(f"/api/v1/runs/{run['run_id']}/ledger", headers=headers).json()
 
     failed = [work for work in works if work["status"] == "failed"]
     completed = [work for work in works if work["status"] == "completed"]
@@ -891,7 +1237,15 @@ def test_failed_map_work_remains_unfinished_while_other_digests_are_auditable(tm
     assert set(failed[0]["chunk_ids"]).isdisjoint(
         {chunk_id for work in completed for chunk_id in work["chunk_ids"]}
     )
-    assert run_detail["status"] == "failed"
+    missing_chunk_ids = sorted(chunk_id for work in failed for chunk_id in work["chunk_ids"])
+    assert run_detail["status"] == "partial"
+    assert ledger["missing_chunk_ids"] == missing_chunk_ids
+    assert ledger["coverage"]["complete"] is False
+    assert ledger["stop_decision"] == {
+        "reason": "missing_required_map_work",
+        "completeness": "partial",
+    }
+    assert all(chunk_id in ledger["gaps"][0]["description"] for chunk_id in missing_chunk_ids)
 
 
 def test_cancellation_during_map_call_prevents_new_digest_commit(tmp_path) -> None:

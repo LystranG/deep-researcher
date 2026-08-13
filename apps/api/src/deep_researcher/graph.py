@@ -110,7 +110,7 @@ async def _run_source_mapper(
         raise
     except Exception as exc:
         ledger.fail(context, str(exc))
-        raise RuntimeError("Source map work 执行失败") from exc
+        return {"map_results": []}
     return {"map_results": []}
 
 

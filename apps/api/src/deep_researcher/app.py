@@ -101,6 +101,7 @@ from deep_researcher.sandbox import (
 from deep_researcher.security import hash_access_token, hash_password, issue_access_token
 from deep_researcher.settings import Settings
 from deep_researcher.skills import SOURCE_COMPARISON_MANIFEST, manifest_hash, validate_manifest
+from deep_researcher.source_map import missing_source_map_chunk_ids
 from deep_researcher.storage import FileTooLargeError, LocalObjectStore
 from deep_researcher.tool_execution import (
     DisabledMcpGateway,
@@ -263,6 +264,7 @@ class ResearchLedgerResponse(BaseModel):
     coverage: LedgerCoverageResponse | None
     gaps: list[LedgerGapResponse]
     stop_decision: LedgerStopDecisionResponse | None
+    missing_chunk_ids: list[str]
 
 
 class SourceMapWorkResponse(BaseModel):
@@ -1880,6 +1882,12 @@ def create_app(
             .where(EvidenceGap.ledger_id == ledger.id)
             .order_by(EvidenceGap.created_at)
         ).all()
+        map_works = session.scalars(
+            select(SourceMapWork).where(
+                SourceMapWork.run_id == run.id,
+                SourceMapWork.workspace_id == run.workspace_id,
+            )
+        ).all()
         return ResearchLedgerResponse(
             id=str(ledger.id),
             run_id=str(ledger.run_id),
@@ -1908,6 +1916,7 @@ def create_app(
                 if stop_decision is not None
                 else None
             ),
+            missing_chunk_ids=list(missing_source_map_chunk_ids(map_works)),
         )
 
     @app.get(
@@ -2681,7 +2690,10 @@ def create_app(
             source_captured_at=source_captured_at,
             document_version=document_version,
             page_number=chunk.page_number,
-            evidence_text=chunk.text,
+            evidence_text=chunk.text[
+                citation.evidence_start - chunk.start_offset :
+                citation.evidence_end - chunk.start_offset
+            ],
             source_hash=citation.source_hash,
         )
 

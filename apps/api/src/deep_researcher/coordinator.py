@@ -259,6 +259,62 @@ class ResearchCoordinator:
                     self._cancel(run_id, lease_owner=lease_owner)
                     return
             answer = graph_state["answer"]
+            citation_drafts = graph_state["citation_drafts"]
+            reduction = (
+                self._source_map_ledger.reduce(run_id, run.workspace_id, map_budget)
+                if self._requires_whole_page_map(question)
+                else None
+            )
+            map_verification_status: str | None = None
+            if reduction is not None:
+                candidate_sources = [
+                    candidate.source for candidate in reduction.evidence_candidates
+                ]
+                final_research_context = freeze_research_context(
+                    question=research_context["question"],
+                    sources=[
+                        *(
+                            source
+                            for source in research_context["sources"]
+                            if source not in citable_sources(research_context)
+                        ),
+                        *candidate_sources,
+                    ],
+                    correction=research_context["correction"],
+                    memory=research_context["memory"],
+                    conversation_leads=research_context["conversation_leads"],
+                    skills=research_context["skills"],
+                )
+                if reduction.evidence_candidates:
+                    answer_parts: list[str] = []
+                    citation_drafts = []
+                    cursor = 0
+                    for label, candidate in enumerate(
+                        reduction.evidence_candidates, start=1
+                    ):
+                        part = f"{candidate.claim_text} [{label}]"
+                        answer_parts.append(part)
+                        marker_start = cursor + len(candidate.claim_text) + 1
+                        citation_drafts.append(
+                            {
+                                "label": label,
+                                "answer_start": marker_start,
+                                "answer_end": marker_start + len(f"[{label}]"),
+                            }
+                        )
+                        cursor += len(part) + 1
+                    answer = "\n".join(answer_parts)
+                else:
+                    citation_drafts = []
+                missing_chunk_ids = reduction.missing_chunk_ids
+                unsupported_claims = reduction.unsupported_claims
+                map_verification_status = (
+                    "supported" if reduction.evidence_candidates else "insufficient"
+                )
+            else:
+                final_research_context = graph_state["research_context"]
+                missing_chunk_ids = ()
+                unsupported_claims = ()
             if sandbox_summaries:
                 answer = f"{answer}\n\n受限 Sandbox 计算结果：{sandbox_summaries[0]}"
             elif sandbox_failed:
@@ -281,7 +337,6 @@ class ResearchCoordinator:
                     event_key="model-usage-recorded",
                     lease_owner=lease_owner,
                 )
-            citation_drafts = graph_state["citation_drafts"]
             completed_conversation_id: UUID | None = None
             completed_research_record_id: UUID | None = None
 
@@ -330,7 +385,7 @@ class ResearchCoordinator:
                     persisted_citations: list[Citation] = []
                     for citation_draft in citation_drafts:
                         label = citation_draft["label"]
-                        citable = citable_sources(research_context)
+                        citable = citable_sources(final_research_context)
                         if label < 1 or label > len(citable):
                             continue
                         source = citable[label - 1]
@@ -352,9 +407,12 @@ class ResearchCoordinator:
                         citation_ids.append(str(citation.id))
                         persisted_citations.append(citation)
                     verification_status = (
-                        graph_state["verification"]["status"]
-                        if isinstance(graph_state.get("verification"), dict)
-                        else "supported"
+                        map_verification_status
+                        or (
+                            graph_state["verification"]["status"]
+                            if isinstance(graph_state.get("verification"), dict)
+                            else "supported"
+                        )
                     )
                     research_record = self._promote_research_record(
                         session,
@@ -378,6 +436,8 @@ class ResearchCoordinator:
                             for task in completed_tasks
                             if task.status in {"failed", "skipped"} and task.failure_impact
                         ),
+                        missing_chunk_ids=missing_chunk_ids,
+                        unsupported_claims=unsupported_claims,
                     )
                     for completed_task in completed_tasks:
                         if completed_task.status in {"pending", "running"}:
@@ -456,14 +516,26 @@ class ResearchCoordinator:
     ) -> bool:
         """回读不可变 Chunk 与 Snapshot 验证 Citation locator、offset 和 hash"""
         chunk = session.get(SourceChunk, UUID(source["source_chunk_id"]))
+        source_start = source.get("start_offset")
+        source_end = source.get("end_offset")
         if (
             chunk is None
             or chunk.workspace_id != run.workspace_id
-            or chunk.content_hash != source.get("content_hash")
-            or chunk.start_offset != source.get("start_offset")
-            or chunk.end_offset != source.get("end_offset")
-            or chunk.text != source.get("text")
+            or not isinstance(source_start, int)
+            or not isinstance(source_end, int)
+            or source_start < chunk.start_offset
+            or source_end > chunk.end_offset
+            or source_start >= source_end
             or hashlib.sha256(chunk.text.encode()).hexdigest() != chunk.content_hash
+        ):
+            return False
+        local_start = source_start - chunk.start_offset
+        local_end = source_end - chunk.start_offset
+        exact_text = chunk.text[local_start:local_end]
+        if (
+            exact_text != source.get("text")
+            or hashlib.sha256(exact_text.encode()).hexdigest()
+            != source.get("content_hash")
         ):
             return False
         if chunk.source_snapshot_id is None:
@@ -475,6 +547,7 @@ class ResearchCoordinator:
             or snapshot.invalidated_at is not None
             or hashlib.sha256(snapshot.content.encode()).hexdigest() != snapshot.content_hash
             or snapshot.content[chunk.start_offset : chunk.end_offset] != chunk.text
+            or snapshot.content[source_start:source_end] != exact_text
         ):
             return False
         source_window = source.get("source_window")
@@ -1046,7 +1119,6 @@ class ResearchCoordinator:
             if (
                 chunk is None
                 or chunk.workspace_id != run.workspace_id
-                or chunk.content_hash != span.content_hash
                 or evidence_ref.get("source_hash") != span.content_hash
             ):
                 continue
@@ -1076,9 +1148,15 @@ class ResearchCoordinator:
             local_end = span.end_offset - chunk.start_offset
             if local_start < 0 or local_end > len(chunk.text) or local_start >= local_end:
                 continue
+            evidence_text = chunk.text[local_start:local_end]
+            if span.content_hash not in {
+                chunk.content_hash,
+                hashlib.sha256(evidence_text.encode()).hexdigest(),
+            }:
+                continue
             return {
                 "source_chunk_id": str(chunk.id),
-                "text": chunk.text[local_start:local_end],
+                "text": evidence_text,
                 "start_offset": span.start_offset,
                 "end_offset": span.end_offset,
                 "content_hash": span.content_hash,
@@ -1902,6 +1980,8 @@ class ResearchCoordinator:
         verified_claim_count: int = 0,
         verification_status: str | None = None,
         blocking_gap_descriptions: tuple[str, ...] = (),
+        missing_chunk_ids: tuple[str, ...] = (),
+        unsupported_claims: tuple[str, ...] = (),
     ) -> str:
         """根据终态和已固化 Citation 写入 Coverage Snapshot 与 Stop Decision"""
         ledger = session.scalar(select(ResearchLedger).where(ResearchLedger.run_id == run.id))
@@ -1914,6 +1994,8 @@ class ResearchCoordinator:
                 verified_claim_count=verified_claim_count,
                 valid_citation_count=citation_count,
                 blocking_gap_descriptions=blocking_gap_descriptions,
+                missing_chunk_ids=missing_chunk_ids,
+                unsupported_claims=unsupported_claims,
             )
         )
         ledger.status = outcome.status

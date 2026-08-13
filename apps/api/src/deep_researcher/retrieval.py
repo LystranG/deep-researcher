@@ -1,3 +1,4 @@
+import hashlib
 import math
 import os
 import re
@@ -629,7 +630,6 @@ class PostgresResearchRecordRetrievalAdapter:
             if (
                 chunk is None
                 or chunk.workspace_id != workspace_id
-                or chunk.content_hash != span.content_hash
                 or evidence_ref.get("source_hash") != span.content_hash
             ):
                 continue
@@ -659,6 +659,13 @@ class PostgresResearchRecordRetrievalAdapter:
             local_start = span.start_offset - chunk.start_offset
             local_end = span.end_offset - chunk.start_offset
             if local_start < 0 or local_end > len(chunk.text) or local_start >= local_end:
+                continue
+            if span.content_hash not in {
+                chunk.content_hash,
+                hashlib.sha256(
+                    chunk.text[local_start:local_end].encode()
+                ).hexdigest(),
+            }:
                 continue
             return True
         return False

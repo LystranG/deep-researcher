@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from deep_researcher.agents.verifier import verify_evidence_candidate
 from deep_researcher.models import (
     ResearchLedger,
     ResearchRun,
@@ -16,6 +17,7 @@ from deep_researcher.models import (
     SourceMapWork,
     SourceSnapshot,
 )
+from deep_researcher.research_context import FrozenSource
 from deep_researcher.retrieval import ContextBudget, TokenEstimator
 
 MAP_PROMPT_VERSION = "source-map-v1"
@@ -99,6 +101,35 @@ class SourceMapContext:
     consumed_tokens: int
     input_capacity: int
     prompt_version: str
+
+
+@dataclass(frozen=True)
+class SourceMapEvidenceCandidate:
+    """表示经过不可变 Chunk 回读核验的 reduce 候选"""
+
+    claim_text: str
+    source: FrozenSource
+
+
+@dataclass(frozen=True)
+class SourceMapReduction:
+    """表示整页 reduce 的稳定覆盖与已核验候选"""
+
+    missing_chunk_ids: tuple[str, ...]
+    evidence_candidates: tuple[SourceMapEvidenceCandidate, ...]
+    unsupported_claims: tuple[str, ...]
+
+
+def missing_source_map_chunk_ids(works: Sequence[SourceMapWork]) -> tuple[str, ...]:
+    """根据领域 work 计算稳定的缺失 Chunk 集合"""
+    expected = {chunk_id for work in works for chunk_id in work.chunk_ids}
+    completed = {
+        chunk_id
+        for work in works
+        if work.status == "completed"
+        for chunk_id in work.chunk_ids
+    }
+    return tuple(sorted(expected - completed))
 
 
 def source_map_prompt(context: SourceMapContext) -> str:
@@ -295,6 +326,134 @@ class SourceMapLedger:
                 )
             )
         return dict(digest) if isinstance(digest, dict) else None
+
+    def reduce(
+        self,
+        run_id: UUID,
+        workspace_id: UUID,
+        context_budget: ContextBudget,
+    ) -> SourceMapReduction | None:
+        """消费全部已提交 digest 并回读不可变 Chunk 形成 reduce 覆盖"""
+        output_capacity = self._input_capacity(context_budget)
+        with self._session_factory() as session:
+            run = session.get(ResearchRun, run_id)
+            if run is None or run.workspace_id != workspace_id:
+                return None
+            works = session.scalars(
+                select(SourceMapWork)
+                .where(
+                    SourceMapWork.run_id == run_id,
+                    SourceMapWork.workspace_id == workspace_id,
+                )
+                .order_by(SourceMapWork.created_at, SourceMapWork.id)
+            ).all()
+            if not works:
+                return None
+            missing = missing_source_map_chunk_ids(works)
+            candidates: list[SourceMapEvidenceCandidate] = []
+            unsupported_claims: list[str] = []
+            seen: set[tuple[str, str]] = set()
+            for work in works:
+                if work.status != "completed" or not isinstance(work.digest, dict):
+                    continue
+                locators = work.digest.get("candidate_span_locators", [])
+                claims = work.digest.get("candidate_claims", [])
+                if not isinstance(locators, list):
+                    continue
+                if not isinstance(claims, list) or not all(
+                    isinstance(claim, str) for claim in claims
+                ):
+                    continue
+                supported_claims: set[str] = set()
+                for locator in locators:
+                    if not isinstance(locator, dict):
+                        continue
+                    chunk_id = locator.get("chunk_id")
+                    if not isinstance(chunk_id, str):
+                        continue
+                    chunk = session.get(SourceChunk, UUID(chunk_id))
+                    try:
+                        chunk_position = work.chunk_ids.index(chunk_id)
+                    except ValueError:
+                        continue
+                    if (
+                        chunk is None
+                        or chunk.workspace_id != workspace_id
+                        or chunk.source_snapshot_id != work.source_snapshot_id
+                        or chunk.content_hash != work.chunk_hashes[chunk_position]
+                        or chunk.content_hash != locator.get("content_hash")
+                    ):
+                        continue
+                    start = locator.get("start_offset")
+                    end = locator.get("end_offset")
+                    if not isinstance(start, int) or not isinstance(end, int):
+                        continue
+                    if start < chunk.start_offset or end > chunk.end_offset or start >= end:
+                        continue
+                    snapshot = (
+                        session.get(SourceSnapshot, chunk.source_snapshot_id)
+                        if chunk.source_snapshot_id is not None
+                        else None
+                    )
+                    if (
+                        snapshot is None
+                        or snapshot.workspace_id != workspace_id
+                        or snapshot.run_id != run_id
+                        or snapshot.id != work.source_snapshot_id
+                        or snapshot.content_hash != work.snapshot_hash
+                        or snapshot.invalidated_at is not None
+                    ):
+                        continue
+                    locator_text = snapshot.content[start:end]
+                    locator_claims = [
+                        claim
+                        for claim in claims
+                        if verify_evidence_candidate(claim, locator_text)["status"]
+                        == "supported"
+                    ]
+                    if not locator_claims:
+                        continue
+                    for claim in locator_claims:
+                        identity = (claim, chunk_id)
+                        supported_claims.add(claim)
+                        if identity in seen:
+                            continue
+                        seen.add(identity)
+                        claim_start = start + locator_text.index(claim)
+                        claim_end = claim_start + len(claim)
+                        candidate = SourceMapEvidenceCandidate(
+                            claim_text=claim,
+                            source={
+                                "source_chunk_id": chunk_id,
+                                "source_snapshot_id": str(snapshot.id),
+                                "text": claim,
+                                "start_offset": claim_start,
+                                "end_offset": claim_end,
+                                "content_hash": hashlib.sha256(
+                                    claim.encode()
+                                ).hexdigest(),
+                            },
+                        )
+                        proposed_answer = "\n".join(
+                            [
+                                *(
+                                    f"{selected.claim_text} [{index}]"
+                                    for index, selected in enumerate(candidates, start=1)
+                                ),
+                                f"{claim} [{len(candidates) + 1}]",
+                            ]
+                        )
+                        if self._token_estimator.count_tokens(proposed_answer) <= output_capacity:
+                            candidates.append(candidate)
+                if not unsupported_claims and any(
+                    claim for claim in claims if claim and claim not in supported_claims
+                ):
+                    unsupported_claims.append("unsupported_claim")
+            return SourceMapReduction(
+                missing,
+                tuple(candidates),
+                tuple(dict.fromkeys(unsupported_claims)),
+            )
 
     def fail(self, context: SourceMapContext, reason: str) -> None:
         """记录失败并保留可恢复的未完成 work"""

@@ -10,6 +10,13 @@ class VerificationResult(TypedDict):
     summary: str
 
 
+def verify_evidence_candidate(claim_text: str, evidence_text: str) -> VerificationResult:
+    """核验候选主张是否由回读的不可变来源原文直接支持"""
+    if claim_text and claim_text in evidence_text:
+        return {"status": "supported", "summary": "候选主张由来源原文直接支持"}
+    return {"status": "insufficient", "summary": "候选主张无法由来源原文直接支持"}
+
+
 def verify(findings: list[ResearchFinding]) -> VerificationResult:
     """独立核对聚合结果是否足以进入写作阶段"""
     if not findings:
