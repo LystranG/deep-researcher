@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: pgvector/pgvector:0.8.5-pg17
     environment:
       POSTGRES_DB: deep_researcher
       POSTGRES_USER: deep_researcher
@@ -24,6 +24,12 @@ services:
       DEEP_RESEARCHER_OBJECT_STORE_ROOT: /data/objects
       DEEP_RESEARCHER_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DEEP_RESEARCHER_OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
+      DEEP_RESEARCHER_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      DEEP_RESEARCHER_EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:-}
+      DEEP_RESEARCHER_EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+      DEEP_RESEARCHER_RERANK_API_KEY: ${RERANK_API_KEY:-}
+      DEEP_RESEARCHER_RERANK_API_BASE: ${RERANK_API_BASE:-}
+      DEEP_RESEARCHER_RERANK_MODEL: ${RERANK_MODEL:-}
     depends_on:
       postgres:
         condition: service_healthy

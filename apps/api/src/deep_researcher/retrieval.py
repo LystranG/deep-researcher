@@ -269,6 +269,7 @@ class LiteLLMEmbeddingGateway:
         }
         if self._api_base is not None:
             request_args["api_base"] = self._api_base
+            request_args["custom_llm_provider"] = "openai"
         return request_args
 
 
@@ -705,11 +706,17 @@ class LiteLLMRerankGateway:
         self._api_key = api_key
         self._model = model
         self._api_base = api_base
+        self._last_metadata: dict[str, object] | None = None
+
+    def last_metadata(self) -> dict[str, object] | None:
+        """返回最近一次精排的安全 Provider 元数据"""
+        return self._last_metadata
 
     def rerank(self, query: str, documents: Sequence[str], top_n: int) -> list[tuple[int, float]]:
         """按相关性返回候选下标和分数，Provider 失败时直接抛出异常"""
         from litellm import rerank
 
+        self._last_metadata = None
         request_args: dict[str, Any] = {
             "model": self._model,
             "api_key": self._api_key,
@@ -719,8 +726,16 @@ class LiteLLMRerankGateway:
             "return_documents": False,
         }
         if self._api_base is not None:
-            request_args["api_base"] = self._api_base
+            api_base = self._api_base.rstrip("/")
+            request_args["api_base"] = api_base.removesuffix("/v1")
+            request_args["custom_llm_provider"] = "litellm_proxy"
         response = rerank(**request_args)
+        self._last_metadata = {
+            "model_alias": self._model,
+            "provider": request_args.get("custom_llm_provider", self._model.split("/", 1)[0]),
+            "response_id": getattr(response, "id", None),
+            "provider_meta": getattr(response, "meta", None),
+        }
         return [(int(item["index"]), float(item["relevance_score"])) for item in response.results]
 
 

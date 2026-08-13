@@ -17,6 +17,8 @@ from deep_researcher.models import (
 from deep_researcher.retrieval import (
     ContextBudget,
     HybridRetrieval,
+    LiteLLMEmbeddingGateway,
+    LiteLLMRerankGateway,
     LiteLLMTokenEstimator,
     RetrievalCandidate,
     RetrievalRequest,
@@ -147,6 +149,70 @@ def test_hybrid_retrieval_uses_rerank_order_for_final_candidates() -> None:
     )
 
     assert [item.candidate.candidate_id for item in result] == ["second", "first"]
+
+
+def test_custom_openai_embedding_gateway_routes_through_openai_provider(monkeypatch) -> None:
+    """验证自定义 OpenAI-compatible embedding endpoint 能被 LiteLLM 正确路由"""
+    import litellm
+
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __init__(self) -> None:
+            """初始化 LiteLLM embedding fake response"""
+            self.data = [{"embedding": [0.1, 0.2]}]
+
+    def fake_embedding(**kwargs):
+        """记录 embedding 请求参数并返回固定向量"""
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(litellm, "embedding", fake_embedding)
+    result = LiteLLMEmbeddingGateway(
+        api_key="test-key",
+        model="qwen3-embedding-8b",
+        api_base="https://models.example/v1",
+    ).embed_query("semantic retrieval")
+
+    assert result == (0.1, 0.2)
+    assert captured["custom_llm_provider"] == "openai"
+
+
+def test_custom_rerank_gateway_routes_through_litellm_proxy(monkeypatch) -> None:
+    """验证自定义 rerank endpoint 能按 LiteLLM Proxy 契约正确路由"""
+    import litellm
+
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __init__(self) -> None:
+            """初始化 LiteLLM rerank fake response"""
+            self.results = [{"index": 0, "relevance_score": 0.9}]
+            self.id = None
+            self.meta = None
+
+    def fake_rerank(**kwargs):
+        """记录 rerank 请求参数并返回固定排序"""
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(litellm, "rerank", fake_rerank)
+    gateway = LiteLLMRerankGateway(
+        api_key="test-key",
+        model="qwen3-reranker-8b",
+        api_base="https://models.example/v1",
+    )
+    result = gateway.rerank("semantic retrieval", ["evidence"], 1)
+
+    assert result == [(0, 0.9)]
+    assert captured["custom_llm_provider"] == "litellm_proxy"
+    assert captured["api_base"] == "https://models.example"
+    assert gateway.last_metadata() == {
+        "model_alias": "qwen3-reranker-8b",
+        "provider": "litellm_proxy",
+        "response_id": None,
+        "provider_meta": None,
+    }
 
 
 def test_retrieval_page_reserves_context_and_uses_injected_token_estimator() -> None:
@@ -286,6 +352,25 @@ def test_token_estimation_does_not_enable_real_provider_for_next_app(
     )
     assert settings.openai_api_key is None
     assert settings.brave_search_api_key is None
+
+
+def test_empty_retrieval_provider_settings_leave_retrieval_disabled(tmp_path) -> None:
+    """验证空字符串 Provider 配置不会误启用真实检索"""
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'empty-provider.db'}",
+        object_store_root=tmp_path / "objects",
+        embedding_api_key="",
+        embedding_model="",
+        rerank_api_key="",
+        rerank_model="",
+    )
+
+    with TestClient(create_app(settings, embedded_worker=False)) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
 
 
 def test_retrieve_deduplicates_same_content_across_sources_before_single_rerank() -> None:

@@ -631,7 +631,7 @@ def create_app(
     resolved_embedding_gateway = embedding_gateway
     resolved_rerank_gateway = rerank_gateway
     retrieval_configured = any(
-        value is not None
+        bool(value)
         for value in (
             resolved_settings.embedding_api_key,
             resolved_settings.embedding_model,
