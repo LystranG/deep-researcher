@@ -279,6 +279,11 @@ class ResearchGraphRunner:
         self._local_checkpointer = InMemorySaver()
         self._graph = build_research_graph(self._local_checkpointer)
 
+    async def setup_checkpointer(self) -> None:
+        """在服务接收请求前初始化 PostgreSQL checkpoint schema"""
+        if self._database_url and self._database_url.startswith("postgres"):
+            await setup_postgres_checkpointer(self._database_url)
+
     async def arun(
         self,
         run_id: UUID,
@@ -457,8 +462,15 @@ async def postgres_checkpointer(database_url: str) -> AsyncIterator[Any]:
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
     async with AsyncPostgresSaver.from_conn_string(_checkpoint_url(database_url)) as checkpointer:
-        await checkpointer.setup()
         yield checkpointer
+
+
+async def setup_postgres_checkpointer(database_url: str) -> None:
+    """独占初始化 PostgreSQL checkpoint schema，避免运行期 DDL 阻塞"""
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    async with AsyncPostgresSaver.from_conn_string(_checkpoint_url(database_url)) as checkpointer:
+        await checkpointer.setup()
 
 
 def _checkpoint_url(database_url: str) -> str:

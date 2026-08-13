@@ -3,10 +3,12 @@ import time
 from io import BytesIO
 from uuid import UUID
 
-from deep_researcher.model_gateway import ExtractiveModelGateway
+from deep_researcher.model_gateway import AnswerContext, ExtractiveModelGateway
 from deep_researcher.models import ConversationSegment
 from deep_researcher.settings import Settings
+from deep_researcher.source_map import SourceMapContext, SourceMapDigest
 from deep_researcher.testing import running_worker_client
+from deep_researcher.web_page import WebAcquisition
 from deep_researcher.web_search import DisabledWebSearchGateway
 from reportlab.pdfgen import canvas
 from sqlalchemy import select
@@ -46,6 +48,62 @@ class StableRerankGateway:
         return [(index, 1.0 - index / 100) for index in range(min(len(documents), top_n))]
 
 
+class CombinedSourceWebSearchGateway:
+    """为组合 Research Run 返回可审计的网页发现结果"""
+
+    def __init__(self) -> None:
+        """初始化查询记录"""
+        self.queries: list[str] = []
+
+    def search(self, query: str, *, count: int = 5) -> list[dict[str, str]]:
+        """记录查询并返回不具备 Citation 资格的发现 snippet"""
+        self.queries.append(query)
+        assert count == 5
+        return [
+            {
+                "title": "组合来源公告",
+                "url": "https://example.com/combined-source",
+                "snippet": "BRAVE-SNIPPET 只能用于发现",
+            }
+        ]
+
+
+class ExternalExtractiveGateway:
+    """模拟已配置外部模型但保留确定性回答内容的 Gateway"""
+
+    requires_web_research = True
+
+    def __init__(self) -> None:
+        """初始化内部确定性委托"""
+        self._delegate = ExtractiveModelGateway()
+
+    def stream_answer(self, context: AnswerContext):
+        """转发同步回答生成"""
+        yield from self._delegate.stream_answer(context)
+
+    async def astream_answer(self, context: AnswerContext):
+        """转发异步回答生成"""
+        async for delta in self._delegate.astream_answer(context):
+            yield delta
+
+    async def acomplete_map_work(self, context: SourceMapContext) -> SourceMapDigest:
+        """转发有界整页分析"""
+        return await self._delegate.acomplete_map_work(context)
+
+
+class CombinedSourceWebPageGateway:
+    """为组合 Research Run 返回可持久化网页正文"""
+
+    def fetch(self, url: str) -> dict[str, object]:
+        """返回与 discovery snippet 不同的网页证据"""
+        assert url == "https://example.com/combined-source"
+        return {
+            "title": "组合来源公告",
+            "content": "网页证据编号为 WEB-2048。",
+            "truncated": False,
+        }
+
+
 class ConversationLeadGateway:
     """将召回到的历史会话线索原样展示给端到端测试"""
 
@@ -79,6 +137,7 @@ def test_indexed_workspace_document_is_cited_from_another_conversation(tmp_path)
     """验证异步索引后的空间文档可跨会话回读并引用原文"""
     evidence = "混合检索验收编号为 VECTOR-2048。"
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )
@@ -156,6 +215,84 @@ def test_indexed_workspace_document_is_cited_from_another_conversation(tmp_path)
     assert ledger.json()["status"] == "completed"
     assert ledger.json()["stop_decision"]["completeness"] == "complete"
     assert ledger.json()["coverage"]["citation_count"] == 1
+
+
+def test_external_research_combines_workspace_retrieval_with_web_acquisition(tmp_path) -> None:
+    """验证外部模型运行同时保留 Workspace 检索与网页正文来源"""
+    workspace_evidence = "Workspace 证据编号为 VECTOR-4096。"
+    web_search = CombinedSourceWebSearchGateway()
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+        openai_api_key="configured-for-external-run",
+    )
+
+    with running_worker_client(
+        settings,
+        model_gateway=ExternalExtractiveGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=web_search,
+        web_page_gateway=WebAcquisition(
+            jina_reader=CombinedSourceWebPageGateway(),
+            local_reader=None,
+            url_validator=lambda _: None,
+        ),
+    ) as client:
+        registered = client.post(
+            "/api/v1/auth/register",
+            json={"email": "combined@example.com", "password": "correct horse battery"},
+        )
+        headers = {"Authorization": f"Bearer {registered.json()['access_token']}"}
+        workspace_id = client.post(
+            "/api/v1/workspaces", headers=headers, json={"name": "组合来源"}
+        ).json()["id"]
+        upload_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "资料上传"},
+        ).json()["id"]
+        query_conversation_id = client.post(
+            f"/api/v1/workspaces/{workspace_id}/conversations",
+            headers=headers,
+            json={"title": "组合检索"},
+        ).json()["id"]
+        uploaded = client.post(
+            f"/api/v1/conversations/{upload_conversation_id}/attachments",
+            headers=headers,
+            files={"file": ("workspace.txt", workspace_evidence, "text/plain")},
+        ).json()
+        for _ in range(50):
+            attachment = client.get(
+                f"/api/v1/attachments/{uploaded['id']}", headers=headers
+            ).json()
+            if attachment["status"] != "processing":
+                break
+            time.sleep(0.01)
+        client.post(f"/api/v1/attachments/{uploaded['id']}/promote", headers=headers)
+
+        question = "同时核验 Workspace 与网页证据编号"
+        run = client.post(
+            f"/api/v1/conversations/{query_conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "combined-research"},
+            json={"content": question},
+        ).json()
+        events = client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        sources = client.get(
+            f"/api/v1/runs/{run['run_id']}/sources", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert web_search.queries == [question]
+    assert "event: tool_completed" in events.text
+    assert sources[0]["content_kind"] == "web_page"
+    assert "WEB-2048" in sources[0]["content_preview"]
+    assert citations[0]["source_type"] == "workspace_document"
+    assert citations[0]["evidence_text"] == workspace_evidence
+    assert "BRAVE-SNIPPET" not in citations[0]["evidence_text"]
 
 
 def test_other_conversation_is_recalled_only_as_lead_without_citation(tmp_path) -> None:
@@ -323,11 +460,18 @@ def test_private_attachment_answer_stays_out_of_workspace_retrieval(tmp_path) ->
 def test_unknown_citation_falls_back_to_frozen_evidence(tmp_path) -> None:
     """验证未知引用不会进入最终消息和 Citation"""
     settings = Settings(
+        _env_file=None,
         database_url=f"sqlite:///{tmp_path / 'test.db'}",
         object_store_root=tmp_path / "objects",
     )
 
-    with running_worker_client(settings, model_gateway=UnknownCitationGateway()) as client:
+    with running_worker_client(
+        settings,
+        model_gateway=UnknownCitationGateway(),
+        embedding_gateway=DeterministicEmbeddingGateway(),
+        rerank_gateway=StableRerankGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
         registered = client.post(
             "/api/v1/auth/register",
             json={"email": "researcher@example.com", "password": "correct horse battery"},

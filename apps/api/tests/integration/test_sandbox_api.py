@@ -1,6 +1,8 @@
 import time
 from pathlib import Path
+from uuid import UUID
 
+from deep_researcher.models import Artifact, Citation
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
 from fastapi.testclient import TestClient
@@ -106,6 +108,13 @@ def test_user_can_cancel_running_sandbox_execution(tmp_path) -> None:
             json={"content": "准备执行"},
         ).json()
         client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        with client.app.state.session_factory() as session:
+            citations_before = session.query(Citation).filter_by(
+                message_id=UUID(run["assistant_message_id"])
+            ).count()
+            artifacts_before = session.query(Artifact).filter_by(
+                run_id=UUID(run["run_id"])
+            ).count()
         created = client.post(
             f"/api/v1/runs/{run['run_id']}/sandbox-executions",
             headers=headers,
@@ -128,9 +137,18 @@ def test_user_can_cancel_running_sandbox_execution(tmp_path) -> None:
         )
         assert cancelled.status_code == 200, cancelled.text
         execution = wait_for_execution(client, headers, created["id"])
+        with client.app.state.session_factory() as session:
+            citations_after = session.query(Citation).filter_by(
+                message_id=UUID(run["assistant_message_id"])
+            ).count()
+            artifacts_after = session.query(Artifact).filter_by(
+                run_id=UUID(run["run_id"])
+            ).count()
 
     assert execution["status"] == "cancelled"
     assert execution["artifacts"] == []
+    assert citations_after == citations_before
+    assert artifacts_after == artifacts_before
 
 
 def register(client: TestClient, email: str) -> dict[str, str]:

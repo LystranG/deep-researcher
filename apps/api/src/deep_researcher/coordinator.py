@@ -160,6 +160,21 @@ class ResearchCoordinator:
                 memory = self._best_memory(session, run, question, retrieval_page)
                 conversation_lead = self._best_conversation_lead(retrieval_page)
 
+            if retrieval_page is not None:
+                self._append_event(
+                    run_id,
+                    "retrieval_completed",
+                    {
+                        "consumed_tokens": retrieval_page.consumed_tokens,
+                        "remaining_tokens": retrieval_page.remaining_tokens,
+                        "result_count": len(retrieval_page.items),
+                        "omitted_count": len(retrieval_page.omitted_ids),
+                        "completeness": retrieval_page.completeness,
+                    },
+                    event_key="workspace-retrieval-completed",
+                    lease_owner=lease_owner,
+                )
+
             if resume is None:
                 self._append_event(
                     run_id,
@@ -171,7 +186,12 @@ class ResearchCoordinator:
             sources: list[FrozenSource] = []
             if evidence is not None:
                 sources.append(evidence)
-            elif conversation_lead is None and memory is None and correction is None:
+            if self._require_web_search_for_external_model or (
+                evidence is None
+                and conversation_lead is None
+                and memory is None
+                and correction is None
+            ):
                 for discovered_chunk in self._search_web(
                     run_id, question, lease_owner=lease_owner
                 ):

@@ -36,6 +36,8 @@ from fastapi.testclient import TestClient
 class FailIfCalledModelGateway:
     """验证搜索失败后不得继续调用模型"""
 
+    requires_web_research = True
+
     async def astream_answer(self, context):
         """模型被调用时立即暴露错误路径"""
         del context

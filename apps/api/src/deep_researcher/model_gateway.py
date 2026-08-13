@@ -98,6 +98,8 @@ class ExtractiveModelGateway:
 class LiteLLMModelGateway:
     """使用进程内 LiteLLM SDK 的受控模型 Adapter"""
 
+    requires_web_research = True
+
     def __init__(
         self,
         *,
@@ -144,10 +146,12 @@ class LiteLLMModelGateway:
                 "json_schema": {"name": "structured_result", "schema": response_schema},
             },
             "timeout": 60,
-            "reasoning_effort": self._reasoning_effort,
         }
         if self._api_base:
             request_args["api_base"] = self._api_base
+            request_args["custom_llm_provider"] = "openai"
+        else:
+            request_args["reasoning_effort"] = self._reasoning_effort
         response = await acompletion(**request_args)
         if context.cancellation_token is not None:
             context.cancellation_token.raise_if_cancelled()
@@ -239,10 +243,12 @@ Source Manifest 导航：{manifest_block}
                     "stream": True,
                     "stream_options": {"include_usage": True},
                     "timeout": 60,
-                    "reasoning_effort": self._reasoning_effort,
                 }
                 if self._api_base:
                     request_args["api_base"] = self._api_base
+                    request_args["custom_llm_provider"] = "openai"
+                else:
+                    request_args["reasoning_effort"] = self._reasoning_effort
                 stream = await acompletion(**request_args)
                 async for chunk in stream:
                     if context.cancellation_token is not None:

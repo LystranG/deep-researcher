@@ -681,6 +681,10 @@ def create_app(
         resolved_mcp_gateway or DisabledMcpGateway(),
         approval_ttl_seconds=resolved_settings.tool_approval_ttl_seconds,
     )
+    resolved_graph_runner = graph_runner or ResearchGraphRunner(
+        resolved_settings.database_url,
+        max_concurrency=resolved_settings.map_work_max_concurrency,
+    )
     coordinator = ResearchCoordinator(
         session_factory,
         model_gateway=resolved_model_gateway,
@@ -697,13 +701,11 @@ def create_app(
         model_output_token_reserve=resolved_settings.model_output_token_reserve,
         model_context_safety_margin=resolved_settings.model_context_safety_margin,
         token_estimator=token_estimator,
-        require_web_search_for_external_model=bool(resolved_settings.openai_api_key),
-        step_delay_seconds=resolved_settings.research_step_delay_seconds,
-        graph_runner=graph_runner
-        or ResearchGraphRunner(
-            resolved_settings.database_url,
-            max_concurrency=resolved_settings.map_work_max_concurrency,
+        require_web_search_for_external_model=bool(
+            getattr(resolved_model_gateway, "requires_web_research", False)
         ),
+        step_delay_seconds=resolved_settings.research_step_delay_seconds,
+        graph_runner=resolved_graph_runner,
         embedding_gateway=resolved_embedding_gateway,
         retrieval=retrieval,
         sandbox_submitter=lambda execution_id: sandbox_executor.submit(
@@ -781,17 +783,24 @@ def create_app(
                     )
                 )
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def initialize_runtime() -> None:
+        """初始化 API 与独立 Worker 共用的数据库和运行时资源"""
         resolved_settings.object_store_root.mkdir(parents=True, exist_ok=True)
         resolved_settings.sandbox_output_root.mkdir(parents=True, exist_ok=True)
         upgrade_schema()
+        if isinstance(resolved_graph_runner, ResearchGraphRunner):
+            await resolved_graph_runner.setup_checkpointer()
         ensure_builtin_skills()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        await initialize_runtime()
         app.state.session_factory = session_factory
         app.state.run_worker = run_worker
         app.state.run_queue = run_queue
         app.state.run_coordinator = coordinator
         app.state.tool_execution = tool_execution
+        app.state.graph_runner = resolved_graph_runner
         if embedded_worker_enabled:
             run_worker.start()
         yield
@@ -802,6 +811,13 @@ def create_app(
         engine.dispose()
 
     app = FastAPI(title="深度研究工作台", lifespan=lifespan)
+    app.state.initialize_runtime = initialize_runtime
+    app.state.session_factory = session_factory
+    app.state.run_worker = run_worker
+    app.state.run_queue = run_queue
+    app.state.run_coordinator = coordinator
+    app.state.tool_execution = tool_execution
+    app.state.graph_runner = resolved_graph_runner
 
     def get_session() -> Iterator[Session]:
         yield from session_scope(session_factory)

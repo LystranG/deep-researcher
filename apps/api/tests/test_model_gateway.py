@@ -133,6 +133,61 @@ def test_async_litellm_returns_structured_json(monkeypatch) -> None:
     }
 
 
+def test_custom_api_base_uses_openai_compatible_provider(monkeypatch) -> None:
+    """验证自定义模型端点通过 OpenAI-compatible 路由调用"""
+    captured_calls: list[dict[str, object]] = []
+
+    async def fake_acompletion(**kwargs):
+        captured_calls.append(kwargs)
+        if kwargs.get("stream"):
+            async def stream():
+                yield type(
+                    "Chunk",
+                    (),
+                    {
+                        "choices": [
+                            type(
+                                "Choice",
+                                (),
+                                {"delta": type("Delta", (), {"content": "完成"})()},
+                            )()
+                        ]
+                    },
+                )()
+
+            return stream()
+        return type(
+            "Response",
+            (),
+            {
+                "choices": [
+                    type(
+                        "Choice",
+                        (),
+                        {"message": type("Message", (), {"content": "{}"})()},
+                    )()
+                ]
+            },
+        )()
+
+    monkeypatch.setattr("litellm.acompletion", fake_acompletion)
+    gateway = LiteLLMModelGateway(
+        api_key="test",
+        api_base="https://models.example.com/v1",
+        model="custom-model",
+        reasoning_effort="low",
+    )
+
+    async def consume():
+        return [delta async for delta in gateway.astream_answer(_context())]
+
+    assert asyncio.run(consume()) == ["完成"]
+    assert asyncio.run(gateway.acomplete_structured(_context(), {"type": "object"})) == {}
+    assert all(call["custom_llm_provider"] == "openai" for call in captured_calls)
+    assert all(call["api_base"] == "https://models.example.com/v1" for call in captured_calls)
+    assert all("reasoning_effort" not in call for call in captured_calls)
+
+
 def test_async_litellm_records_final_stream_usage_and_cost(monkeypatch) -> None:
     """验证最终 usage chunk 的 token 和费用摘要可供业务层读取"""
     captured: dict[str, object] = {}

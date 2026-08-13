@@ -42,6 +42,24 @@ class DockerSandbox:
         self._cancelled_before_start: set[str] = set()
         self._lock = Lock()
 
+    @staticmethod
+    def _docker_cli_env() -> dict[str, str]:
+        """仅向 Docker CLI 透传连接选择和 TLS 配置"""
+        allowed_names = (
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        )
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            **{
+                name: os.environ[name]
+                for name in allowed_names
+                if os.environ.get(name)
+            },
+        }
+
     def execute(
         self, request: SandboxRequest, *, execution_key: str | None = None
     ) -> SandboxResult:
@@ -101,7 +119,7 @@ class DockerSandbox:
                 text=True,
                 timeout=request.timeout_seconds,
                 check=False,
-                env={"PATH": os.environ.get("PATH", "")},
+                env=self._docker_cli_env(),
             )
         except FileNotFoundError as exc:
             raise SandboxUnavailableError("Docker CLI 不可用") from exc
@@ -111,7 +129,7 @@ class DockerSandbox:
                 capture_output=True,
                 timeout=10,
                 check=False,
-                env={"PATH": os.environ.get("PATH", "")},
+                env=self._docker_cli_env(),
             )
             return SandboxResult(status="timed_out", stdout="", stderr="执行超时", artifacts=[])
         finally:
@@ -150,7 +168,7 @@ class DockerSandbox:
                     capture_output=True,
                     timeout=10,
                     check=False,
-                    env={"PATH": os.environ.get("PATH", "")},
+                    env=self._docker_cli_env(),
                 )
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 return False
