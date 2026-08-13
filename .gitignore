@@ -13,3 +13,9 @@ htmlcov/
 var/*
 !var/.gitkeep
 
+.agents/
+.claude/
+.idea/
+.serena/
+skills-lock.json
+var/
