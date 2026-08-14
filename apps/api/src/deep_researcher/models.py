@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -811,7 +812,13 @@ class WebAcquisitionAttempt(Base):
 
 class Citation(Base):
     __tablename__ = "citations"
-    __table_args__ = (UniqueConstraint("message_id", "label"),)
+    __table_args__ = (
+        UniqueConstraint("message_id", "label"),
+        CheckConstraint(
+            "(source_chunk_id IS NOT NULL) != (derived_evidence_id IS NOT NULL)",
+            name="ck_citations_exactly_one_source",
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     workspace_id: Mapped[UUID] = mapped_column(
@@ -820,7 +827,12 @@ class Citation(Base):
     message_id: Mapped[UUID] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), index=True
     )
-    source_chunk_id: Mapped[UUID] = mapped_column(ForeignKey("source_chunks.id"), index=True)
+    source_chunk_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("source_chunks.id"), index=True, default=None
+    )
+    derived_evidence_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("derived_evidence.id"), index=True, default=None
+    )
     label: Mapped[int] = mapped_column(Integer)
     answer_start: Mapped[int] = mapped_column(Integer)
     answer_end: Mapped[int] = mapped_column(Integer)
@@ -918,7 +930,9 @@ class SandboxExecution(Base):
     )
     purpose: Mapped[str] = mapped_column(Text)
     code: Mapped[str] = mapped_column(Text)
+    input_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     input_attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_evidence_span_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     timeout_seconds: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), default="queued")
     stdout: Mapped[str] = mapped_column(Text, default="")
@@ -930,6 +944,31 @@ class SandboxExecution(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class DerivedEvidence(Base):
+    __tablename__ = "derived_evidence"
+    __table_args__ = (UniqueConstraint("sandbox_execution_id"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    sandbox_execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_executions.id", ondelete="CASCADE"), index=True
+    )
+    purpose: Mapped[str] = mapped_column(Text)
+    code_hash: Mapped[str] = mapped_column(String(64))
+    input_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_evidence_span_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    stdout: Mapped[str] = mapped_column(Text)
+    stdout_hash: Mapped[str] = mapped_column(String(64))
+    result_hash: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class Artifact(Base):

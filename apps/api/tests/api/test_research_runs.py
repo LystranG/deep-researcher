@@ -5,6 +5,7 @@ from threading import Event
 from deep_researcher.app import create_app
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import BudgetExceededError
+from deep_researcher.sandbox import DockerSandbox, SandboxResult
 from deep_researcher.settings import Settings
 from deep_researcher.testing import running_worker_client
 from deep_researcher.web_search import DisabledWebSearchGateway
@@ -611,6 +612,51 @@ def test_calculation_research_exposes_agent_sandbox_todo_and_sse_event(tmp_path)
     sandbox_todos = [item for item in todos.json()["items"] if item["kind"] == "python_sandbox"]
     assert len(sandbox_todos) == 1
     assert sandbox_todos[0]["status"] in {"running", "completed", "failed", "skipped"}
+
+
+def test_calculation_research_cites_persisted_sandbox_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    """验证真实 Research Run 将成功 Sandbox 结果引用为派生证据"""
+
+    def completed_sandbox(
+        _sandbox: DockerSandbox, _request, *, execution_key: str | None = None
+    ) -> SandboxResult:
+        """返回确定性的成功 Sandbox 结果"""
+        del execution_key
+        return SandboxResult(status="completed", stdout="84\n", stderr="", artifacts=[])
+
+    monkeypatch.setattr(DockerSandbox, "execute", completed_sandbox)
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    with running_worker_client(settings) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "sandbox-derived-citation"},
+            json={"content": "计算 12 * 7 并说明计算过程"},
+        ).json()
+        client.get(f"/api/v1/runs/{created['run_id']}/events", headers=headers)
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+        ledger = client.get(
+            f"/api/v1/runs/{created['run_id']}/ledger", headers=headers
+        ).json()
+
+    assert "受限 Sandbox 计算结果：84 [" in messages[-1]["content"]
+    derived_citations = [
+        citation for citation in citations if citation["source_type"] == "derived_evidence"
+    ]
+    assert len(derived_citations) == 1
+    assert derived_citations[0]["evidence_text"] == "84"
+    assert derived_citations[0]["derived_evidence"] == ledger["derived_evidence"][0]
 
 
 def test_first_question_renames_default_conversation(tmp_path) -> None:

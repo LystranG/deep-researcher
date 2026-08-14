@@ -1938,6 +1938,7 @@ def test_research_without_local_evidence_uses_web_snapshot_and_citation(tmp_path
         "page_number": None,
         "evidence_text": "2026 年的实验把逻辑错误率降低了一半。",
         "source_hash": citation["source_hash"],
+        "derived_evidence": None,
     }
 
 

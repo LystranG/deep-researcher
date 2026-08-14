@@ -3,6 +3,7 @@ import json
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 from typing import Any, cast
@@ -21,6 +22,7 @@ from deep_researcher.models import (
     Citation,
     ConversationSkillOverride,
     CoverageSnapshot,
+    DerivedEvidence,
     Document,
     DocumentVersion,
     EvidenceGap,
@@ -73,6 +75,30 @@ from deep_researcher.stop_policy import StopPolicyInput, decide_stop
 from deep_researcher.tool_execution import ToolExecutionService
 from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
 from deep_researcher.web_search import SearchResult, SearchUnavailableError, WebSearchGateway
+
+
+@dataclass(frozen=True)
+class SandboxEvidenceResult:
+    """描述可进入回答和 Citation 的已持久化 Sandbox 结果"""
+
+    evidence_id: UUID
+    summary: str
+    evidence_start: int
+    evidence_end: int
+    result_hash: str
+
+
+@dataclass(frozen=True)
+class DerivedCitationDraft:
+    """保存回答标记到派生结果片段的引用草稿"""
+
+    evidence_id: UUID
+    label: int
+    answer_start: int
+    answer_end: int
+    evidence_start: int
+    evidence_end: int
+    source_hash: str
 
 
 class ResearchCoordinator:
@@ -266,7 +292,7 @@ class ResearchCoordinator:
                 )
             if current_status == "waiting_approval":
                 return
-            sandbox_summaries, sandbox_failed = self._wait_for_sandbox_todos(
+            sandbox_results, sandbox_failed = self._wait_for_sandbox_todos(
                 run_id, lease_owner=lease_owner
             )
             self._publish_sandbox_todo_updates(run_id, lease_owner=lease_owner)
@@ -335,8 +361,24 @@ class ResearchCoordinator:
                 final_research_context = graph_state["research_context"]
                 missing_chunk_ids = ()
                 unsupported_claims = ()
-            if sandbox_summaries:
-                answer = f"{answer}\n\n受限 Sandbox 计算结果：{sandbox_summaries[0]}"
+            derived_citation_draft: DerivedCitationDraft | None = None
+            if sandbox_results:
+                sandbox_result = sandbox_results[0]
+                derived_label = max(
+                    (int(draft["label"]) for draft in citation_drafts), default=0
+                ) + 1
+                answer_prefix = f"{answer}\n\n受限 Sandbox 计算结果：{sandbox_result.summary}"
+                answer_marker = f" [{derived_label}]"
+                answer = answer_prefix + answer_marker
+                derived_citation_draft = DerivedCitationDraft(
+                    evidence_id=sandbox_result.evidence_id,
+                    label=derived_label,
+                    answer_start=len(answer_prefix) + 1,
+                    answer_end=len(answer_prefix) + 1 + len(answer_marker.strip()),
+                    evidence_start=sandbox_result.evidence_start,
+                    evidence_end=sandbox_result.evidence_end,
+                    source_hash=sandbox_result.result_hash,
+                )
             elif sandbox_failed:
                 answer = f"{answer}\n\n受限 Sandbox 执行失败，未将其作为研究结论依据。"
             for answer_delta in [answer]:
@@ -426,6 +468,30 @@ class ResearchCoordinator:
                         session.flush()
                         citation_ids.append(str(citation.id))
                         persisted_citations.append(citation)
+                    if derived_citation_draft is not None:
+                        derived_evidence = session.scalar(
+                            select(DerivedEvidence).where(
+                                DerivedEvidence.id == derived_citation_draft.evidence_id,
+                                DerivedEvidence.run_id == run.id,
+                                DerivedEvidence.workspace_id == run.workspace_id,
+                            )
+                        )
+                        if derived_evidence is not None:
+                            citation = Citation(
+                                workspace_id=run.workspace_id,
+                                message_id=message.id,
+                                derived_evidence_id=derived_evidence.id,
+                                label=derived_citation_draft.label,
+                                answer_start=derived_citation_draft.answer_start,
+                                answer_end=derived_citation_draft.answer_end,
+                                evidence_start=derived_citation_draft.evidence_start,
+                                evidence_end=derived_citation_draft.evidence_end,
+                                source_hash=derived_citation_draft.source_hash,
+                            )
+                            session.add(citation)
+                            session.flush()
+                            citation_ids.append(str(citation.id))
+                            persisted_citations.append(citation)
                     verification_status = (
                         map_verification_status
                         or (
@@ -684,6 +750,7 @@ class ResearchCoordinator:
                             requested_by_user_id=run.initiated_by_user_id,
                             purpose="按研究计划完成受限计算",
                             code=self._sandbox_code(question),
+                            input_message_ids=[str(run.trigger_message_id)],
                             input_attachment_ids=[],
                             timeout_seconds=task["time_budget_seconds"],
                             status="queued",
@@ -880,8 +947,8 @@ class ResearchCoordinator:
         run_id: UUID,
         *,
         lease_owner: str | None,
-    ) -> tuple[list[str], bool]:
-        """等待 Agent Sandbox Todo 终态并返回可信输出与失败标记"""
+    ) -> tuple[list[SandboxEvidenceResult], bool]:
+        """等待 Agent Sandbox Todo 终态并返回可引用结果与失败标记"""
         deadline = time.monotonic() + 20
         while True:
             with self._session_factory() as session:
@@ -899,13 +966,39 @@ class ResearchCoordinator:
                     return [], False
                 active = [todo for todo in todos if todo.status in {"pending", "running"}]
                 if not active:
-                    summaries = [
-                        todo.result_summary.strip()
-                        for todo in todos
-                        if todo.status == "completed" and todo.result_summary
-                    ]
+                    rows = session.execute(
+                        select(Todo, DerivedEvidence)
+                        .join(
+                            DerivedEvidence,
+                            DerivedEvidence.sandbox_execution_id
+                            == Todo.sandbox_execution_id,
+                        )
+                        .where(
+                            Todo.run_id == run_id,
+                            Todo.kind == "python_sandbox",
+                            Todo.status == "completed",
+                        )
+                        .order_by(Todo.ordinal, Todo.created_at)
+                    ).all()
+                    results: list[SandboxEvidenceResult] = []
+                    for todo, evidence in rows:
+                        if not todo.result_summary:
+                            continue
+                        summary = todo.result_summary.strip()
+                        evidence_start = evidence.stdout.find(summary)
+                        if evidence_start < 0:
+                            continue
+                        results.append(
+                            SandboxEvidenceResult(
+                                evidence_id=evidence.id,
+                                summary=summary,
+                                evidence_start=evidence_start,
+                                evidence_end=evidence_start + len(summary),
+                                result_hash=evidence.result_hash,
+                            )
+                        )
                     failed = any(todo.status in {"failed", "skipped"} for todo in todos)
-                    return summaries, failed
+                    return results, failed
             if time.monotonic() >= deadline:
                 with self._session_factory.begin() as session:
                     active = list(session.scalars(
@@ -1196,7 +1289,12 @@ class ResearchCoordinator:
         """将有精确 Citation 的已完成回答提升为不可变 Workspace Research Record"""
         if not citations or verification_status not in {"supported", "contradicted"}:
             return None
-        for citation in citations:
+        source_citations = [
+            citation for citation in citations if citation.source_chunk_id is not None
+        ]
+        if not source_citations:
+            return None
+        for citation in source_citations:
             source_chunk = session.get(SourceChunk, citation.source_chunk_id)
             if source_chunk is None:
                 return None
@@ -1228,7 +1326,7 @@ class ResearchCoordinator:
             session.add(claim)
             session.flush()
         evidence_refs: list[dict[str, object]] = []
-        for citation in citations:
+        for citation in source_citations:
             span = session.scalar(
                 select(EvidenceSpan).where(
                     EvidenceSpan.run_id == run.id,
@@ -1768,17 +1866,18 @@ class ResearchCoordinator:
                 todo.completed_at = cancelled_at
                 if todo.sandbox_execution_id is not None:
                     sandbox_execution_ids.append(todo.sandbox_execution_id)
-            executions = (
-                session.scalars(
-                    select(SandboxExecution).where(
-                        SandboxExecution.id.in_(sandbox_execution_ids)
-                    )
-                ).all()
-                if sandbox_execution_ids
-                else []
-            )
+            executions = session.scalars(
+                select(SandboxExecution).where(
+                    SandboxExecution.run_id == run.id,
+                    SandboxExecution.status.in_(
+                        {"queued", "running", "cancel_requested"}
+                    ),
+                )
+            ).all()
             for execution in executions:
                 execution.cancel_requested_at = cancelled_at
+                if execution.id not in sandbox_execution_ids:
+                    sandbox_execution_ids.append(execution.id)
             run.status = "cancelled"
             run.completed_at = cancelled_at
             self._finalize_ledger(session, run, status="cancelled")

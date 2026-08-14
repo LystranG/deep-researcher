@@ -1,4 +1,5 @@
 import hashlib
+import json
 import mimetypes
 import os
 import re
@@ -40,6 +41,7 @@ from deep_researcher.models import (
     ConversationSegment,
     ConversationSkillOverride,
     CoverageSnapshot,
+    DerivedEvidence,
     Document,
     DocumentVersion,
     EvidenceGap,
@@ -256,6 +258,20 @@ class LedgerStopDecisionResponse(BaseModel):
     completeness: str
 
 
+class DerivedEvidenceResponse(BaseModel):
+    id: str
+    run_id: str
+    sandbox_execution_id: str
+    purpose: str
+    code_hash: str
+    input_message_ids: list[str]
+    input_attachment_ids: list[str]
+    input_evidence_span_ids: list[str]
+    stdout_hash: str
+    result_hash: str
+    created_at: datetime
+
+
 class ResearchLedgerResponse(BaseModel):
     id: str
     run_id: str
@@ -265,6 +281,7 @@ class ResearchLedgerResponse(BaseModel):
     gaps: list[LedgerGapResponse]
     stop_decision: LedgerStopDecisionResponse | None
     missing_chunk_ids: list[str]
+    derived_evidence: list[DerivedEvidenceResponse]
 
 
 class SourceMapWorkResponse(BaseModel):
@@ -369,6 +386,7 @@ class CitationResponse(BaseModel):
     page_number: int | None
     evidence_text: str
     source_hash: str
+    derived_evidence: DerivedEvidenceResponse | None = None
 
 
 class CitationListResponse(BaseModel):
@@ -469,6 +487,7 @@ class SandboxExecutionCreateRequest(BaseModel):
     purpose: str = Field(min_length=1, max_length=4000)
     code: str = Field(min_length=1, max_length=100_000)
     attachment_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    evidence_span_ids: list[UUID] = Field(default_factory=list, max_length=100)
     timeout_seconds: int = Field(default=30, ge=1, le=300)
 
 
@@ -486,7 +505,9 @@ class SandboxExecutionResponse(BaseModel):
     run_id: str
     purpose: str
     code: str
+    input_message_ids: list[str]
     attachment_ids: list[str]
+    evidence_span_ids: list[str]
     timeout_seconds: int
     status: str
     stdout: str
@@ -496,6 +517,7 @@ class SandboxExecutionResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     artifacts: list[ArtifactResponse]
+    derived_evidence: DerivedEvidenceResponse | None
 
 
 class EvidenceCheckRequest(BaseModel):
@@ -596,6 +618,20 @@ class McpToolResponse(BaseModel):
 class McpToolListResponse(BaseModel):
     workspace_enabled: bool
     items: list[McpToolResponse]
+
+
+def sandbox_result_hash(stdout_hash: str, artifact_hashes: list[str]) -> str:
+    """根据 stdout 哈希和产物哈希计算稳定结果哈希"""
+    canonical_result = json.dumps(
+        {
+            "artifact_hashes": sorted(artifact_hashes),
+            "stdout_hash": stdout_hash,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical_result.encode()).hexdigest()
 
 
 def create_app(
@@ -1904,6 +1940,14 @@ def create_app(
                 SourceMapWork.workspace_id == run.workspace_id,
             )
         ).all()
+        derived_evidence = session.scalars(
+            select(DerivedEvidence)
+            .where(
+                DerivedEvidence.run_id == run.id,
+                DerivedEvidence.workspace_id == run.workspace_id,
+            )
+            .order_by(DerivedEvidence.created_at, DerivedEvidence.id)
+        ).all()
         return ResearchLedgerResponse(
             id=str(ledger.id),
             run_id=str(ledger.run_id),
@@ -1933,6 +1977,9 @@ def create_app(
                 else None
             ),
             missing_chunk_ids=list(missing_source_map_chunk_ids(map_works)),
+            derived_evidence=[
+                derived_evidence_response(evidence) for evidence in derived_evidence
+            ],
         )
 
     @app.get(
@@ -2661,6 +2708,35 @@ def create_app(
         return Response(status_code=204)
 
     def citation_response(session: Session, citation: Citation) -> CitationResponse:
+        """按来源类型回读原始证据或 Sandbox 派生证据"""
+        if citation.derived_evidence_id is not None:
+            evidence = session.get(DerivedEvidence, citation.derived_evidence_id)
+            if (
+                evidence is None
+                or citation.source_hash != evidence.result_hash
+                or citation.evidence_start < 0
+                or citation.evidence_end > len(evidence.stdout)
+                or citation.evidence_start >= citation.evidence_end
+            ):
+                raise HTTPException(status_code=410, detail="引用来源已失效")
+            return CitationResponse(
+                id=str(citation.id),
+                label=citation.label,
+                source_type="derived_evidence",
+                filename=evidence.purpose,
+                source_url=None,
+                source_captured_at=evidence.created_at,
+                document_version=None,
+                page_number=None,
+                evidence_text=evidence.stdout[
+                    citation.evidence_start : citation.evidence_end
+                ],
+                source_hash=citation.source_hash,
+                derived_evidence=derived_evidence_response(evidence),
+            )
+
+        if citation.source_chunk_id is None:
+            raise HTTPException(status_code=410, detail="引用来源已失效")
         chunk = session.get(SourceChunk, citation.source_chunk_id)
         if chunk is None:
             raise HTTPException(status_code=410, detail="引用来源已失效")
@@ -2711,6 +2787,7 @@ def create_app(
                 citation.evidence_end - chunk.start_offset
             ],
             source_hash=citation.source_hash,
+            derived_evidence=None,
         )
 
     @app.get(
@@ -2975,6 +3052,22 @@ def create_app(
             created_at=artifact.created_at,
         )
 
+    def derived_evidence_response(evidence: DerivedEvidence) -> DerivedEvidenceResponse:
+        """返回不包含代码、stdout 或完整输入内容的安全 provenance"""
+        return DerivedEvidenceResponse(
+            id=str(evidence.id),
+            run_id=str(evidence.run_id),
+            sandbox_execution_id=str(evidence.sandbox_execution_id),
+            purpose=evidence.purpose,
+            code_hash=evidence.code_hash,
+            input_message_ids=evidence.input_message_ids,
+            input_attachment_ids=evidence.input_attachment_ids,
+            input_evidence_span_ids=evidence.input_evidence_span_ids,
+            stdout_hash=evidence.stdout_hash,
+            result_hash=evidence.result_hash,
+            created_at=evidence.created_at,
+        )
+
     def sandbox_execution_response(
         session: Session, execution: SandboxExecution
     ) -> SandboxExecutionResponse:
@@ -2986,12 +3079,19 @@ def create_app(
             )
             .order_by(Artifact.created_at, Artifact.filename)
         ).all()
+        evidence = session.scalar(
+            select(DerivedEvidence).where(
+                DerivedEvidence.sandbox_execution_id == execution.id
+            )
+        )
         return SandboxExecutionResponse(
             id=str(execution.id),
             run_id=str(execution.run_id),
             purpose=execution.purpose,
             code=execution.code,
+            input_message_ids=execution.input_message_ids,
             attachment_ids=execution.input_attachment_ids,
+            evidence_span_ids=execution.input_evidence_span_ids,
             timeout_seconds=execution.timeout_seconds,
             status=execution.status,
             stdout=execution.stdout,
@@ -3001,6 +3101,9 @@ def create_app(
             started_at=execution.started_at,
             completed_at=execution.completed_at,
             artifacts=[artifact_response(artifact) for artifact in artifacts],
+            derived_evidence=(
+                derived_evidence_response(evidence) if evidence is not None else None
+            ),
         )
 
     def tool_approval_response(
@@ -3138,6 +3241,31 @@ def create_app(
             raise HTTPException(status_code=404, detail="沙箱执行不存在")
         return execution
 
+    @app.get(
+        "/api/v1/derived-evidence/{evidence_id}",
+        response_model=DerivedEvidenceResponse,
+    )
+    def get_derived_evidence(
+        evidence_id: UUID, session: SessionDependency, user: CurrentUser
+    ) -> DerivedEvidenceResponse:
+        """按 Workspace 成员权限回读安全的派生证据 provenance"""
+        evidence = session.scalar(
+            select(DerivedEvidence)
+            .join(
+                WorkspaceMember,
+                WorkspaceMember.workspace_id == DerivedEvidence.workspace_id,
+            )
+            .join(Workspace, Workspace.id == DerivedEvidence.workspace_id)
+            .where(
+                DerivedEvidence.id == evidence_id,
+                WorkspaceMember.user_id == user.id,
+                Workspace.deleted_at.is_(None),
+            )
+        )
+        if evidence is None:
+            raise HTTPException(status_code=404, detail="派生证据不存在")
+        return derived_evidence_response(evidence)
+
     def update_sandbox_todo(
         worker_session: Session,
         execution_id: UUID,
@@ -3162,13 +3290,44 @@ def create_app(
         if status_value in {"completed", "skipped", "failed", "cancelled"}:
             todo.completed_at = datetime.now(UTC)
 
+    def locked_sandbox_state(
+        worker_session: Session, execution_id: UUID
+    ) -> tuple[SandboxExecution | None, ResearchRun | None]:
+        """按 Run 再 SandboxExecution 的固定顺序锁定发布状态"""
+        snapshot = worker_session.get(SandboxExecution, execution_id)
+        if snapshot is None:
+            return None, None
+        run = worker_session.scalar(
+            select(ResearchRun)
+            .where(ResearchRun.id == snapshot.run_id)
+            .with_for_update()
+        )
+        execution = worker_session.scalar(
+            select(SandboxExecution)
+            .where(SandboxExecution.id == execution_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return execution, run
+
+    def sandbox_publish_is_cancelled(
+        execution: SandboxExecution, run: ResearchRun | None
+    ) -> bool:
+        """判断 Sandbox 结果是否已失去发布资格"""
+        return (
+            execution.cancel_requested_at is not None
+            or run is None
+            or run.cancel_requested_at is not None
+            or run.status == "cancelled"
+        )
+
     def run_sandbox_execution(execution_id: UUID) -> None:
         try:
             with session_factory.begin() as worker_session:
-                execution = worker_session.get(SandboxExecution, execution_id)
+                execution, run = locked_sandbox_state(worker_session, execution_id)
                 if execution is None:
                     return
-                if execution.cancel_requested_at is not None:
+                if sandbox_publish_is_cancelled(execution, run):
                     execution.status = "cancelled"
                     execution.completed_at = datetime.now(UTC)
                     update_sandbox_todo(worker_session, execution_id, "cancelled")
@@ -3225,13 +3384,13 @@ def create_app(
             )
 
             with session_factory.begin() as worker_session:
-                execution = worker_session.get(SandboxExecution, execution_id)
+                execution, run = locked_sandbox_state(worker_session, execution_id)
                 if execution is None:
                     return
                 execution.stdout = result.stdout
                 execution.stderr = result.stderr
                 execution.completed_at = datetime.now(UTC)
-                if execution.cancel_requested_at is not None:
+                if sandbox_publish_is_cancelled(execution, run):
                     execution.status = "cancelled"
                     update_sandbox_todo(worker_session, execution_id, "cancelled")
                     return
@@ -3245,9 +3404,8 @@ def create_app(
                         failure_reason=execution.error_message,
                     )
                     return
-                update_sandbox_todo(
-                    worker_session, execution_id, "completed", result_summary=result.stdout
-                )
+                pending_artifacts: list[Artifact] = []
+                artifact_hashes: list[str] = []
                 for artifact_path in result.artifacts:
                     size_bytes = artifact_path.stat().st_size
                     if size_bytes > resolved_settings.sandbox_max_artifact_bytes:
@@ -3261,7 +3419,8 @@ def create_app(
                     media_type = (
                         mimetypes.guess_type(relative_name)[0] or "application/octet-stream"
                     )
-                    worker_session.add(
+                    artifact_hashes.append(digest)
+                    pending_artifacts.append(
                         Artifact(
                             workspace_id=workspace_id,
                             run_id=run_id,
@@ -3273,6 +3432,26 @@ def create_app(
                             sha256=digest,
                         )
                     )
+                stdout_hash = hashlib.sha256(result.stdout.encode()).hexdigest()
+                worker_session.add_all(pending_artifacts)
+                worker_session.add(
+                    DerivedEvidence(
+                        workspace_id=workspace_id,
+                        run_id=run_id,
+                        sandbox_execution_id=execution.id,
+                        purpose=execution.purpose,
+                        code_hash=hashlib.sha256(code.encode()).hexdigest(),
+                        input_message_ids=list(execution.input_message_ids),
+                        input_attachment_ids=list(execution.input_attachment_ids),
+                        input_evidence_span_ids=list(execution.input_evidence_span_ids),
+                        stdout=result.stdout,
+                        stdout_hash=stdout_hash,
+                        result_hash=sandbox_result_hash(stdout_hash, artifact_hashes),
+                    )
+                )
+                update_sandbox_todo(
+                    worker_session, execution_id, "completed", result_summary=result.stdout
+                )
         except SandboxUnavailableError as exc:
             with session_factory.begin() as worker_session:
                 execution = worker_session.get(SandboxExecution, execution_id)
@@ -3312,6 +3491,8 @@ def create_app(
         user: CurrentUser,
     ) -> SandboxExecutionResponse:
         run = accessible_run(session, user, run_id)
+        if run.cancel_requested_at is not None or run.status == "cancelled":
+            raise HTTPException(status_code=409, detail="研究运行已取消")
         if payload.timeout_seconds > resolved_settings.sandbox_max_timeout_seconds:
             raise HTTPException(status_code=422, detail="沙箱执行时间超过部署限制")
         unique_attachment_ids = set(payload.attachment_ids)
@@ -3330,6 +3511,20 @@ def create_app(
         )
         if len(attachments) != len(unique_attachment_ids):
             raise HTTPException(status_code=404, detail="沙箱输入不存在于当前会话")
+        unique_evidence_span_ids = set(payload.evidence_span_ids)
+        evidence_spans = (
+            session.scalars(
+                select(EvidenceSpan).where(
+                    EvidenceSpan.id.in_(unique_evidence_span_ids),
+                    EvidenceSpan.workspace_id == run.workspace_id,
+                    EvidenceSpan.run_id == run.id,
+                )
+            ).all()
+            if unique_evidence_span_ids
+            else []
+        )
+        if len(evidence_spans) != len(unique_evidence_span_ids):
+            raise HTTPException(status_code=404, detail="派生证据输入不属于当前研究运行")
         filenames = [attachment.filename for attachment in attachments]
         if len(filenames) != len(set(filenames)):
             raise HTTPException(status_code=409, detail="沙箱输入文件名不能重复")
@@ -3339,7 +3534,9 @@ def create_app(
             requested_by_user_id=user.id,
             purpose=payload.purpose.strip(),
             code=payload.code,
+            input_message_ids=[str(run.trigger_message_id)],
             input_attachment_ids=[str(value) for value in payload.attachment_ids],
+            input_evidence_span_ids=[str(value) for value in payload.evidence_span_ids],
             timeout_seconds=payload.timeout_seconds,
             status="queued",
         )
@@ -3366,7 +3563,10 @@ def create_app(
     def cancel_sandbox_execution(
         execution_id: UUID, session: SessionDependency, user: CurrentUser
     ) -> SandboxExecutionResponse:
-        execution = accessible_sandbox_execution(session, user, execution_id)
+        accessible_sandbox_execution(session, user, execution_id)
+        execution, _run = locked_sandbox_state(session, execution_id)
+        if execution is None:
+            raise HTTPException(status_code=404, detail="沙箱执行不存在")
         if execution.status in {"completed", "failed", "timed_out", "cancelled", "unavailable"}:
             return sandbox_execution_response(session, execution)
         execution.cancel_requested_at = datetime.now(UTC)
