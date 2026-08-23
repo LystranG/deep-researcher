@@ -313,6 +313,9 @@ class TaskModelTurn(Base):
     output: Mapped[dict[str, object] | None] = mapped_column(JSON, default=None)
     usage: Mapped[dict[str, int | float] | None] = mapped_column(JSON, default=None)
     provider_reference: Mapped[str | None] = mapped_column(String(500), default=None)
+    logical_call_ref: Mapped[str | None] = mapped_column(String(300), default=None)
+    parameters_hash: Mapped[str | None] = mapped_column(String(64), default=None)
+    safe_summary: Mapped[str | None] = mapped_column(String(1000), default=None)
     failure_reason: Mapped[str | None] = mapped_column(String(200), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -334,7 +337,7 @@ class TaskObservation(Base):
         ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
     )
     turn_id: Mapped[UUID] = mapped_column(
-        ForeignKey("task_model_turns.id", ondelete="CASCADE"), unique=True, index=True
+        ForeignKey("task_model_turns.id", ondelete="CASCADE"), index=True
     )
     observation_ref: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(32))
@@ -342,6 +345,10 @@ class TaskObservation(Base):
     evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
     evidence_gain: Mapped[bool] = mapped_column(Boolean, default=False)
     failure_ref: Mapped[str | None] = mapped_column(String(1000), default=None)
+    logical_call_ref: Mapped[str | None] = mapped_column(String(300), default=None)
+    summary: Mapped[str | None] = mapped_column(String(2000), default=None)
+    error_category: Mapped[str | None] = mapped_column(String(64), default=None)
+    waiting_reference: Mapped[str | None] = mapped_column(String(500), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

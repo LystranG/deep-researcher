@@ -25,9 +25,37 @@ from deep_researcher.task_runtime import (
     TaskResultProposal,
     TaskRuntime,
     TaskToolCall,
+    ToolDefinition,
+    ToolPolicy,
+    ToolRegistry,
 )
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+
+
+class ResumableWaitingAdapter:
+    def __init__(self) -> None:
+        self.execute_calls = 0
+        self.resume_calls = 0
+
+    def execute(self, claim, call):
+        del claim, call
+        self.execute_calls += 1
+        return TaskObservationResult(
+            status="waiting",
+            waiting_reference="approval:stable",
+            failure_ref="approval_required",
+        )
+
+    def resume(self, claim, call, waiting_reference):
+        del claim, call
+        assert waiting_reference == "approval:stable"
+        self.resume_calls += 1
+        return TaskObservationResult(
+            result_reference="observation:approved",
+            evidence_refs=("evidence:approved",),
+            evidence_gain=True,
+        )
 
 
 def register(client: TestClient) -> dict[str, str]:
@@ -555,3 +583,210 @@ def test_react_controller_turn_budget_and_cancellation_are_terminal_facts(tmp_pa
     assert cancelled.status == "terminal"
     assert cancel_outcome is not None
     assert cancel_outcome.kind == "cancelled"
+
+
+def test_tool_registry_rejects_unknown_and_invalid_calls_without_side_effect(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'tool-policy.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tool-policy"},
+            json={"content": "测试工具策略"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory.begin() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task.allowed_tools = ["search"]
+            task_id = task.id
+
+        adapter = DeterministicTaskToolAdapter()
+        registry = ToolRegistry(
+            [
+                ToolDefinition(
+                    name="search",
+                    input_schema={
+                        "type": "object",
+                        "required": ["query"],
+                        "properties": {"query": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                    result_contract={"type": "observation"},
+                    handler=adapter,
+                )
+            ]
+        )
+        claim = runtime.claim(task_id, lease_owner="policy-worker")
+        assert claim is not None
+        unknown = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [TaskToolCall(tool_name="not-registered", arguments={})]
+            ),
+            tool_registry=registry,
+        ).advance(claim)
+
+        invalid_created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tool-invalid"},
+            json={"content": "测试非法参数"},
+        ).json()
+        with app.state.session_factory.begin() as session:
+            task = session.get(ResearchTask, task_id)
+            invalid_task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(invalid_created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            assert invalid_task is not None
+            invalid_task.allowed_tools = ["search"]
+            invalid_task_id = invalid_task.id
+        invalid_claim = runtime.claim(invalid_task_id, lease_owner="policy-worker")
+        assert invalid_claim is not None
+        invalid = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [TaskToolCall(tool_name="search", arguments={"query": 42})]
+            ),
+            tool_registry=registry,
+        ).advance(invalid_claim)
+
+    assert unknown.reason == "unknown_tool"
+    assert invalid.reason == "invalid_arguments"
+    assert adapter.calls == []
+
+
+def test_tool_policy_workspace_acl_rejects_before_handler_execution(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'tool-acl.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tool-acl"},
+            json={"content": "测试 Workspace ACL"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory.begin() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task.allowed_tools = ["search"]
+            task_id = task.id
+        adapter = DeterministicTaskToolAdapter()
+        claim = runtime.claim(task_id, lease_owner="acl-worker")
+        assert claim is not None
+        result = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [TaskToolCall(tool_name="search", arguments={"query": "secret"})]
+            ),
+            tool_registry=ToolRegistry(
+                [
+                    ToolDefinition(
+                        name="search",
+                        input_schema={"type": "object"},
+                        handler=adapter,
+                    )
+                ]
+            ),
+            tool_policy=ToolPolicy(workspace_acl=lambda _workspace_id, _name: False),
+        ).advance(claim)
+
+    assert result.reason == "workspace_acl_denied"
+    assert adapter.calls == []
+
+
+def test_waiting_tool_resumes_by_stable_reference_and_observation_reaches_next_turn(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'tool-waiting.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "tool-waiting"},
+            json={"content": "测试等待恢复"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory.begin() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task.allowed_tools = ["reviewed-search"]
+            task_id = task.id
+            criteria = tuple(task.success_criteria)
+        claim = runtime.claim(task_id, lease_owner="waiting-worker")
+        assert claim is not None
+        adapter = ResumableWaitingAdapter()
+        model = DeterministicTaskModelGateway(
+            [
+                TaskToolCall(tool_name="reviewed-search", arguments={"query": "bounded"}),
+                TaskResultProposal(
+                    result_reference="result:waiting",
+                    evidence_refs=("evidence:approved",),
+                    covered_criteria=criteria,
+                ),
+            ]
+        )
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=model,
+            tool_registry=ToolRegistry(
+                [
+                    ToolDefinition(
+                        name="reviewed-search",
+                        input_schema={"type": "object"},
+                        risk="safe",
+                        handler=adapter,
+                    )
+                ]
+            ),
+        )
+
+        waiting = controller.advance(claim)
+        resumed = controller.advance(claim)
+        terminal = controller.advance(claim)
+
+        with app.state.session_factory() as session:
+            observations = session.scalars(
+                select(TaskObservation).where(TaskObservation.task_id == task_id)
+            ).all()
+
+    assert waiting.status == "waiting"
+    assert waiting.observation_ref == "task-observation:" + str(task_id) + ":1"
+    assert resumed.status == "runnable"
+    assert terminal.status == "terminal"
+    assert adapter.execute_calls == adapter.resume_calls == 1
+    assert len(observations) == 2
+    assert model.contexts[1].previous_observation is not None
+    assert model.contexts[1].previous_observation.result_reference == "observation:approved"

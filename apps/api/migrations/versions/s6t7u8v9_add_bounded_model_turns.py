@@ -55,7 +55,7 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["turn_id"], ["task_model_turns.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("task_id", "observation_ref"),
-        sa.UniqueConstraint("turn_id"),
+        sa.UniqueConstraint("turn_id", name="uq_task_observations_turn_id"),
     )
     for column in ("workspace_id", "run_id", "task_id", "turn_id"):
         op.create_index(f"ix_task_observations_{column}", "task_observations", [column])

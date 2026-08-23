@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, TypedDict
 from uuid import UUID
@@ -75,6 +75,9 @@ class TaskToolCall:
     arguments: dict[str, object]
     provider_reference: str | None = None
     usage: dict[str, int | float] | None = None
+    logical_call_ref: str | None = None
+    parameters_hash: str | None = None
+    safe_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,106 @@ class TaskObservationResult:
     evidence_refs: tuple[str, ...] = ()
     evidence_gain: bool = False
     failure_ref: str | None = None
+    summary: str | None = None
+    error_category: str | None = None
+    waiting_reference: str | None = None
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """Static contract and adapter binding exposed to a Research Task."""
+
+    name: str
+    input_schema: dict[str, object]
+    result_contract: dict[str, object] | str = "observation"
+    risk: str = "safe"
+    handler: TaskToolAdapter | None = None
+    requires_approval: bool = False
+
+
+@dataclass(frozen=True)
+class ToolPolicyDecision:
+    allowed: bool
+    reason: str | None = None
+    waiting_reference: str | None = None
+
+
+class ToolRegistry:
+    """Small immutable-at-read static registry for task tools."""
+
+    def __init__(self, definitions: Sequence[ToolDefinition] = ()) -> None:
+        self._definitions: dict[str, ToolDefinition] = {}
+        for definition in definitions:
+            self.register(definition)
+
+    def register(self, definition: ToolDefinition) -> None:
+        if not definition.name or definition.name in self._definitions:
+            raise ValueError(f"duplicate or empty tool definition: {definition.name!r}")
+        if definition.risk not in {"safe", "review", "dangerous"}:
+            raise ValueError(f"invalid tool risk: {definition.risk}")
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> ToolDefinition | None:
+        return self._definitions.get(name)
+
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        return tuple(self._definitions.values())
+
+    def validate(self, definition: ToolDefinition, arguments: dict[str, object]) -> str | None:
+        return _validate_tool_schema(definition.input_schema, arguments, "$")
+
+
+class ToolPolicy:
+    """Policy seam for task allowlists, workspace ACL, risk and tool budgets."""
+
+    def __init__(
+        self,
+        *,
+        workspace_acl: Callable[[UUID, str], bool] | None = None,
+        risk_policy: Callable[[str], bool] | None = None,
+        max_tool_calls: int | None = None,
+        approval_reference: Callable[[TaskClaim, ToolDefinition], str] | None = None,
+    ) -> None:
+        if max_tool_calls is not None and max_tool_calls < 1:
+            raise ValueError("max_tool_calls must be positive")
+        self._workspace_acl = workspace_acl
+        self._risk_policy = risk_policy
+        self._max_tool_calls = max_tool_calls
+        self._approval_reference = approval_reference
+
+    def check(
+        self,
+        claim: TaskClaim,
+        task: ResearchTask,
+        run: ResearchRun,
+        definition: ToolDefinition,
+        *,
+        tool_call_count: int,
+    ) -> ToolPolicyDecision:
+        if run.cancel_requested_at is not None:
+            return ToolPolicyDecision(False, "run_cancelled")
+        if task.allowed_tools and definition.name not in task.allowed_tools:
+            return ToolPolicyDecision(False, "tool_not_allowed")
+        if self._workspace_acl is not None and not self._workspace_acl(
+            task.workspace_id, definition.name
+        ):
+            return ToolPolicyDecision(False, "workspace_acl_denied")
+        if self._max_tool_calls is not None and tool_call_count >= self._max_tool_calls:
+            return ToolPolicyDecision(False, "tool_budget_exhausted")
+        if self._risk_policy is not None and not self._risk_policy(definition.risk):
+            return ToolPolicyDecision(False, "risk_policy_denied")
+        if definition.requires_approval or definition.risk == "review":
+            reference = (
+                self._approval_reference(claim, definition)
+                if self._approval_reference is not None
+                else f"approval:{claim.task_id}:{definition.name}"
+            )
+            return ToolPolicyDecision(
+                allowed=False,
+                reason="approval_required",
+                waiting_reference=reference,
+            )
+        return ToolPolicyDecision(True)
 
 
 @dataclass(frozen=True)
@@ -175,9 +278,10 @@ class DeterministicTaskModelGateway:
     ) -> None:
         self._outputs = list(outputs)
         self._repairs = list(repairs)
+        self.contexts: list[TaskTurnContext] = []
 
     def complete_task_turn(self, context: TaskTurnContext) -> object:
-        del context
+        self.contexts.append(context)
         if not self._outputs:
             raise TimeoutError("deterministic model output exhausted")
         return self._outputs.pop(0)
@@ -436,6 +540,8 @@ class ReActTaskController:
         *,
         model_gateway: TaskModelGateway,
         tool_adapter: TaskToolAdapter | None = None,
+        tool_registry: ToolRegistry | None = None,
+        tool_policy: ToolPolicy | None = None,
         max_turns: int = MAX_MODEL_TURNS,
         no_evidence_gain_limit: int = NO_EVIDENCE_GAIN_LIMIT,
     ) -> None:
@@ -446,6 +552,8 @@ class ReActTaskController:
         self._session_factory = session_factory
         self._model_gateway = model_gateway
         self._tool_adapter = tool_adapter
+        self._tool_registry = tool_registry
+        self._tool_policy = tool_policy or ToolPolicy()
         self._max_turns = max_turns
         self._no_evidence_gain_limit = no_evidence_gain_limit
         self._task_runtime = TaskRuntime(session_factory)
@@ -560,6 +668,25 @@ class ReActTaskController:
                     reason=budget_reason,
                 )
             if latest_observation is not None and latest_observation.status == "waiting":
+                if latest_turn is not None:
+                    resumed = self._resume_waiting_tool(
+                        claim, latest_turn, latest_observation
+                    )
+                    if resumed is not None:
+                        if resumed.status == "waiting":
+                            return TaskAdvanceResult(
+                                status="waiting",
+                                task_id=task.id,
+                                turn_ordinal=turns[-1].turn_ordinal if turns else None,
+                                observation_ref=latest_observation.observation_ref,
+                                reason=resumed.failure_ref,
+                            )
+                        return self._finish_observation(
+                            claim,
+                            latest_turn,
+                            resumed,
+                            f"task-observation:{claim.task_id}:{latest_turn.turn_ordinal}:resume",
+                        )
                 return TaskAdvanceResult(
                     status="waiting",
                     task_id=task.id,
@@ -695,42 +822,154 @@ class ReActTaskController:
         context: TaskTurnContext,
         call: TaskToolCall,
     ) -> TaskAdvanceResult:
-        if context.allowed_tools and call.tool_name not in context.allowed_tools:
-            self._persist_failed_turn(claim, turn_ordinal, "tool_not_allowed")
-            outcome = self._task_runtime.record_outcome(
-                claim, TaskExecutionResult(kind="failed", failure_ref="tool_not_allowed")
-            )
-            return TaskAdvanceResult(
-                status="terminal",
-                task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
-                outcome_ref=outcome.outcome_ref,
-                reason="tool_not_allowed",
-            )
-        if self._tool_adapter is None:
-            self._persist_failed_turn(claim, turn_ordinal, "tool_adapter_unavailable")
-            outcome = self._task_runtime.record_outcome(
-                claim,
-                TaskExecutionResult(kind="failed", failure_ref="tool_adapter_unavailable"),
-            )
-            return TaskAdvanceResult(
-                status="terminal",
-                task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
-                outcome_ref=outcome.outcome_ref,
-                reason="tool_adapter_unavailable",
-            )
+        call = _with_call_identity(claim, turn_ordinal, call)
+        registry = self._tool_registry
+        definition = (
+            registry.get(call.tool_name) if registry is not None else None
+        )
         turn = self._persist_turn(claim, turn_ordinal, call)
+        with self._session_factory() as session:
+            task = session.get(ResearchTask, claim.task_id)
+            run = session.get(ResearchRun, claim.run_id)
+            existing_observation = session.scalar(
+                select(TaskObservation)
+                .where(
+                    TaskObservation.task_id == claim.task_id,
+                    TaskObservation.logical_call_ref == call.logical_call_ref,
+                )
+                .order_by(TaskObservation.created_at, TaskObservation.id)
+            )
+            tool_call_count = len(
+                session.scalars(
+                    select(TaskModelTurn).where(
+                        TaskModelTurn.task_id == claim.task_id,
+                        TaskModelTurn.output_kind == "tool_call",
+                    )
+                ).all()
+            )
+        if task is None or run is None:
+            raise StaleTaskClaimError("task claim has been fenced")
+        if existing_observation is not None:
+            return self._replay_observation(claim, turn_ordinal, existing_observation)
+        if registry is not None and definition is None:
+            return self._finish_observation(
+                claim,
+                turn,
+                TaskObservationResult(
+                    status="failed",
+                    failure_ref="unknown_tool",
+                    error_category="policy",
+                    summary="tool is not registered",
+                ),
+                f"task-observation:{claim.task_id}:{turn_ordinal}",
+            )
+        if definition is not None:
+            assert registry is not None
+            schema_error = registry.validate(definition, call.arguments)
+            if schema_error is not None:
+                return self._finish_observation(
+                    claim,
+                    turn,
+                    TaskObservationResult(
+                        status="failed",
+                        failure_ref="invalid_arguments",
+                        error_category="validation",
+                        summary=schema_error,
+                    ),
+                    f"task-observation:{claim.task_id}:{turn_ordinal}",
+                )
+            decision = self._tool_policy.check(
+                claim,
+                task,
+                run,
+                definition,
+                tool_call_count=tool_call_count - 1,
+            )
+            if not decision.allowed:
+                if decision.waiting_reference is not None:
+                    return self._finish_observation(
+                        claim,
+                        turn,
+                        TaskObservationResult(
+                            status="waiting",
+                            failure_ref=decision.reason,
+                            error_category="approval",
+                            waiting_reference=decision.waiting_reference,
+                            summary="tool approval is required",
+                        ),
+                        f"task-observation:{claim.task_id}:{turn_ordinal}",
+                    )
+                if decision.reason == "run_cancelled":
+                    observation_ref = f"task-observation:{claim.task_id}:{turn_ordinal}"
+                    self._persist_observation(
+                        claim,
+                        turn,
+                        TaskObservationResult(
+                            status="failed",
+                            failure_ref="run_cancelled",
+                            error_category="cancelled",
+                        ),
+                        observation_ref,
+                    )
+                    outcome = self._task_runtime.record_outcome(
+                        claim,
+                        TaskExecutionResult(kind="cancelled", failure_ref="run_cancelled"),
+                    )
+                    return TaskAdvanceResult(
+                        status="terminal",
+                        task_id=claim.task_id,
+                        turn_ordinal=turn_ordinal,
+                        observation_ref=observation_ref,
+                        outcome_ref=outcome.outcome_ref,
+                        reason="run_cancelled",
+                    )
+                return self._finish_observation(
+                    claim,
+                    turn,
+                    TaskObservationResult(
+                        status="failed",
+                        failure_ref=decision.reason,
+                        error_category="policy",
+                        summary="tool call rejected by policy",
+                    ),
+                    f"task-observation:{claim.task_id}:{turn_ordinal}",
+                )
+        elif context.allowed_tools and call.tool_name not in context.allowed_tools:
+            return self._finish_observation(
+                claim,
+                turn,
+                TaskObservationResult(
+                    status="failed",
+                    failure_ref="tool_not_allowed",
+                    error_category="policy",
+                    summary="tool is not in the task allowlist",
+                ),
+                f"task-observation:{claim.task_id}:{turn_ordinal}",
+            )
+        handler = definition.handler if definition is not None else self._tool_adapter
+        if handler is None:
+            return self._finish_observation(
+                claim,
+                turn,
+                TaskObservationResult(
+                    status="failed",
+                    failure_ref="tool_adapter_unavailable",
+                    error_category="execution",
+                ),
+                f"task-observation:{claim.task_id}:{turn_ordinal}",
+            )
         try:
-            observation = self._tool_adapter.execute(claim, call)
+            observation = handler.execute(claim, call)
         except Exception as exc:
             observation = TaskObservationResult(
-                status="failed",
-                failure_ref=_failure_category(exc),
+                status="failed", failure_ref=_failure_category(exc),
+                error_category=_failure_category(exc),
             )
         if observation.status not in {"succeeded", "waiting", "failed"}:
             observation = TaskObservationResult(
-                status="failed", failure_ref="invalid_tool_observation"
+                status="failed",
+                failure_ref="invalid_tool_observation",
+                error_category="protocol",
             )
         with self._session_factory() as session:
             run = session.get(ResearchRun, claim.run_id)
@@ -746,13 +985,62 @@ class ReActTaskController:
                 outcome_ref=outcome.outcome_ref,
                 reason="run_cancelled",
             )
-        observation_ref = f"task-observation:{claim.task_id}:{turn_ordinal}"
+        return self._finish_observation(
+            claim,
+            turn,
+            observation,
+            f"task-observation:{claim.task_id}:{turn_ordinal}",
+        )
+
+    def _resume_waiting_tool(
+        self,
+        claim: TaskClaim,
+        turn: TaskModelTurn,
+        observation: TaskObservation,
+    ) -> TaskObservationResult | None:
+        if not observation.waiting_reference:
+            return None
+        call = _task_tool_call_from_payload(turn.output)
+        if call is None:
+            return None
+        definition = (
+            self._tool_registry.get(call.tool_name)
+            if self._tool_registry is not None
+            else None
+        )
+        handler = definition.handler if definition is not None else self._tool_adapter
+        resume = getattr(handler, "resume", None)
+        if not callable(resume):
+            return None
+        try:
+            result = resume(claim, call, observation.waiting_reference)
+        except Exception as exc:
+            return TaskObservationResult(
+                status="failed",
+                failure_ref=_failure_category(exc),
+                error_category=_failure_category(exc),
+            )
+        if not isinstance(result, TaskObservationResult):
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="invalid_tool_observation",
+                error_category="protocol",
+            )
+        return result
+
+    def _finish_observation(
+        self,
+        claim: TaskClaim,
+        turn: TaskModelTurn,
+        observation: TaskObservationResult,
+        observation_ref: str,
+    ) -> TaskAdvanceResult:
         self._persist_observation(claim, turn, observation, observation_ref)
         if observation.status == "waiting":
             return TaskAdvanceResult(
                 status="waiting",
                 task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
+                turn_ordinal=turn.turn_ordinal,
                 observation_ref=observation_ref,
                 reason=observation.failure_ref,
             )
@@ -764,7 +1052,7 @@ class ReActTaskController:
             return TaskAdvanceResult(
                 status="terminal",
                 task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
+                turn_ordinal=turn.turn_ordinal,
                 observation_ref=observation_ref,
                 outcome_ref=outcome.outcome_ref,
                 reason=observation.failure_ref,
@@ -773,7 +1061,7 @@ class ReActTaskController:
             return TaskAdvanceResult(
                 status="runnable",
                 task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
+                turn_ordinal=turn.turn_ordinal,
                 observation_ref=observation_ref,
             )
         with self._session_factory() as session:
@@ -788,7 +1076,7 @@ class ReActTaskController:
             return TaskAdvanceResult(
                 status="terminal",
                 task_id=claim.task_id,
-                turn_ordinal=turn_ordinal,
+                turn_ordinal=turn.turn_ordinal,
                 observation_ref=observation_ref,
                 outcome_ref=outcome.outcome_ref,
                 reason="no_evidence_gain",
@@ -796,8 +1084,63 @@ class ReActTaskController:
         return TaskAdvanceResult(
             status="runnable",
             task_id=claim.task_id,
-            turn_ordinal=turn_ordinal,
+            turn_ordinal=turn.turn_ordinal,
             observation_ref=observation_ref,
+        )
+
+    def _replay_observation(
+        self, claim: TaskClaim, turn_ordinal: int, observation: TaskObservation
+    ) -> TaskAdvanceResult:
+        if observation.status == "waiting":
+            return TaskAdvanceResult(
+                status="waiting",
+                task_id=claim.task_id,
+                turn_ordinal=turn_ordinal,
+                observation_ref=observation.observation_ref,
+                reason=observation.failure_ref,
+            )
+        if observation.status == "failed":
+            outcome = self._task_runtime.record_outcome(
+                claim,
+                TaskExecutionResult(kind="failed", failure_ref=observation.failure_ref),
+            )
+            return TaskAdvanceResult(
+                status="terminal",
+                task_id=claim.task_id,
+                turn_ordinal=turn_ordinal,
+                observation_ref=observation.observation_ref,
+                outcome_ref=outcome.outcome_ref,
+                reason=observation.failure_ref,
+            )
+        if not observation.evidence_gain:
+            with self._session_factory() as session:
+                replay_count = len(
+                    session.scalars(
+                        select(TaskModelTurn).where(
+                            TaskModelTurn.task_id == claim.task_id,
+                            TaskModelTurn.logical_call_ref == observation.logical_call_ref,
+                            TaskModelTurn.output_kind == "tool_call",
+                        )
+                    ).all()
+                )
+            if replay_count >= self._no_evidence_gain_limit:
+                outcome = self._task_runtime.record_outcome(
+                    claim,
+                    TaskExecutionResult(kind="failed", failure_ref="no_evidence_gain"),
+                )
+                return TaskAdvanceResult(
+                    status="terminal",
+                    task_id=claim.task_id,
+                    turn_ordinal=turn_ordinal,
+                    observation_ref=observation.observation_ref,
+                    outcome_ref=outcome.outcome_ref,
+                    reason="no_evidence_gain",
+                )
+        return TaskAdvanceResult(
+            status="runnable",
+            task_id=claim.task_id,
+            turn_ordinal=turn_ordinal,
+            observation_ref=observation.observation_ref,
         )
 
     def _commit_result_proposal(
@@ -879,6 +1222,9 @@ class ReActTaskController:
                 output=_tool_call_payload(output),
                 usage=output.usage,
                 provider_reference=output.provider_reference,
+                logical_call_ref=output.logical_call_ref,
+                parameters_hash=output.parameters_hash,
+                safe_summary=output.safe_summary,
             )
             session.add(turn)
             session.flush()
@@ -907,6 +1253,10 @@ class ReActTaskController:
                     evidence_refs=list(observation.evidence_refs),
                     evidence_gain=observation.evidence_gain,
                     failure_ref=observation.failure_ref,
+                    logical_call_ref=turn.logical_call_ref,
+                    summary=_bounded_summary(observation.summary),
+                    error_category=observation.error_category,
+                    waiting_reference=observation.waiting_reference,
                 )
             )
 
@@ -961,6 +1311,103 @@ class ReActTaskController:
         return task, run, None
 
 
+def _with_call_identity(
+    claim: TaskClaim, turn_ordinal: int, call: TaskToolCall
+) -> TaskToolCall:
+    canonical = json.dumps(
+        call.arguments, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    parameters_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    logical_call_ref = f"tool-call:{claim.task_id}:{call.tool_name}:{parameters_hash[:16]}"
+    safe_summary = f"{call.tool_name}({canonical[:900]})"
+    return replace(
+        call,
+        logical_call_ref=logical_call_ref,
+        parameters_hash=parameters_hash,
+        safe_summary=safe_summary,
+    )
+
+
+def _task_tool_call_from_payload(
+    payload: dict[str, object] | None,
+) -> TaskToolCall | None:
+    if not isinstance(payload, dict):
+        return None
+    tool_name = payload.get("tool_name")
+    arguments = payload.get("arguments")
+    if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+        return None
+    logical_call_ref = payload.get("logical_call_ref")
+    parameters_hash = payload.get("parameters_hash")
+    safe_summary = payload.get("safe_summary")
+    return TaskToolCall(
+        tool_name=tool_name,
+        arguments=arguments,
+        logical_call_ref=logical_call_ref if isinstance(logical_call_ref, str) else None,
+        parameters_hash=parameters_hash if isinstance(parameters_hash, str) else None,
+        safe_summary=safe_summary if isinstance(safe_summary, str) else None,
+    )
+
+
+def _bounded_summary(summary: str | None) -> str | None:
+    if summary is None:
+        return None
+    return summary[:2000]
+
+
+def _validate_tool_schema(
+    schema: dict[str, object], value: object, path: str
+) -> str | None:
+    schema_type = schema.get("type")
+    if schema_type is not None and not _matches_schema_type(schema_type, value):
+        return f"{path} must be {schema_type}"
+    enum = schema.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        return f"{path} must be one of the allowed values"
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            for key in required:
+                if isinstance(key, str) and key not in value:
+                    return f"{path}.{key} is required"
+        properties = schema.get("properties", {})
+        if isinstance(properties, dict):
+            for key, child in value.items():
+                if key not in properties:
+                    if schema.get("additionalProperties") is False:
+                        return f"{path}.{key} is not allowed"
+                    continue
+                child_schema = properties[key]
+                if isinstance(child_schema, dict):
+                    error = _validate_tool_schema(child_schema, child, f"{path}.{key}")
+                    if error is not None:
+                        return error
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        item_schema = schema["items"]
+        assert isinstance(item_schema, dict)
+        for index, child in enumerate(value):
+            error = _validate_tool_schema(item_schema, child, f"{path}[{index}]")
+            if error is not None:
+                return error
+    return None
+
+
+def _matches_schema_type(schema_type: object, value: object) -> bool:
+    if schema_type == "object":
+        return isinstance(value, dict)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    return True
+
+
 def _normalize_task_model_output(output: object) -> TaskModelOutput:
     if isinstance(output, TaskToolCall):
         if not output.tool_name or not isinstance(output.arguments, dict):
@@ -974,6 +1421,9 @@ def _normalize_task_model_output(output: object) -> TaskModelOutput:
             arguments=output.arguments,
             provider_reference=output.provider_reference,
             usage=_normalize_usage(output.usage),
+            logical_call_ref=output.logical_call_ref,
+            parameters_hash=output.parameters_hash,
+            safe_summary=output.safe_summary,
         )
     if isinstance(output, TaskResultProposal):
         evidence_refs = tuple(output.evidence_refs)
@@ -993,7 +1443,13 @@ def _normalize_task_model_output(output: object) -> TaskModelOutput:
 
 
 def _tool_call_payload(call: TaskToolCall) -> dict[str, object]:
-    return {"tool_name": call.tool_name, "arguments": call.arguments}
+    return {
+        "tool_name": call.tool_name,
+        "arguments": call.arguments,
+        "logical_call_ref": call.logical_call_ref,
+        "parameters_hash": call.parameters_hash,
+        "safe_summary": call.safe_summary,
+    }
 
 
 def _proposal_payload(proposal: TaskResultProposal) -> dict[str, object]:
@@ -1039,6 +1495,9 @@ def _observation_draft(observation: TaskObservation | None) -> TaskObservationRe
         evidence_refs=tuple(observation.evidence_refs),
         evidence_gain=observation.evidence_gain,
         failure_ref=observation.failure_ref,
+        summary=observation.summary,
+        error_category=observation.error_category,
+        waiting_reference=observation.waiting_reference,
     )
 
 
