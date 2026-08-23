@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Research File Space 与 Sandbox 文件往返原型</title>
+  <style>
+    :root {
+      --ink: #17212b;
+      --muted: #62717d;
+      --paper: #f5f7f8;
+      --panel: #ffffff;
+      --line: #d8e0e4;
+      --accent: #086f83;
+      --accent-soft: #e5f2f4;
+      --good: #237452;
+      --good-soft: #e8f4ed;
+      --warn: #9a5b09;
+      --warn-soft: #fff3dc;
+      --bad: #a13b3b;
+      --bad-soft: #f9eaea;
+      --code: #111a21;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 14px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button { font: inherit; }
+    button { min-height: 36px; padding: 7px 11px; color: var(--ink); background: #fff; border: 1px solid #9fb0b9; border-radius: 5px; cursor: pointer; }
+    button:hover { color: var(--accent); border-color: var(--accent); }
+    button:disabled { cursor: not-allowed; color: #98a3a8; background: #f1f3f4; border-color: #d7dde0; }
+    button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    button.danger { color: var(--bad); border-color: #d8aaaa; }
+    main { max-width: 1440px; margin: 0 auto; padding: 28px 20px 60px; }
+    h1, h2, h3 { letter-spacing: 0; }
+    h1 { margin: 0; font-size: 28px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    h3 { margin: 0 0 8px; font-size: 14px; }
+    p { margin: 7px 0; }
+    code { padding: 1px 4px; background: #edf1f3; border-radius: 3px; }
+    .eyebrow { color: var(--accent); font-size: 12px; font-weight: 700; }
+    .lede { max-width: 980px; margin: 8px 0 18px; color: var(--muted); }
+    .notice { padding: 11px 13px; margin-bottom: 16px; background: var(--warn-soft); border: 1px solid #ead09c; border-radius: 5px; }
+    .layout { display: grid; grid-template-columns: minmax(330px, 0.8fr) minmax(560px, 1.5fr); gap: 16px; }
+    .stack { display: grid; gap: 16px; align-content: start; }
+    .panel { min-width: 0; padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 7px; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    .metric { min-width: 0; padding: 9px 10px; background: #f0f4f5; border-radius: 4px; }
+    .metric b { display: block; overflow: hidden; font-size: 19px; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+    .metric span { color: var(--muted); font-size: 11px; }
+    .tabs, .buttons { display: flex; flex-wrap: wrap; gap: 7px; }
+    .tabs { padding-bottom: 10px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .tab.active { color: #075868; background: var(--accent-soft); border-color: #86bec7; }
+    .walkthrough { display: none; }
+    .walkthrough.active { display: block; }
+    .step { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 9px; align-items: center; padding: 10px 0; border-top: 1px solid #edf0f2; }
+    .step:first-of-type { border-top: 0; }
+    .step-number { display: grid; width: 24px; height: 24px; place-items: center; color: var(--muted); background: #edf2f4; border-radius: 50%; font-size: 11px; font-weight: 700; }
+    .step.done .step-number { color: var(--good); background: var(--good-soft); }
+    .step small { display: block; color: var(--muted); }
+    .tag { display: inline-block; padding: 2px 7px; color: #50636d; background: #edf2f4; border-radius: 10px; font-size: 11px; white-space: nowrap; }
+    .tag.good { color: var(--good); background: var(--good-soft); }
+    .tag.warn { color: var(--warn); background: var(--warn-soft); }
+    .tag.bad { color: var(--bad); background: var(--bad-soft); }
+    .result { max-height: 290px; padding: 12px; overflow: auto; color: #dce8ed; background: var(--code); border-radius: 5px; white-space: pre-wrap; word-break: break-word; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .result.good { border-left: 4px solid #5aba83; }
+    .result.bad { border-left: 4px solid #dc7373; }
+    .table-wrap { max-height: 310px; overflow: auto; border: 1px solid #e7ecee; border-radius: 5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 8px 7px; text-align: left; vertical-align: top; border-bottom: 1px solid #e7ecee; }
+    th { position: sticky; top: 0; z-index: 1; color: var(--muted); background: #f7f9fa; font-weight: 600; }
+    td code { word-break: break-all; }
+    .empty { padding: 18px; color: var(--muted); text-align: center; }
+    .verdict { display: grid; gap: 8px; }
+    .check { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; padding: 9px 10px; background: #f6f8f9; border-radius: 5px; }
+    .check b { display: block; }
+    .check span { color: var(--muted); font-size: 12px; }
+    .icon { font-weight: 800; text-align: center; }
+    .event-list { max-height: 280px; overflow: auto; }
+    .event { display: grid; grid-template-columns: 35px minmax(0, 1fr); gap: 8px; padding: 8px 0; border-bottom: 1px solid #edf0f2; }
+    .event:last-child { border-bottom: 0; }
+    .event b { display: block; font-size: 12px; }
+    .event small { color: var(--muted); word-break: break-word; }
+    .full { grid-column: 1 / -1; }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } .full { grid-column: auto; } }
+    @media (max-width: 620px) { main { padding: 20px 12px 40px; } .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .step { grid-template-columns: 28px minmax(0, 1fr); } .step button { grid-column: 2; justify-self: start; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">一次性逻辑原型 · 原型验证 Research File Space 与 Sandbox 文件往返</div>
+  <h1>一个文件从来源进入 Sandbox，再成为可恢复产物</h1>
+  <p class="lede">此原型只回答状态模型问题：模型面对的是否仍是少量结构化 Tool，而 File Space Module 能否在内部守住 Revision、Capability、CAS、幂等重试、输出回收、Artifact provenance 与 tombstone</p>
+  <div class="notice"><b>原型边界：</b>所有状态只存在浏览器内存，不验证 PostgreSQL、对象存储、容器隔离或真实 Worker。它验证业务语义和恢复路径，不修改生产实现</div>
+
+  <section class="panel" style="margin-bottom:16px">
+    <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+      <div>
+        <h2>当前运行</h2>
+        <p><code>run-21</code> / <code>task-analysis</code> / Workspace <code>ws-demo</code></p>
+      </div>
+      <button id="resetAll">重置全部状态</button>
+    </div>
+    <div class="metrics" id="metrics"></div>
+  </section>
+
+  <div class="layout">
+    <div class="stack">
+      <section class="panel">
+        <h2>引导验证</h2>
+        <div class="tabs">
+          <button class="tab active" data-tab="source">1 来源</button>
+          <button class="tab" data-tab="work">2 工作文件</button>
+          <button class="tab" data-tab="sandbox">3 Sandbox</button>
+          <button class="tab" data-tab="artifact">4 产物</button>
+          <button class="tab" data-tab="recovery">5 恢复</button>
+        </div>
+
+        <div class="walkthrough active" id="walkthrough-source">
+          <p><b>目标：</b>确认 <code>/sources</code> 只是固定 Revision 的只读投影</p>
+          <div class="step" data-step-row="source-read"><span class="step-number">1</span><span>读取固定来源<small>返回 Revision、Blob 和来源投影身份</small></span><button data-action="readSource">读取</button></div>
+          <div class="step" data-step-row="source-write"><span class="step-number">2</span><span>尝试覆盖来源<small>无论路径正确与否都应 fail closed</small></span><button class="danger" data-action="writeSource">尝试写入</button></div>
+          <div class="step" data-step-row="source-freeze"><span class="step-number">3</span><span>模拟上游文档更新<small>Run 内来源仍指向启动时 Revision</small></span><button data-action="updateUpstream">模拟更新</button></div>
+        </div>
+
+        <div class="walkthrough" id="walkthrough-work">
+          <p><b>目标：</b>确认 Agent 只需 write，Module 内部处理 create、CAS update 与 tombstone</p>
+          <div class="step" data-step-row="work-create"><span class="step-number">1</span><span>创建分析草稿<small>新 File Entry 和不可变 Revision</small></span><button data-action="createWork">创建</button></div>
+          <div class="step" data-step-row="work-update"><span class="step-number">2</span><span>按 expected Revision 更新<small>入口前移，旧 Revision 保留</small></span><button data-action="updateWork">更新</button></div>
+          <div class="step" data-step-row="work-stale"><span class="step-number">3</span><span>重复过期写入<small>返回 revision_conflict，不覆盖新内容</small></span><button class="danger" data-action="staleWorkWrite">制造冲突</button></div>
+          <div class="step" data-step-row="work-delete"><span class="step-number">4</span><span>软删除再恢复<small>普通路径隐藏，历史 Revision 不消失</small></span><button data-action="toggleWorkDelete">删除 / 恢复</button></div>
+        </div>
+
+        <div class="walkthrough" id="walkthrough-sandbox">
+          <p><b>目标：</b>确认 Sandbox 排队时 pin 输入，暂态失败重试不重复逻辑 Tool Call</p>
+          <div class="step" data-step-row="sandbox-submit"><span class="step-number">1</span><span>提交 transform_artifact<small>输入只接受 FileRevisionRef 和 Capability</small></span><button data-action="submitSandbox">提交</button></div>
+          <div class="step" data-step-row="sandbox-fail"><span class="step-number">2</span><span>第一个 Attempt 暂态失败<small>Job 保持同一逻辑身份</small></span><button data-action="failAttempt">执行失败</button></div>
+          <div class="step" data-step-row="sandbox-retry"><span class="step-number">3</span><span>Worker 接管并成功<small>输出先进入 staging，不直接成为 Artifact</small></span><button data-action="retrySandbox">重试成功</button></div>
+          <div class="step" data-step-row="sandbox-ingest"><span class="step-number">4</span><span>回收输出<small>staging 字节摄取为 Blob 和 work Revision 后才发布 Observation</small></span><button data-action="ingestOutput">回收</button></div>
+        </div>
+
+        <div class="walkthrough" id="walkthrough-artifact">
+          <p><b>目标：</b>确认 publish 产生 Artifact 版本并保留完整 provenance</p>
+          <div class="step" data-step-row="artifact-publish1"><span class="step-number">1</span><span>发布第一版图表<small>work Revision 复用 Blob，形成 Artifact Revision</small></span><button data-action="publishArtifact">发布 v1</button></div>
+          <div class="step" data-step-row="artifact-revise"><span class="step-number">2</span><span>生成并发布第二版<small>同一 Artifact Entry 前移，v1 仍可追溯</small></span><button data-action="publishArtifactV2">发布 v2</button></div>
+          <div class="step" data-step-row="artifact-delete"><span class="step-number">3</span><span>软删除 Artifact<small>从路径和普通检索隐藏，不破坏历史 Observation</small></span><button class="danger" data-action="deleteArtifact">软删除</button></div>
+        </div>
+
+        <div class="walkthrough" id="walkthrough-recovery">
+          <p><b>目标：</b>确认重放只读取业务事实，不再次执行 Sandbox 副作用</p>
+          <div class="step" data-step-row="recovery-checkpoint"><span class="step-number">1</span><span>模拟 Worker / Graph 崩溃<small>Checkpoint 只保留稳定 ID 和恢复游标</small></span><button data-action="crashRuntime">模拟崩溃</button></div>
+          <div class="step" data-step-row="recovery-resume"><span class="step-number">2</span><span>从业务事实恢复<small>成功 Observation 存在时不得再次执行 Job</small></span><button data-action="resumeRuntime">恢复</button></div>
+          <div class="step" data-step-row="recovery-history"><span class="step-number">3</span><span>读取被删除 Artifact 的历史版本<small>通过 Revision 和 provenance 回读，不依赖当前路径</small></span><button data-action="readHistoricalArtifact">读取历史</button></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>自由操作</h2>
+        <div class="buttons">
+          <button data-action="runHappyPath" class="primary">运行完整 happy path</button>
+          <button data-action="duplicatePublish">重复发布同一幂等键</button>
+          <button data-action="readTombstone">按路径读取墓碑</button>
+          <button data-action="restoreArtifact">恢复 Artifact 入口</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>最近一次结果</h2>
+        <div class="result" id="lastResult">尚未执行操作</div>
+      </section>
+
+      <section class="panel">
+        <h2>恢复事件</h2>
+        <div class="event-list" id="events"></div>
+      </section>
+    </div>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>文件入口与当前投影</h2>
+        <div class="table-wrap"><table><thead><tr><th>Namespace / 路径</th><th>Entry</th><th>当前 Revision</th><th>Generation</th><th>状态</th></tr></thead><tbody id="entriesTable"></tbody></table></div>
+      </section>
+
+      <section class="panel">
+        <h2>不可变 Revision 与 provenance</h2>
+        <div class="table-wrap"><table><thead><tr><th>Revision</th><th>Blob</th><th>来源</th><th>创建活动</th><th>可达原因</th></tr></thead><tbody id="revisionsTable"></tbody></table></div>
+      </section>
+
+      <section class="panel">
+        <h2>Sandbox Job / Attempt / Observation</h2>
+        <div class="table-wrap"><table><thead><tr><th>逻辑 Job</th><th>输入</th><th>Attempt</th><th>状态</th><th>输出 / Observation</th></tr></thead><tbody id="sandboxTable"></tbody></table></div>
+      </section>
+
+      <section class="panel">
+        <h2>设计问题判定</h2>
+        <div class="verdict" id="verdict"></div>
+      </section>
+
+      <section class="panel">
+        <h2>完整领域状态</h2>
+        <div class="result" id="fullState" style="max-height:520px"></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+  const initialState = {
+    run: { id: 'run-21', taskId: 'task-analysis', workspaceId: 'ws-demo', status: 'running', checkpoint: { cursor: 'task:advance:1', refs: [] } },
+    sourceProjection: { entryId: 'entry-source-orders', path: '/sources/documents/orders.csv', pinnedRevisionId: 'rev-source-orders-1', upstreamCurrentRevisionId: 'rev-source-orders-1' },
+    entries: [
+      { id: 'entry-source-orders', namespace: 'sources', path: '/sources/documents/orders.csv', currentRevisionId: 'rev-source-orders-1', generation: 1, tombstoned: false, owner: 'source-projection' }
+    ],
+    revisions: [
+      { id: 'rev-source-orders-1', blobId: 'blob-orders-v1', media: 'text/csv', bytes: 46, derivedFrom: [], activityId: 'source-freeze-run-21', reachableBy: ['run-source-freeze'] }
+    ],
+    blobs: [
+      { id: 'blob-orders-v1', hash: 'sha256:orders-v1', content: 'region,amount\n华东,120\n华南,80\n华东,100' }
+    ],
+    capabilities: [
+      { id: 'cap-source-read', taskId: 'task-analysis', mode: 'read', revisionId: 'rev-source-orders-1', revoked: false }
+    ],
+    jobs: [], observations: [], events: [], idempotency: {}, completedSteps: {}, last: null
+  };
+
+  let state = cloneFixture(initialState);
+
+  // 深拷贝仅含 JSON 数据的固定原型状态
+  function cloneFixture(fixture) {
+    return JSON.parse(JSON.stringify(fixture));
+  }
+
+  // 深拷贝初始 fixture 并重置页面状态
+  function resetState() {
+    state = cloneFixture(initialState);
+    recordEvent('run.fixture_reset', '已恢复到来源冻结后的初始状态');
+    render();
+  }
+
+  // 按稳定身份查找文件入口
+  function entryById(entryId) {
+    return state.entries.find(entry => entry.id === entryId);
+  }
+
+  // 按稳定身份查找不可变文件版本
+  function revisionById(revisionId) {
+    return state.revisions.find(revision => revision.id === revisionId);
+  }
+
+  // 按稳定身份查找不可变字节内容
+  function blobById(blobId) {
+    return state.blobs.find(blob => blob.id === blobId);
+  }
+
+  // 追加单调序号的运行事件并返回事件
+  function recordEvent(type, summary) {
+    const event = { sequence: state.events.length + 1, type, summary };
+    state.events.push(event);
+    return event;
+  }
+
+  // 记录一次结构化操作结果并刷新全部投影
+  function result(operation, status, data, error = null) {
+    state.last = { operation, status, data, error, eventSequence: state.events.length };
+    render();
+    return state.last;
+  }
+
+  // 标记引导步骤已完成
+  function completeStep(step) {
+    state.completedSteps[step] = true;
+  }
+
+  // 创建或复用不可变 Blob
+  function putBlob(content, hint) {
+    const existing = state.blobs.find(blob => blob.content === content);
+    if (existing) return existing;
+    const blob = { id: `blob-${hint}-${state.blobs.length + 1}`, hash: `sha256:${hint}-${content.length}`, content };
+    state.blobs.push(blob);
+    return blob;
+  }
+
+  // 创建新的不可变 Revision 并记录来源关系
+  function createRevision({ blob, derivedFrom, activityId, media = 'text/markdown', reachableBy = [] }) {
+    const revision = {
+      id: `rev-${activityId}-${state.revisions.length + 1}`,
+      blobId: blob.id,
+      media,
+      bytes: blob.content.length,
+      derivedFrom: [...derivedFrom],
+      activityId,
+      reachableBy: [...reachableBy]
+    };
+    state.revisions.push(revision);
+    return revision;
+  }
+
+  // 读取固定 Revision 并校验 Task capability
+  function readSource() {
+    const capability = state.capabilities.find(item => item.id === 'cap-source-read' && !item.revoked);
+    const revision = revisionById(state.sourceProjection.pinnedRevisionId);
+    if (!capability || capability.revisionId !== revision.id) return result('file_read', 'rejected', null, 'capability_denied');
+    const blob = blobById(revision.blobId);
+    completeStep('source-read');
+    recordEvent('file.revision_read', `${revision.id} 已通过 ${capability.id} 读取`);
+    return result('file_read', 'completed', { path: state.sourceProjection.path, revisionId: revision.id, blobId: blob.id, hash: blob.hash, content: blob.content });
+  }
+
+  // 尝试写入只读来源并展示结构化拒绝
+  function writeSource() {
+    completeStep('source-write');
+    recordEvent('file.write_rejected', '/sources 是 Run 冻结的只读投影');
+    return result('file_write', 'rejected', { path: state.sourceProjection.path }, 'read_only_source');
+  }
+
+  // 模拟来源系统产生新版本但不改变当前 Run 的冻结投影
+  function updateUpstream() {
+    const blob = putBlob('region,amount\n华东,130\n华南,90\n华东,110', 'orders-v2');
+    const revision = createRevision({ blob, derivedFrom: ['rev-source-orders-1'], activityId: 'upstream-update', media: 'text/csv', reachableBy: ['upstream-current'] });
+    state.sourceProjection.upstreamCurrentRevisionId = revision.id;
+    completeStep('source-freeze');
+    recordEvent('source.upstream_changed', `上游已到 ${revision.id}，Run 仍固定 ${state.sourceProjection.pinnedRevisionId}`);
+    return result('source_freeze_check', 'completed', { pinnedRevisionId: state.sourceProjection.pinnedRevisionId, upstreamCurrentRevisionId: revision.id, unchanged: true });
+  }
+
+  // 在当前 Task 的 work 命名空间创建分析草稿
+  function createWork() {
+    const existing = entryById('entry-work-analysis');
+    if (existing && !existing.tombstoned) return result('file_write', 'reused', { entryId: existing.id, revisionId: existing.currentRevisionId });
+    const blob = putBlob('# 区域分析\n等待 Sandbox 结果', 'work-draft');
+    const revision = createRevision({ blob, derivedFrom: ['rev-source-orders-1'], activityId: 'file-write-draft', reachableBy: ['work-entry'] });
+    if (existing) {
+      existing.tombstoned = false;
+      existing.currentRevisionId = revision.id;
+      existing.generation += 1;
+    } else {
+      state.entries.push({ id: 'entry-work-analysis', namespace: 'work', path: '/work/tasks/task-analysis/analysis.md', currentRevisionId: revision.id, generation: 1, tombstoned: false, owner: 'task-analysis' });
+    }
+    completeStep('work-create');
+    recordEvent('file.work_created', `${revision.id} 已成为 work 当前版本`);
+    return result('file_write', 'completed', { entryId: 'entry-work-analysis', revisionId: revision.id, expectedRevisionId: null });
+  }
+
+  // 使用 expected Revision 对 work 入口执行 CAS 更新
+  function updateWork() {
+    const entry = entryById('entry-work-analysis');
+    if (!entry || entry.tombstoned) return result('file_write', 'rejected', null, 'work_entry_not_available');
+    if (entry.generation > 1) return result('file_write', 'reused', { entryId: entry.id, revisionId: entry.currentRevisionId });
+    const expectedRevisionId = entry.currentRevisionId;
+    const blob = putBlob('# 区域分析\n华东合计 220，华南合计 80', 'work-analysis');
+    const revision = createRevision({ blob, derivedFrom: [expectedRevisionId, 'rev-source-orders-1'], activityId: 'file-write-analysis', reachableBy: ['work-entry'] });
+    revisionById(expectedRevisionId).reachableBy.push('work-history');
+    entry.currentRevisionId = revision.id;
+    entry.generation += 1;
+    state.idempotency['write-work-v2'] = { revisionId: revision.id };
+    completeStep('work-update');
+    recordEvent('file.work_updated', `${entry.id} 从 ${expectedRevisionId} 前移到 ${revision.id}`);
+    return result('file_write', 'completed', { entryId: entry.id, expectedRevisionId, revisionId: revision.id, generation: entry.generation });
+  }
+
+  // 使用过期 expected Revision 验证 CAS 冲突不覆盖当前内容
+  function staleWorkWrite() {
+    const entry = entryById('entry-work-analysis');
+    if (!entry) return result('file_write', 'rejected', null, 'work_entry_not_found');
+    const staleRevision = state.revisions.find(revision => revision.activityId === 'file-write-draft');
+    completeStep('work-stale');
+    recordEvent('file.write_conflict', `expected ${staleRevision.id}，current ${entry.currentRevisionId}`);
+    return result('file_write', 'rejected', { entryId: entry.id, expectedRevisionId: staleRevision.id, currentRevisionId: entry.currentRevisionId }, 'revision_conflict');
+  }
+
+  // 在 tombstone 与恢复状态间切换 work 入口
+  function toggleWorkDelete() {
+    const entry = entryById('entry-work-analysis');
+    if (!entry) return result('file_delete', 'rejected', null, 'work_entry_not_found');
+    entry.tombstoned = !entry.tombstoned;
+    entry.generation += 1;
+    completeStep('work-delete');
+    recordEvent(entry.tombstoned ? 'file.entry_tombstoned' : 'file.entry_restored', `${entry.id} 当前 tombstone=${entry.tombstoned}`);
+    return result(entry.tombstoned ? 'file_delete' : 'file_restore', 'completed', { entryId: entry.id, tombstoned: entry.tombstoned, currentRevisionId: entry.currentRevisionId, generation: entry.generation });
+  }
+
+  // 确保 Sandbox 需要的 work 草稿存在且可读
+  function ensureWorkForSandbox() {
+    let entry = entryById('entry-work-analysis');
+    if (!entry) {
+      createWork();
+      entry = entryById('entry-work-analysis');
+    }
+    if (entry.tombstoned) {
+      entry.tombstoned = false;
+      entry.generation += 1;
+    }
+    return entry;
+  }
+
+  // 创建逻辑 Sandbox Job 并在排队时固定精确输入 Revision
+  function submitSandbox() {
+    const existing = state.jobs.find(job => job.id === 'job-chart-21');
+    if (existing) return result('python_execute', 'reused', existing);
+    const workEntry = ensureWorkForSandbox();
+    const job = {
+      id: 'job-chart-21',
+      logicalCallId: 'tool-call-python-21',
+      purpose: 'transform_artifact',
+      inputRevisionIds: ['rev-source-orders-1', workEntry.currentRevisionId],
+      status: 'queued', attempts: [], stagingOutput: null, observationId: null
+    };
+    state.jobs.push(job);
+    completeStep('sandbox-submit');
+    recordEvent('sandbox.job_queued', `${job.id} 已 pin 输入 ${job.inputRevisionIds.join(', ')}`);
+    return result('python_execute', 'queued', job);
+  }
+
+  // 记录第一次暂态基础设施失败并保留同一逻辑 Job
+  function failAttempt() {
+    let job = state.jobs.find(item => item.id === 'job-chart-21');
+    if (!job) {
+      submitSandbox();
+      job = state.jobs.find(item => item.id === 'job-chart-21');
+    }
+    if (job.attempts.length) return result('sandbox_attempt', 'reused', job.attempts[0]);
+    const attempt = { id: 'attempt-chart-1', fencingToken: 1, status: 'failed_retryable', reason: 'worker_lost_before_publish' };
+    job.attempts.push(attempt);
+    job.status = 'retry_wait';
+    completeStep('sandbox-fail');
+    recordEvent('sandbox.attempt_failed', `${attempt.id} 暂态失败，逻辑 Job 未改变`);
+    return result('sandbox_attempt', 'failed_retryable', attempt);
+  }
+
+  // 由新租约接管同一 Job 并把输出留在隔离 staging
+  function retrySandbox() {
+    let job = state.jobs.find(item => item.id === 'job-chart-21');
+    if (!job) {
+      submitSandbox();
+      job = state.jobs.find(item => item.id === 'job-chart-21');
+    }
+    if (!job.attempts.length) failAttempt();
+    const existing = job.attempts.find(attempt => attempt.status === 'executed_pending_ingest');
+    if (existing) return result('sandbox_attempt', 'reused', existing);
+    const attempt = { id: 'attempt-chart-2', fencingToken: 2, status: 'executed_pending_ingest', reason: null };
+    job.attempts.push(attempt);
+    job.status = 'executed_pending_ingest';
+    job.stagingOutput = { executorRef: 'container-opaque-21:/out/region-chart.csv', content: 'region,total\n华东,220\n华南,80', media: 'text/csv' };
+    completeStep('sandbox-retry');
+    recordEvent('sandbox.attempt_executed', `${attempt.id} 成功，输出等待 File Space 摄取`);
+    return result('sandbox_attempt', 'executed_pending_ingest', { attempt, stagingOutput: { media: job.stagingOutput.media, bytes: job.stagingOutput.content.length } });
+  }
+
+  // 把隔离输出摄取为 Blob 与 work Revision 后发布唯一 Observation
+  function ingestOutput() {
+    let job = state.jobs.find(item => item.id === 'job-chart-21');
+    if (!job || job.status === 'queued' || job.status === 'retry_wait') {
+      retrySandbox();
+      job = state.jobs.find(item => item.id === 'job-chart-21');
+    }
+    if (job.observationId) return result('sandbox_output_ingest', 'reused', state.observations.find(item => item.id === job.observationId));
+    const blob = putBlob(job.stagingOutput.content, 'sandbox-chart');
+    const revision = createRevision({ blob, derivedFrom: job.inputRevisionIds, activityId: 'sandbox-job-chart-21', media: job.stagingOutput.media, reachableBy: ['work-entry', 'tool-observation'] });
+    state.entries.push({ id: 'entry-work-chart', namespace: 'work', path: '/work/tasks/task-analysis/region-chart.csv', currentRevisionId: revision.id, generation: 1, tombstoned: false, owner: 'task-analysis' });
+    const observation = { id: 'obs-chart-21', toolCallId: job.logicalCallId, jobId: job.id, status: 'completed', outputRevisionIds: [revision.id], attemptCount: job.attempts.length };
+    state.observations.push(observation);
+    job.observationId = observation.id;
+    job.status = 'completed';
+    job.stagingOutput = null;
+    completeStep('sandbox-ingest');
+    recordEvent('tool.observation_published', `${observation.id} 原子引用 ${revision.id}`);
+    return result('sandbox_output_ingest', 'completed', observation);
+  }
+
+  // 将 work Revision 显式发布为 Artifact Revision
+  function publishArtifact() {
+    if (state.idempotency['publish-chart-v1']) return result('file_publish', 'reused', state.idempotency['publish-chart-v1']);
+    let workEntry = entryById('entry-work-chart');
+    if (!workEntry) {
+      ingestOutput();
+      workEntry = entryById('entry-work-chart');
+    }
+    const workRevision = revisionById(workEntry.currentRevisionId);
+    const artifactRevision = createRevision({ blob: blobById(workRevision.blobId), derivedFrom: [workRevision.id], activityId: 'publish-chart-v1', media: workRevision.media, reachableBy: ['artifact-entry', 'provenance'] });
+    state.entries.push({ id: 'entry-artifact-chart', namespace: 'artifacts', path: '/artifacts/charts/region-chart.csv', currentRevisionId: artifactRevision.id, generation: 1, tombstoned: false, owner: 'ws-demo' });
+    const receipt = { entryId: 'entry-artifact-chart', revisionId: artifactRevision.id, derivedFromRevisionId: workRevision.id, sandboxJobId: 'job-chart-21', idempotencyKey: 'publish-chart-v1' };
+    state.idempotency['publish-chart-v1'] = receipt;
+    completeStep('artifact-publish1');
+    recordEvent('artifact.version_published', `${artifactRevision.id} 已从 ${workRevision.id} 发布`);
+    return result('file_publish', 'completed', receipt);
+  }
+
+  // 生成新的 work 输出并发布为同一 Artifact Entry 的第二版
+  function publishArtifactV2() {
+    if (state.idempotency['publish-chart-v2']) return result('file_publish', 'reused', state.idempotency['publish-chart-v2']);
+    let artifactEntry = entryById('entry-artifact-chart');
+    if (!artifactEntry) {
+      publishArtifact();
+      artifactEntry = entryById('entry-artifact-chart');
+    }
+    const oldArtifactRevisionId = artifactEntry.currentRevisionId;
+    const workEntry = entryById('entry-work-chart');
+    const oldWorkRevisionId = workEntry.currentRevisionId;
+    const blob = putBlob('region,total,share\n华东,220,73.3%\n华南,80,26.7%', 'sandbox-chart-v2');
+    const workRevision = createRevision({ blob, derivedFrom: [oldWorkRevisionId, 'rev-source-orders-1'], activityId: 'sandbox-job-chart-v2', media: 'text/csv', reachableBy: ['work-entry', 'tool-observation'] });
+    workEntry.currentRevisionId = workRevision.id;
+    workEntry.generation += 1;
+    const artifactRevision = createRevision({ blob, derivedFrom: [workRevision.id, oldArtifactRevisionId], activityId: 'publish-chart-v2', media: 'text/csv', reachableBy: ['artifact-entry', 'provenance'] });
+    revisionById(oldArtifactRevisionId).reachableBy.push('artifact-history');
+    artifactEntry.currentRevisionId = artifactRevision.id;
+    artifactEntry.generation += 1;
+    const receipt = { entryId: artifactEntry.id, previousRevisionId: oldArtifactRevisionId, revisionId: artifactRevision.id, derivedFromRevisionId: workRevision.id, idempotencyKey: 'publish-chart-v2' };
+    state.idempotency['publish-chart-v2'] = receipt;
+    completeStep('artifact-revise');
+    recordEvent('artifact.version_published', `${artifactEntry.id} 已从 ${oldArtifactRevisionId} 前移到 ${artifactRevision.id}`);
+    return result('file_publish', 'completed', receipt);
+  }
+
+  // 对 Artifact Entry 写墓碑而不删除历史 Revision
+  function deleteArtifact() {
+    const entry = entryById('entry-artifact-chart');
+    if (!entry) return result('file_delete', 'rejected', null, 'artifact_not_found');
+    if (entry.tombstoned) return result('file_delete', 'reused', { entryId: entry.id, tombstoned: true });
+    entry.tombstoned = true;
+    entry.generation += 1;
+    revisionById(entry.currentRevisionId).reachableBy.push('tombstone-last-revision');
+    completeStep('artifact-delete');
+    recordEvent('artifact.entry_tombstoned', `${entry.id} 已从路径和普通检索隐藏`);
+    return result('file_delete', 'completed', { entryId: entry.id, currentRevisionId: entry.currentRevisionId, tombstoned: true, generation: entry.generation });
+  }
+
+  // 恢复 Artifact 逻辑入口并保留原有版本链
+  function restoreArtifact() {
+    const entry = entryById('entry-artifact-chart');
+    if (!entry) return result('file_restore', 'rejected', null, 'artifact_not_found');
+    if (!entry.tombstoned) return result('file_restore', 'reused', { entryId: entry.id, tombstoned: false });
+    entry.tombstoned = false;
+    entry.generation += 1;
+    recordEvent('artifact.entry_restored', `${entry.id} 已恢复到 ${entry.currentRevisionId}`);
+    return result('file_restore', 'completed', { entryId: entry.id, revisionId: entry.currentRevisionId, generation: entry.generation });
+  }
+
+  // 重放同一发布命令并验证幂等 receipt
+  function duplicatePublish() {
+    if (!state.idempotency['publish-chart-v1']) publishArtifact();
+    const before = state.revisions.length;
+    const receipt = state.idempotency['publish-chart-v1'];
+    recordEvent('artifact.publish_replayed', `复用 ${receipt.revisionId}，未创建新 Revision`);
+    return result('file_publish', 'reused', { ...receipt, revisionCountUnchanged: before === state.revisions.length });
+  }
+
+  // 按逻辑路径读取并拒绝已写墓碑的入口
+  function readTombstone() {
+    let entry = entryById('entry-artifact-chart');
+    if (!entry) {
+      publishArtifact();
+      deleteArtifact();
+      entry = entryById('entry-artifact-chart');
+    }
+    if (!entry.tombstoned) deleteArtifact();
+    recordEvent('file.path_read_rejected', `${entry.path} 已被墓碑隐藏`);
+    return result('file_read_by_path', 'rejected', { path: entry.path, entryId: entry.id }, 'entry_tombstoned');
+  }
+
+  // 模拟运行时崩溃并仅在 checkpoint 中保留稳定引用
+  function crashRuntime() {
+    const job = state.jobs.find(item => item.id === 'job-chart-21');
+    state.run.status = 'recovering';
+    state.run.checkpoint = { cursor: 'task:await_tool_observation', refs: [job?.id, job?.observationId].filter(Boolean) };
+    completeStep('recovery-checkpoint');
+    recordEvent('runtime.crashed', `checkpoint 仅保留 ${state.run.checkpoint.refs.join(', ') || '无业务引用'}`);
+    return result('runtime_crash', 'completed', state.run.checkpoint);
+  }
+
+  // 从 Observation 与 Job 事实恢复并禁止再次执行成功 Job
+  function resumeRuntime() {
+    if (!state.jobs.length) ingestOutput();
+    const job = state.jobs.find(item => item.id === 'job-chart-21');
+    const observation = state.observations.find(item => item.id === job.observationId);
+    const attemptsBefore = job.attempts.length;
+    state.run.status = 'running';
+    state.run.checkpoint = { cursor: 'task:observation_loaded', refs: [job.id, observation.id] };
+    completeStep('recovery-resume');
+    recordEvent('runtime.resumed_from_facts', `复用 ${observation.id}，Sandbox Attempt 数保持 ${attemptsBefore}`);
+    return result('runtime_resume', 'completed', { jobId: job.id, observationId: observation.id, attemptsBefore, attemptsAfter: job.attempts.length, reexecuted: false });
+  }
+
+  // 通过稳定 Revision 读取墓碑入口的历史 Artifact 内容与来源链
+  function readHistoricalArtifact() {
+    let entry = entryById('entry-artifact-chart');
+    if (!entry) {
+      publishArtifact();
+      entry = entryById('entry-artifact-chart');
+    }
+    if (!entry.tombstoned) deleteArtifact();
+    const firstReceipt = state.idempotency['publish-chart-v1'];
+    const revision = revisionById(firstReceipt.revisionId);
+    const blob = blobById(revision.blobId);
+    completeStep('recovery-history');
+    recordEvent('artifact.history_read', `${revision.id} 通过 provenance 读取，未依赖当前路径可见性`);
+    return result('file_read_revision', 'completed', { entryTombstoned: entry.tombstoned, revisionId: revision.id, blobId: blob.id, content: blob.content, derivedFrom: revision.derivedFrom, activityId: revision.activityId });
+  }
+
+  // 顺序运行完整主路径以观察端到端状态
+  function runHappyPath() {
+    readSource();
+    writeSource();
+    updateUpstream();
+    createWork();
+    updateWork();
+    staleWorkWrite();
+    submitSandbox();
+    failAttempt();
+    retrySandbox();
+    ingestOutput();
+    publishArtifact();
+    publishArtifactV2();
+    deleteArtifact();
+    crashRuntime();
+    resumeRuntime();
+    return readHistoricalArtifact();
+  }
+
+  // 返回状态标签使用的样式类
+  function statusClass(status) {
+    if (['completed', 'running', 'reused', 'ok'].includes(status)) return 'good';
+    if (['rejected', 'failed_retryable', 'tombstoned'].includes(status)) return 'bad';
+    return 'warn';
+  }
+
+  // 转义状态中的动态文本以安全渲染表格
+  function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+  }
+
+  // 渲染顶层指标、表格、事件、判定与完整状态
+  function render() {
+    const activeEntries = state.entries.filter(entry => !entry.tombstoned).length;
+    document.getElementById('metrics').innerHTML = `
+      <div class="metric"><b>${activeEntries}</b><span>可见 File Entry</span></div>
+      <div class="metric"><b>${state.revisions.length}</b><span>不可变 Revision</span></div>
+      <div class="metric"><b>${state.jobs.length ? state.jobs[0].status : '-'}</b><span>Sandbox Job</span></div>
+      <div class="metric"><b>${state.events.length}</b><span>Run Event sequence</span></div>`;
+
+    document.getElementById('entriesTable').innerHTML = state.entries.map(entry => `
+      <tr><td><b>/${escapeHtml(entry.namespace)}</b><br>${escapeHtml(entry.path)}</td><td><code>${escapeHtml(entry.id)}</code></td><td><code>${escapeHtml(entry.currentRevisionId)}</code></td><td>${entry.generation}</td><td><span class="tag ${entry.tombstoned ? 'bad' : 'good'}">${entry.tombstoned ? 'tombstoned' : 'visible'}</span></td></tr>`).join('');
+
+    document.getElementById('revisionsTable').innerHTML = state.revisions.map(revision => `
+      <tr><td><code>${escapeHtml(revision.id)}</code></td><td><code>${escapeHtml(revision.blobId)}</code><br>${revision.bytes} bytes</td><td>${revision.derivedFrom.length ? revision.derivedFrom.map(id => `<code>${escapeHtml(id)}</code>`).join('<br>') : '<span class="tag">root</span>'}</td><td><code>${escapeHtml(revision.activityId)}</code></td><td>${revision.reachableBy.map(reason => `<span class="tag">${escapeHtml(reason)}</span>`).join(' ')}</td></tr>`).join('');
+
+    const sandboxRows = state.jobs.length ? state.jobs.map(job => `
+      <tr><td><code>${job.id}</code><br>${job.purpose}</td><td>${job.inputRevisionIds.map(id => `<code>${escapeHtml(id)}</code>`).join('<br>')}</td><td>${job.attempts.length ? job.attempts.map(attempt => `<code>${attempt.id}</code> <span class="tag ${statusClass(attempt.status)}">${attempt.status}</span>`).join('<br>') : '<span class="tag">尚未执行</span>'}</td><td><span class="tag ${statusClass(job.status)}">${job.status}</span></td><td>${job.observationId ? `<code>${job.observationId}</code>` : job.stagingOutput ? '<span class="tag warn">staging only</span>' : '-'}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">尚未提交 Sandbox Job</td></tr>';
+    document.getElementById('sandboxTable').innerHTML = sandboxRows;
+
+    document.getElementById('events').innerHTML = state.events.length ? [...state.events].reverse().map(event => `
+      <div class="event"><span class="tag">${event.sequence}</span><span><b>${escapeHtml(event.type)}</b><small>${escapeHtml(event.summary)}</small></span></div>`).join('') : '<div class="empty">尚无运行事件</div>';
+
+    const sourceSafe = state.sourceProjection.pinnedRevisionId === 'rev-source-orders-1';
+    const casProven = state.last?.error === 'revision_conflict' || state.events.some(event => event.type === 'file.write_conflict');
+    const outputIngested = state.observations.some(observation => observation.status === 'completed');
+    const versioned = state.idempotency['publish-chart-v2'];
+    const recovered = state.events.some(event => event.type === 'runtime.resumed_from_facts');
+    const checks = [
+      [sourceSafe, '来源冻结与只读', 'Run 内投影保持固定 Revision，写入被结构化拒绝'],
+      [casProven, 'work 增删改与并发', '创建、CAS 更新、冲突和 tombstone 由一个 File Space Module 处理'],
+      [outputIngested, 'Sandbox 文件往返', '排队 pin 输入，输出摄取成功后才形成唯一 Observation'],
+      [versioned, 'Artifact 版本与 provenance', '显式 publish 产生版本链，引用稳定 Revision 而非路径'],
+      [recovered, '重试与恢复', '逻辑 Job 不变，恢复读取已提交事实且不重跑成功副作用']
+    ];
+    document.getElementById('verdict').innerHTML = checks.map(([ok, title, detail]) => `
+      <div class="check"><span class="icon" style="color:${ok ? 'var(--good)' : 'var(--muted)'}">${ok ? 'OK' : '·'}</span><span><b>${title}</b><span>${detail}</span></span></div>`).join('') + `
+      <div class="notice" style="margin:4px 0 0"><b>待用户判断：</b>${checks.every(item => item[0]) ? '五条语义均已在原型中跑通。请判断这组外部 Tool 行为是否足够简单，能否作为后续实施合同' : '继续执行尚未完成的引导场景，再判断接口复杂度与恢复语义'}</div>`;
+
+    document.getElementById('lastResult').className = `result ${state.last?.status === 'rejected' ? 'bad' : state.last ? 'good' : ''}`;
+    document.getElementById('lastResult').textContent = state.last ? JSON.stringify(state.last, null, 2) : '尚未执行操作';
+    document.getElementById('fullState').textContent = JSON.stringify(state, null, 2);
+    document.querySelectorAll('[data-step-row]').forEach(row => row.classList.toggle('done', Boolean(state.completedSteps[row.dataset.stepRow])));
+  }
+
+  const actions = { readSource, writeSource, updateUpstream, createWork, updateWork, staleWorkWrite, toggleWorkDelete, submitSandbox, failAttempt, retrySandbox, ingestOutput, publishArtifact, publishArtifactV2, deleteArtifact, duplicatePublish, readTombstone, restoreArtifact, crashRuntime, resumeRuntime, readHistoricalArtifact, runHappyPath };
+  document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => actions[button.dataset.action]()));
+  document.querySelectorAll('[data-tab]').forEach(button => button.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+    document.querySelectorAll('.walkthrough').forEach(walkthrough => walkthrough.classList.remove('active'));
+    button.classList.add('active');
+    document.getElementById(`walkthrough-${button.dataset.tab}`).classList.add('active');
+  }));
+  document.getElementById('resetAll').addEventListener('click', resetState);
+  resetState();
+</script>
+</body>
+</html>

@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Issue #18 Agent Runtime v2 状态原型</title>
+  <style>
+    :root { --ink:#18242b; --muted:#65747c; --line:#d8e0e4; --paper:#f5f7f8; --panel:#fff; --accent:#0b7285; --good:#267a52; --warn:#9a5a00; --bad:#a23c3c; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1220px; margin:0 auto; padding:32px 20px 60px; }
+    h1 { margin:0 0 8px; font-size:30px; letter-spacing:0; }
+    h2 { margin:0 0 12px; font-size:20px; letter-spacing:0; }
+    h3 { margin:0 0 6px; font-size:16px; }
+    p { margin:8px 0; }
+    code { background:#edf2f4; padding:1px 4px; border-radius:3px; }
+    .eyebrow { color:var(--accent); font-weight:700; font-size:12px; letter-spacing:.08em; text-transform:uppercase; }
+    .intro { border-left:4px solid var(--accent); padding-left:14px; margin:16px 0 22px; }
+    .notice { background:#fff8e8; border:1px solid #ead7a7; padding:12px 14px; margin:14px 0 20px; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:16px; }
+    .wide { grid-column:1/-1; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:17px; }
+    .metrics { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:9px; }
+    .metric { background:#eef3f5; padding:9px 10px; border-radius:5px; min-height:68px; }
+    .metric b { display:block; font-size:19px; line-height:1.2; overflow-wrap:anywhere; }
+    .metric span { color:var(--muted); font-size:12px; }
+    .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+    button { font:inherit; color:var(--ink); background:#fff; border:1px solid #9eb2b9; border-radius:5px; padding:8px 11px; cursor:pointer; }
+    button:hover { border-color:var(--accent); color:var(--accent); }
+    button.primary { color:#fff; background:var(--accent); border-color:var(--accent); }
+    button.danger { color:var(--bad); border-color:#d9aaaa; }
+    .tabs { display:flex; flex-wrap:wrap; gap:6px; border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:13px; }
+    .tab.active { color:#075766; background:#e5f2f4; border-color:#8fc2c9; }
+    .scenario { display:none; }
+    .scenario.active { display:block; }
+    .step { display:flex; justify-content:space-between; align-items:center; gap:12px; border-top:1px solid #edf0f2; padding:10px 0; }
+    .step small { display:block; color:var(--muted); }
+    .state-list { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px 18px; }
+    .state-list div { border-bottom:1px solid #edf0f2; padding:6px 0; }
+    .state-list span { color:var(--muted); display:block; font-size:12px; }
+    .state-list strong { overflow-wrap:anywhere; }
+    .result { background:#111c21; color:#e3edf0; border-radius:5px; padding:12px; white-space:pre-wrap; overflow:auto; max-height:360px; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .result.good { border-left:4px solid #63c493; }
+    .result.bad { border-left:4px solid #df7777; }
+    .event-list { max-height:310px; overflow:auto; }
+    .event { border-bottom:1px solid #edf0f2; padding:7px 0; }
+    .event b { color:var(--accent); }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { border-bottom:1px solid var(--line); padding:7px 6px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    .scroll { overflow:auto; max-height:360px; }
+    .tag { display:inline-block; padding:2px 7px; border-radius:10px; font-size:11px; background:#edf2f4; color:#52646d; }
+    .tag.good { color:var(--good); background:#e6f3eb; }
+    .tag.warn { color:var(--warn); background:#fff0d2; }
+    .tag.bad { color:var(--bad); background:#faeaea; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } .metrics { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    @media (max-width:520px) { main { padding:24px 13px 45px; } .metrics { grid-template-columns:repeat(2,minmax(0,1fr)); } .state-list { grid-template-columns:1fr; } .step { align-items:flex-start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">一次性逻辑原型 · Issue #18 · 不进入生产</div>
+  <h1>Observation 回流、暂停恢复与预算停止</h1>
+  <div class="intro">
+    <p>这个 demo 只回答一个问题：Plan-and-Solve 外层和单 Research Task 内有界 ReAct，是否能用少量可观察状态表达恢复、幂等、租约 fencing、预算和 Verifier 屏障？每次操作后都会显示完整业务事实</p>
+  </div>
+  <div class="notice"><b>原型边界：</b>所有事实都在内存中；这里模拟的是业务数据库已提交的 Observation、Outcome、Run Event 和 checkpoint 引用，不代表生产表结构或 LangGraph 节点</div>
+
+  <section class="panel">
+    <h2>当前运行</h2>
+    <div class="metrics" id="metrics"></div>
+    <div class="state-list" id="stateList" style="margin-top:13px"></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>自由操作</h2>
+      <p>按钮可以按任意顺序点击；需要先恢复到初始状态时使用重置</p>
+      <div class="buttons">
+        <button class="primary" data-action="happy">运行完整闭环</button>
+        <button data-action="advance">advance(TaskClaim)</button>
+        <button data-action="claimA">Worker A 认领</button>
+        <button data-action="claimB">Worker B 接管</button>
+        <button data-action="asyncStart">进入异步等待</button>
+        <button data-action="asyncComplete">异步工具完成</button>
+        <button data-action="crash">模拟崩溃后恢复</button>
+        <button data-action="verify">执行 Verifier</button>
+        <button data-action="replay">重放 checkpoint</button>
+        <button class="danger" data-action="reset">重置</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>最近一次结果</h2>
+      <div class="result" id="lastResult">尚未执行操作</div>
+    </section>
+
+    <section class="panel wide">
+      <h2>引导场景</h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="happy">1 完整闭环</button>
+        <button class="tab" data-tab="async">2 异步恢复</button>
+        <button class="tab" data-tab="crash">3 崩溃幂等</button>
+        <button class="tab" data-tab="lease">4 租约 fencing</button>
+        <button class="tab" data-tab="budget">5 预算停止</button>
+        <button class="tab" data-tab="verifier">6 Verifier 路由</button>
+        <button class="tab" data-tab="replay">7 checkpoint 重放</button>
+      </div>
+      <div class="scenario active" id="scenario-happy">
+        <p><b>观察：</b>Tool Observation 提交后才回流下一次 Model Turn；Task Outcome 产生后还要经过调度屏障才允许 Verifier</p>
+        <div class="step"><span>1. 认领并推进 Model Turn 1<small>模型只提出一个 Tool Call</small></span><button data-step="happy1">执行</button></div>
+        <div class="step"><span>2. 执行同步 Tool<small>副作用计数只增加一次，Observation 持久化</small></span><button data-step="happy2">执行</button></div>
+        <div class="step"><span>3. 用 Observation 推进 Model Turn 2<small>Controller 形成不可变 Task Outcome</small></span><button data-step="happy3">执行</button></div>
+        <div class="step"><span>4. 形成调度屏障并运行 Verifier<small>只提交一个 complete/replan/partial/failed</small></span><button data-step="happy4">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-async">
+        <p><b>观察：</b>异步 Tool 进入 waiting；完成后只用稳定 <code>task_id</code> 恢复，不携带临时 resume payload</p>
+        <div class="step"><span>1. 推进到异步 Tool<small>结果应为 waiting</small></span><button data-step="async1">执行</button></div>
+        <div class="step"><span>2. 让异步 Worker 完成<small>只写入业务 Observation</small></span><button data-step="async2">执行</button></div>
+        <div class="step"><span>3. 用同一 task_id 恢复<small>结果应为 runnable 或 terminal</small></span><button data-step="async3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-crash">
+        <p><b>观察：</b>Tool 成功后、Task 恢复前崩溃；重放 checkpoint 不应再次执行已成功副作用</p>
+        <div class="step"><span>1. 执行同步 Tool 并提交 Observation<small>记录副作用计数</small></span><button data-step="crash1">执行</button></div>
+        <div class="step"><span>2. 在恢复前模拟崩溃<small>丢弃控制流快照，但保留业务事实</small></span><button data-step="crash2">执行</button></div>
+        <div class="step"><span>3. 重放并恢复 Task<small>副作用计数必须保持 1</small></span><button data-step="crash3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-lease">
+        <p><b>观察：</b>Worker 接管后 lease_epoch 递增；旧 Claim 提交会被拒绝，不能改写业务事实</p>
+        <div class="step"><span>1. Worker A 认领<small>保存 epoch 1 的 TaskClaim</small></span><button data-step="lease1">执行</button></div>
+        <div class="step"><span>2. Worker B 接管<small>epoch 变为 2</small></span><button data-step="lease2">执行</button></div>
+        <div class="step"><span>3. Worker A 用旧 Claim 提交<small>结果应为 lease_lost</small></span><button data-step="lease3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-budget">
+        <p><b>观察：</b>停止原因来自可解释的业务预算，而不是 Graph recursion limit 或模型自报完成</p>
+        <div class="step"><span>1. 连续两次成功推进但无 Evidence Gain<small>Task 应形成 no_evidence_gain 停止事实</small></span><button data-step="budget1">执行</button></div>
+        <div class="step"><span>2. 消耗到 Model Turn 上限<small>Task 应形成 turn_budget_exhausted 停止事实</small></span><button data-step="budget2">执行</button></div>
+        <div class="step"><span>3. 观察 Run 总预算<small>token/cost/deadline 不能因恢复而扩大</small></span><button data-step="budget3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-verifier">
+        <p><b>观察：</b>Verifier 只有在当前计划阶段所有 Task Outcome 已持久化后运行一次；结果互斥且幂等</p>
+        <div class="step"><span>1. 选择 Verifier 输入<small>覆盖、缺口、冲突和可发布 Claim 会影响路由</small></span><button data-step="verifier1">切换</button></div>
+        <div class="step"><span>2. 形成调度屏障<small>屏障前执行 Verifier 会被拒绝</small></span><button data-step="verifier2">执行</button></div>
+        <div class="step"><span>3. 重复执行 Verifier<small>返回同一个 decision，不追加第二个裁决</small></span><button data-step="verifier3">执行</button></div>
+        <div class="buttons" style="margin-top:12px">
+          <button data-step="routeComplete">演示 complete</button>
+          <button data-step="routeReplan">演示 replan</button>
+          <button data-step="routePartial">演示 partial</button>
+          <button data-step="routeFailed">演示 failed</button>
+        </div>
+      </div>
+      <div class="scenario" id="scenario-replay">
+        <p><b>观察：</b>checkpoint 只保存稳定引用和游标；丢失或重放不会改写 Observation、Outcome 或副作用</p>
+        <div class="step"><span>1. 提交业务事实并保存 checkpoint<small>页面展示两个来源的职责</small></span><button data-step="replay1">执行</button></div>
+        <div class="step"><span>2. 模拟 checkpoint 丢失<small>业务事实仍然存在</small></span><button data-step="replay2">执行</button></div>
+        <div class="step"><span>3. 从稳定 ID 重放<small>事件数和副作用数不增加</small></span><button data-step="replay3">执行</button></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>已提交业务事实</h2>
+      <div class="scroll"><table><thead><tr><th>类型</th><th>稳定身份</th><th>状态 / 摘要</th></tr></thead><tbody id="factsTable"></tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>运行事件</h2>
+      <div class="event-list" id="events"></div>
+    </section>
+    <section class="panel wide">
+      <h2>完整状态</h2>
+      <div class="result" id="fullState"></div>
+    </section>
+  </div>
+</main>
+<script>
+  // 创建可重置的原型状态
+  const fixture = {
+    run: { id:'run-demo', planRevision:1, status:'running', tokenLimit:120, tokensUsed:0, costLimit:10, costUsed:0, deadline:'not-expired', replanCount:0 },
+    task: { id:'task-research-1', status:'ready', phase:'model', leaseEpoch:0, owner:null, turn:0, turnLimit:8, noGainStreak:0, noGainLimit:2, evidenceGainNext:true, waiting:null, toolCallId:null, observationId:null, outcome:null },
+    claims: [], toolRuns: [], observations: [], outcomes: [], events: [], checkpoint: { present:true, cursor:'task:ready', refs:[] },
+    verifier: { barrierReady:false, input:{ coverage:'covered', conflict:false, hasClaim:true }, decision:null, decisionId:null, attempts:0 },
+    effects: { externalWrite:0 }, replayCount:0, rejectedSubmissions:0, last:null
+  };
+  let state = clone(fixture);
+
+  // 深拷贝固定状态，避免页面操作共享引用
+  function clone(value) { return JSON.parse(JSON.stringify(value)); }
+
+  // 重置原型并记录新的运行事件
+  function reset() { state = clone(fixture); event('run.reset','恢复到新的 Research Run 和初始 Task'); show('已重置原型'); }
+
+  // 追加已提交的 Run Event 并返回事件
+  function event(type, detail) { const item = { sequence:state.events.length + 1, type, detail }; state.events.push(item); return item; }
+
+  // 记录页面可见的最后一次业务操作
+  function show(message, status='ok', data=null) { state.last = { message, status, data }; render(); }
+
+  // 返回当前 Worker 的稳定 TaskClaim
+  function claim(owner) {
+    state.task.leaseEpoch += 1;
+    state.task.owner = owner;
+    state.task.status = state.task.status === 'ready' ? 'running' : state.task.status;
+    const value = { taskId:state.task.id, owner, leaseEpoch:state.task.leaseEpoch };
+    state.claims.push(value);
+    state.checkpoint = { present:true, cursor:'task:claimed', refs:[state.task.id] };
+    event('task.claimed', `${owner} 认领 ${state.task.id}，lease_epoch=${value.leaseEpoch}`);
+    show(`已由 ${owner} 认领`, 'ok', value);
+    return value;
+  }
+
+  // 校验 TaskClaim，拒绝过期 Worker 写入
+  function validClaim(value) {
+    const ok = value && value.taskId === state.task.id && value.owner === state.task.owner && value.leaseEpoch === state.task.leaseEpoch;
+    if (!ok) { state.rejectedSubmissions += 1; event('task.rejected', 'lease_lost：旧 TaskClaim 不能提交'); show('提交被拒绝：lease_lost', 'rejected', value); }
+    return ok;
+  }
+
+  // 持久化一个模型提出的 Tool Call
+  function createToolCall(kind='sync') {
+    const id = `tool-call-${state.toolRuns.length + 1}`;
+    const run = { id:`tool-run-${state.toolRuns.length + 1}`, toolCallId:id, kind, status:'pending', effectKey:'demo-external-write' };
+    state.task.toolCallId = id;
+    state.toolRuns.push(run);
+    event('tool.call.created', `${id} 已持久化，kind=${kind}`);
+    return run;
+  }
+
+  // 持久化 Tool Observation，副作用按逻辑身份只执行一次
+  function persistObservation(run, status='succeeded') {
+    const existing = state.observations.find(item => item.toolCallId === run.toolCallId);
+    if (existing) { run.status = 'succeeded'; state.task.observationId = existing.id; return existing; }
+    if (run.effectKey === 'demo-external-write') state.effects.externalWrite += 1;
+    run.status = status;
+    const observation = { id:`observation-${state.observations.length + 1}`, toolCallId:run.toolCallId, status, evidenceGain:state.task.evidenceGainNext, payload:'固定 Observation payload', source:'business_fact' };
+    state.observations.push(observation);
+    state.task.observationId = observation.id;
+    event('tool.observation.persisted', `${observation.id} 已提交，external_write=${state.effects.externalWrite}`);
+    return observation;
+  }
+
+  // 推进一次有限 Model Turn 或一个短同步 Tool Call
+  function advance(claimValue, options={}) {
+    if (!validClaim(claimValue)) return { status:'rejected', reason:'lease_lost' };
+    if (state.task.status === 'terminal') { show('Task 已是 terminal，不能再次推进', 'ok'); return { status:'terminal' }; }
+    if (state.task.waiting) { show('Task 正在 waiting，先完成异步 Tool', 'waiting', state.task.waiting); return { status:'waiting' }; }
+    if (state.task.phase === 'tool') {
+      const run = state.toolRuns.find(item => item.toolCallId === state.task.toolCallId);
+      if (!run) { show('Tool Run 不存在', 'rejected'); return { status:'rejected', reason:'tool_run_missing' }; }
+      if (run.kind === 'async' && run.status === 'pending') {
+        state.task.waiting = { taskId:state.task.id, waitRef:`tool-run:${run.id}` };
+        run.status = 'waiting';
+        state.task.phase = 'model';
+        event('task.waiting', `等待 ${run.id}，恢复只需 task_id=${state.task.id}`);
+        show('advance 返回 waiting：异步 Tool 尚未完成', 'waiting', { status:'waiting', taskId:state.task.id });
+        return { status:'waiting', taskId:state.task.id };
+      }
+      persistObservation(run);
+      state.task.phase = 'model';
+      show('advance 返回 runnable：Observation 已提交，下一次可消费', 'ok', { status:'runnable', observationId:state.task.observationId });
+      return { status:'runnable', observationId:state.task.observationId };
+    }
+    if (state.run.tokensUsed >= state.run.tokenLimit) { stopTask('run_token_budget_exhausted'); return { status:'terminal' }; }
+    if (state.task.turn >= state.task.turnLimit) { stopTask('turn_budget_exhausted'); return { status:'terminal' }; }
+    state.task.turn += 1;
+    state.run.tokensUsed += options.tokens || 12;
+    state.run.costUsed += options.cost || 1;
+    if (state.task.phase === 'model') {
+      if (!state.task.toolCallId) {
+        const run = createToolCall(options.kind || 'sync');
+        state.task.phase = 'tool';
+        event('task.turn.advanced', `Model Turn ${state.task.turn} 只提出 ${run.toolCallId}`);
+        show(`advance 返回 runnable：等待执行 ${run.toolCallId}`, 'ok', { status:'runnable', taskId:state.task.id });
+        return { status:'runnable', taskId:state.task.id };
+      }
+      const observation = state.observations.find(item => item.id === state.task.observationId);
+      if (!observation) { show('缺少 Observation，不能形成下一次 Model Turn', 'rejected'); return { status:'rejected', reason:'observation_missing' }; }
+      state.task.noGainStreak = observation.evidenceGain ? 0 : state.task.noGainStreak + 1;
+      if (state.task.noGainStreak >= state.task.noGainLimit) { stopTask('no_evidence_gain'); return { status:'terminal' }; }
+      state.task.phase = 'proposal';
+      event('task.turn.advanced', `Model Turn ${state.task.turn} 消费 ${observation.id} 并提出 Result Proposal`);
+      state.task.outcome = { id:`outcome-${state.outcomes.length + 1}`, taskId:state.task.id, status:'succeeded', sourceObservationId:observation.id, immutable:true };
+      state.outcomes.push(state.task.outcome);
+      state.task.status = 'terminal';
+      event('task.outcome.committed', `${state.task.outcome.id} 已提交，等待 Verification Barrier`);
+      show('advance 返回 terminal：Task Outcome 已提交', 'ok', { status:'terminal', outcomeId:state.task.outcome.id });
+      return { status:'terminal', outcomeId:state.task.outcome.id };
+    }
+    show('Task 已等待 Result Proposal', 'ok');
+    return { status:'terminal' };
+  }
+
+  // 让异步 Worker 只提交 Observation，不直接推进 Task
+  function completeAsync() {
+    const run = state.toolRuns.find(item => item.status === 'waiting');
+    if (!run) { show('没有等待中的异步 Tool', 'rejected'); return; }
+    persistObservation(run);
+    state.task.waiting = null;
+    event('tool.async.completed', `${run.id} 完成，Task 可按稳定 task_id 恢复`);
+    show('异步 Tool 已完成：现在可用同一 task_id 恢复', 'ok', { taskId:state.task.id, observationId:state.task.observationId });
+  }
+
+  // 将 Task 标记为不可继续并记录可解释停止原因
+  function stopTask(reason) {
+    state.task.status = 'terminal';
+    state.task.outcome = { id:`outcome-${state.outcomes.length + 1}`, taskId:state.task.id, status:'incomplete', stopReason:reason, immutable:true };
+    state.outcomes.push(state.task.outcome);
+    event('task.stopped', `${state.task.id} 因 ${reason} 停止`);
+    show(`Task 停止：${reason}`, 'waiting', state.task.outcome);
+  }
+
+  // 在所有 Task Outcome 已提交后形成一次 Verification Barrier
+  function barrier() {
+    state.verifier.barrierReady = state.outcomes.length > 0 && state.task.status === 'terminal';
+    if (state.verifier.barrierReady) { state.checkpoint = { present:true, cursor:'verifier:ready', refs:state.outcomes.map(item => item.id) }; event('verification.barrier.ready','当前计划阶段所有 Task Outcome 已提交'); }
+    show(state.verifier.barrierReady ? 'Verification Barrier 已形成' : 'Barrier 尚未满足：先提交 Task Outcome', state.verifier.barrierReady ? 'ok' : 'rejected');
+  }
+
+  // 根据最小覆盖规则返回唯一且幂等的 Verifier 路由
+  function verify() {
+    if (!state.verifier.barrierReady) { state.verifier.attempts += 1; show('Verifier 被拒绝：尚未到调度屏障', 'rejected'); return; }
+    if (state.verifier.decision) { show(`Verifier 幂等返回 ${state.verifier.decision}`, 'ok', { decision:state.verifier.decision, replay:true }); return; }
+    const input = state.verifier.input;
+    let decision;
+    if (input.coverage === 'covered' && !input.conflict && input.hasClaim) decision = 'complete';
+    else if ((input.coverage !== 'covered' || input.conflict) && state.run.replanCount < 4 && state.run.tokensUsed < state.run.tokenLimit) { decision = 'replan'; state.run.replanCount += 1; }
+    else if (input.hasClaim) decision = 'partial';
+    else decision = 'failed';
+    state.verifier.decision = decision;
+    state.verifier.decisionId = `stop-decision-${state.verifier.attempts + 1}`;
+    state.verifier.attempts += 1;
+    event('verifier.decision.committed', `${state.verifier.decisionId}=${decision}`);
+    show(`Verifier 已提交唯一裁决：${decision}`, 'ok', { decision, decisionId:state.verifier.decisionId });
+  }
+
+  // 丢失控制流 checkpoint 但保留业务事实
+  function loseCheckpoint() { state.checkpoint.present = false; event('checkpoint.lost','控制流 checkpoint 丢失，业务事实仍保留'); show('checkpoint 已丢失，Observation/Outcome 未丢失', 'waiting'); }
+
+  // 从业务事实重建游标，保证重放不再次执行副作用
+  function replay() {
+    state.replayCount += 1;
+    state.checkpoint = { present:true, cursor:state.task.status === 'terminal' ? 'task:terminal' : 'task:resume', refs:[...state.observations.map(item => item.id), ...state.outcomes.map(item => item.id)] };
+    event('checkpoint.replayed', `从 ${state.checkpoint.refs.length} 个稳定引用恢复控制流`);
+    show('checkpoint 已重放：业务事实和副作用计数未增加', 'ok', { replayCount:state.replayCount, effects:state.effects.externalWrite });
+  }
+
+  // 运行 happy path 并停在 Verifier 之前
+  function happyPath() { reset(); const c=claim('worker-a'); advance(c); advance(c); advance(c); barrier(); verify(); }
+
+  // 直接演示连续无证据增益触发停止
+  function forceNoGainStop() { reset(); claim('worker-a'); state.task.turn = 2; state.task.noGainStreak = state.task.noGainLimit; state.run.tokensUsed = 24; stopTask('no_evidence_gain'); }
+
+  // 运行一个指定的 Verifier 路由并展示幂等裁决
+  function runVerifierRoute(route) {
+    reset();
+    const c = claim('worker-a');
+    advance(c); advance(c); advance(c);
+    state.verifier.input = route === 'complete'
+      ? { coverage:'covered', conflict:false, hasClaim:true }
+      : route === 'replan'
+        ? { coverage:'missing', conflict:false, hasClaim:false }
+        : route === 'partial'
+          ? { coverage:'missing', conflict:false, hasClaim:true }
+          : { coverage:'missing', conflict:true, hasClaim:false };
+    barrier();
+    verify();
+    verify();
+  }
+
+  // 将页面按钮动作映射到原型操作
+  function action(name) {
+    if (name === 'reset') return reset();
+    if (name === 'happy') return happyPath();
+    if (name === 'claimA') return claim('worker-a');
+    if (name === 'claimB') return claim('worker-b');
+    if (name === 'advance') { const c=state.claims[state.claims.length - 1] || claim('worker-a'); return advance(c); }
+    if (name === 'asyncStart') { const c=state.claims[state.claims.length - 1] || claim('worker-a'); state.task.phase='model'; state.task.toolCallId=null; advance(c,{kind:'async'}); return advance(c); }
+    if (name === 'asyncComplete') return completeAsync();
+    if (name === 'crash') { if (!state.observations.length) { const c=state.claims[state.claims.length - 1] || claim('worker-a'); advance(c); advance(c); } loseCheckpoint(); return replay(); }
+    if (name === 'verify') return verify();
+    if (name === 'replay') return replay();
+  }
+
+  // 执行带状态复位的引导步骤
+  function step(name) {
+    if (name === 'happy1') { reset(); const c=claim('worker-a'); advance(c); return; }
+    if (name === 'happy2') { const c=state.claims.at(-1); advance(c); return; }
+    if (name === 'happy3') { const c=state.claims.at(-1); advance(c); return; }
+    if (name === 'happy4') { barrier(); verify(); return; }
+    if (name === 'async1') { reset(); const c=claim('worker-a'); advance(c,{kind:'async'}); advance(c); return; }
+    if (name === 'async2') return completeAsync();
+    if (name === 'async3') { const c=state.claims.at(-1); return advance(c); }
+    if (name === 'crash1') { reset(); const c=claim('worker-a'); advance(c); advance(c); return; }
+    if (name === 'crash2') return loseCheckpoint();
+    if (name === 'crash3') { replay(); const c=state.claims.at(-1); return advance(c); }
+    if (name === 'lease1') { reset(); return claim('worker-a'); }
+    if (name === 'lease2') return claim('worker-b');
+    if (name === 'lease3') { const old=state.claims.find(item=>item.owner==='worker-a'); return advance(old); }
+    if (name === 'budget1') return forceNoGainStop();
+    if (name === 'budget2') { reset(); const c=claim('worker-a'); state.task.turnLimit=2; advance(c); advance(c); return advance(c); }
+    if (name === 'budget3') { reset(); state.run.tokenLimit=20; const c=claim('worker-a'); advance(c); advance(c); return advance(c); }
+    if (name === 'verifier1') { state.verifier.input.coverage = state.verifier.input.coverage === 'covered' ? 'missing' : 'covered'; show(`Verifier coverage=${state.verifier.input.coverage}`); return; }
+    if (name === 'verifier2') return barrier();
+    if (name === 'verifier3') return verify();
+    if (name === 'routeComplete') return runVerifierRoute('complete');
+    if (name === 'routeReplan') return runVerifierRoute('replan');
+    if (name === 'routePartial') return runVerifierRoute('partial');
+    if (name === 'routeFailed') return runVerifierRoute('failed');
+    if (name === 'replay1') { reset(); const c=claim('worker-a'); advance(c); advance(c); return; }
+    if (name === 'replay2') return loseCheckpoint();
+    if (name === 'replay3') return replay();
+  }
+
+  // 绘制关键运行指标
+  function renderMetrics() {
+    const values = [
+      ['Run', state.run.status], ['Task', state.task.status], ['Turn', `${state.task.turn}/${state.task.turnLimit}`],
+      ['Token', `${state.run.tokensUsed}/${state.run.tokenLimit}`], ['副作用', state.effects.externalWrite], ['Verifier', state.verifier.decision || '未裁决']
+    ];
+    document.getElementById('metrics').innerHTML = values.map(([label,value]) => `<div class="metric"><b>${escapeHtml(value)}</b><span>${label}</span></div>`).join('');
+    const rows = [
+      ['task_id',state.task.id], ['lease_epoch',state.task.leaseEpoch], ['owner',state.task.owner || '无'], ['phase',state.task.phase],
+      ['waiting',state.task.waiting ? '是' : '否'], ['observation_id',state.task.observationId || '无'], ['outcome_id',state.task.outcome?.id || '无'],
+      ['checkpoint',state.checkpoint.present ? state.checkpoint.cursor : '丢失'], ['barrier',state.verifier.barrierReady ? 'ready' : '未就绪'], ['重放次数',state.replayCount]
+    ];
+    document.getElementById('stateList').innerHTML = rows.map(([label,value]) => `<div><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join('');
+  }
+
+  // 绘制业务事实、事件和完整状态
+  function render() {
+    renderMetrics();
+    const last = state.last || { message:'尚未执行操作', status:'ok', data:null };
+    const result = document.getElementById('lastResult');
+    result.className = `result ${last.status === 'rejected' ? 'bad' : last.status === 'ok' ? 'good' : ''}`;
+    result.textContent = `${last.message}\n${last.data ? JSON.stringify(last.data,null,2) : ''}`;
+    const facts = [
+      ...state.toolRuns.map(item => ['Tool Run',item.id,`${item.status} / ${item.toolCallId}`]),
+      ...state.observations.map(item => ['Observation',item.id,`${item.status} / evidence_gain=${item.evidenceGain}`]),
+      ...state.outcomes.map(item => ['Task Outcome',item.id,`${item.status} / ${item.stopReason || 'success'}`]),
+      ...(state.verifier.decision ? [['Stop Decision',state.verifier.decisionId,state.verifier.decision]] : [])
+    ];
+    document.getElementById('factsTable').innerHTML = facts.length ? facts.map(row => `<tr>${row.map(value=>`<td>${escapeHtml(value)}</td>`).join('')}</tr>`).join('') : '<tr><td colspan="3">尚无已提交事实</td></tr>';
+    document.getElementById('events').innerHTML = state.events.slice().reverse().map(item => `<div class="event"><b>#${item.sequence} ${escapeHtml(item.type)}</b><br>${escapeHtml(item.detail)}</div>`).join('') || '<p>尚无事件</p>';
+    document.getElementById('fullState').textContent = JSON.stringify(state,null,2);
+  }
+
+  // 转义页面展示值，避免原型输入破坏界面
+  function escapeHtml(value) { return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }
+
+  document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => action(button.dataset.action)));
+  document.querySelectorAll('[data-step]').forEach(button => button.addEventListener('click', () => step(button.dataset.step)));
+  document.querySelectorAll('[data-tab]').forEach(button => button.addEventListener('click', () => {
+    document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === button));
+    document.querySelectorAll('.scenario').forEach(item => item.classList.toggle('active', item.id === `scenario-${button.dataset.tab}`));
+  }));
+  render();
+</script>
+</body>
+</html>

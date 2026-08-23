@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Q7 Research File Space 原型</title>
+  <style>
+    :root { --ink:#17212b; --muted:#607080; --line:#d8e0e8; --paper:#f7f9fb; --panel:#fff; --accent:#0b7285; --good:#237a57; --warn:#a35b00; --bad:#a33a3a; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font:15px/1.55 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:1180px; margin:0 auto; padding:36px 22px 64px; }
+    h1 { margin:0 0 8px; font-size:30px; letter-spacing:0; }
+    h2 { margin:0 0 14px; font-size:20px; letter-spacing:0; }
+    h3 { margin:0 0 8px; font-size:16px; }
+    p { margin:8px 0; }
+    .eyebrow { color:var(--accent); font-weight:700; font-size:12px; letter-spacing:.08em; text-transform:uppercase; }
+    .intro { border-left:4px solid var(--accent); padding:4px 0 4px 16px; margin:18px 0 26px; }
+    .notice { background:#fff8e8; border:1px solid #ecd8a8; padding:12px 14px; margin:14px 0 24px; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; margin-top:18px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:18px; }
+    .wide { grid-column:1/-1; }
+    .state { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+    .metric { background:#f1f5f7; padding:10px 12px; border-radius:5px; }
+    .metric b { display:block; font-size:22px; line-height:1.2; }
+    .metric span { color:var(--muted); font-size:12px; }
+    button, select { font:inherit; }
+    button { border:1px solid #9fb4bd; border-radius:5px; background:#fff; color:var(--ink); padding:8px 11px; cursor:pointer; }
+    button:hover { border-color:var(--accent); color:var(--accent); }
+    button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    button.danger { color:var(--bad); border-color:#d9aaaa; }
+    .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+    .tabs { display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:14px; }
+    .tab.active { background:#e5f2f4; border-color:#8fc2c9; color:#075766; }
+    .scenario { display:none; }
+    .scenario.active { display:block; }
+    .step { display:flex; justify-content:space-between; gap:12px; align-items:center; border-top:1px solid #edf0f2; padding:10px 0; }
+    .step small { color:var(--muted); }
+    .result { margin-top:12px; background:#101820; color:#e5eef2; border-radius:5px; padding:12px; max-height:320px; overflow:auto; white-space:pre-wrap; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .result.good { border-left:4px solid #63c493; }
+    .result.bad { border-left:4px solid #df7777; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { border-bottom:1px solid var(--line); padding:8px 6px; text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-weight:600; }
+    .scroll { overflow:auto; max-height:490px; }
+    .tag { display:inline-block; padding:2px 7px; border-radius:10px; font-size:11px; background:#edf2f5; color:#4f6570; }
+    .tag.good { background:#e5f3ec; color:var(--good); }
+    .tag.bad { background:#f9eaea; color:var(--bad); }
+    .tag.warn { background:#fff1d6; color:var(--warn); }
+    .toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin-bottom:12px; }
+    label { color:var(--muted); font-size:13px; }
+    select { border:1px solid var(--line); border-radius:5px; background:#fff; padding:8px; }
+    code { background:#edf2f5; padding:1px 4px; border-radius:3px; }
+    @media (max-width:760px) { .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } .state { grid-template-columns:repeat(2,minmax(0,1fr)); } .step { align-items:flex-start; flex-direction:column; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">一次性逻辑原型 · Issue #15 · Q7</div>
+  <h1>Research File Space：结构化 Tool 是否足够</h1>
+  <div class="intro">
+    <p>本 demo 验证一个具体问题：模型能否在概念、精确 token 和混合问题中正确选择 <code>file_search</code>、<code>file_grep</code>、<code>file_read</code>，并依靠固定 Revision/hash/locator 完成可复现取证，而不需要 raw shell 或 mini pipe DSL</p>
+  </div>
+  <div class="notice"><b>证据边界：</b>页面使用固定 fixture corpus 和两个 deterministic fake planner。A/B/C 数值是可重复的接口仿真，不是实际 provider/model 结果；live provider、真实性能和多租户安全验证仍未完成</div>
+
+  <section class="panel">
+    <h2>当前状态</h2>
+    <div class="state" id="state"></div>
+    <div class="result" id="lastObservation">还没有 Tool Observation。先运行一个场景或点击自由操作</div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>自由操作</h2>
+      <p>这些按钮直接调用结构化 Tool。每次操作都会展示完整 Observation，包括稳定身份、定位和边界结果</p>
+      <div class="buttons">
+        <button class="primary" data-action="searchConcept">语义找“恢复与版本”</button>
+        <button data-action="grepExact">精确查 ERR-427</button>
+        <button data-action="readWindow">读取固定行窗口</button>
+        <button data-action="readTail">读取长文件尾部</button>
+        <button data-action="listMarkdown">列出 Markdown 来源</button>
+        <button class="danger" data-action="unsafePath">尝试路径穿越</button>
+        <button class="danger" data-action="readBinary">尝试读取二进制</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>引导场景</h2>
+      <div class="tabs">
+        <button class="tab active" data-tab="mixed">混合取证</button>
+        <button class="tab" data-tab="truncate">截断恢复</button>
+        <button class="tab" data-tab="revision">Revision 不变性</button>
+        <button class="tab" data-tab="security">安全拒绝</button>
+      </div>
+      <div class="scenario active" id="scenario-mixed">
+        <p><b>问题：</b>先找到“恢复队列”，再核对精确错误码和行上下文。观察语义导航和精确证据如何组合</p>
+        <div class="step"><span>1. 语义搜索“恢复队列错误处理”</span><button data-step="mixed1">执行</button></div>
+        <div class="step"><span>2. 在候选 Revision 上 grep <code>ERR-427</code></span><button data-step="mixed2">执行</button></div>
+        <div class="step"><span>3. 读取命中行，形成 Evidence Span</span><button data-step="mixed3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-truncate">
+        <p><b>问题：</b>长日志超过单次 Observation 限额时，模型能否用 cursor 继续读取而不丢命中</p>
+        <div class="step"><span>1. 对长文件 grep，限制返回 2 个 match</span><button data-step="truncate1">执行</button></div>
+        <div class="step"><span>2. 使用 next cursor 继续 grep</span><button data-step="truncate2">执行</button></div>
+        <div class="step"><span>3. 按固定 Revision 读取最终证据</span><button data-step="truncate3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-revision">
+        <p><b>问题：</b>路径会变化，但 Revision/hash/locator 不能变化。观察 rename 后引用仍能解析</p>
+        <div class="step"><span>1. 读取 <code>rev-runbook-1</code> 的固定窗口</span><button data-step="revision1">执行</button></div>
+        <div class="step"><span>2. 模拟路径从 <code>/sources/runbook/errors.md</code> 改名</span><button data-step="revision2">执行</button></div>
+        <div class="step"><span>3. 用同一 Revision 再读并比对 hash/locator</span><button data-step="revision3">执行</button></div>
+      </div>
+      <div class="scenario" id="scenario-security">
+        <p><b>问题：</b>业务 scope 不是授权。越权、二进制强制文本和 mutation 尝试都应 fail closed</p>
+        <div class="step"><span>1. 读取 <code>../secrets.txt</code></span><button data-step="security1">执行</button></div>
+        <div class="step"><span>2. 用 <code>--text</code> 思路读取二进制</span><button data-step="security2">执行</button></div>
+        <div class="step"><span>3. 尝试写入 <code>/sources</code></span><button data-step="security3">执行</button></div>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <h2>A/B/C 实验</h2>
+      <div class="toolbar">
+        <label for="model">deterministic fake planner</label>
+        <select id="model"><option value="alpha">Alpha：schema 遵循较强</option><option value="beta">Beta：更偏好熟悉的搜索</option></select>
+        <button class="primary" id="runExperiment">运行 24 个任务</button>
+        <button id="clearExperiment">清空结果</button>
+      </div>
+      <p>A：仅混合检索；B：混合检索 + 结构化 list/grep/read；C：只读 raw shell 评估上界。每组使用同一 24 题 corpus 和同一安全边界</p>
+      <div id="experimentSummary"><p>尚未运行实验</p></div>
+      <div class="scroll"><table id="taskTable"><thead><tr><th>任务</th><th>题型</th><th>首个 Tool</th><th>证据 locator</th><th>恢复/无效调用</th><th>分类</th></tr></thead><tbody></tbody></table></div>
+    </section>
+
+    <section class="panel wide">
+      <h2>Fixture corpus 与接口观察</h2>
+      <p>corpus 覆盖纯文本、长行、Unicode 路径、重复文件名、二进制、撤销 Revision、mutable work，以及 <code>/sources</code>、<code>/work</code>、<code>/artifacts</code> 的权限差异</p>
+      <div class="scroll"><table><thead><tr><th>Revision</th><th>逻辑路径</th><th>scope</th><th>media</th><th>hash</th><th>状态</th></tr></thead><tbody id="fixtureTable"></tbody></table></div>
+    </section>
+  </div>
+</main>
+<script>
+  // 创建固定语料、Revision 和稳定哈希
+  const corpus = [
+    {revisionId:'rev-space-1', path:'/sources/research/file-space.md', scope:'sources', media:'text/markdown', hash:'sha256:1111111111111111111111111111111111111111111111111111111111111111', text:'Research File Space 需要统一的研究文件视图\n文件空间与版本定位必须保留稳定证据\n结构化 Tool 通过固定 Revision 保留可复现定位\n恢复时使用 cursor 继续读取截断 Observation\n来源文件是只读的，发布产物进入 artifacts\n不可变内容用于恢复和审计'},
+    {revisionId:'rev-runbook-1', path:'/sources/runbook/errors.md', scope:'sources', media:'text/markdown', hash:'sha256:2222222222222222222222222222222222222222222222222222222222222222', text:'恢复队列遇到暂时性失败时应保留 attempt\n错误处理：错误码 ERR-427 表示 revision manifest 过期\n处理日期为 2026-08-17\n读取固定 Revision 后再重试'},
+    {revisionId:'rev-unicode-1', path:'/sources/笔记/恢复策略.md', scope:'sources', media:'text/markdown', hash:'sha256:3333333333333333333333333333333333333333333333333333333333333333', text:'恢复策略需要记录不可变版本\n路径包含 Unicode 也必须返回稳定 locator\n不要把宿主路径当成文件身份\nUnicode 路径的版本定位仍然固定'},
+    {revisionId:'rev-long-1', path:'/sources/logs/long.log', scope:'sources', media:'text/plain', hash:'sha256:4444444444444444444444444444444444444444444444444444444444444444', text:['长日志用于验证截断恢复和版本定位',...Array.from({length:12},(_,i)=>`attempt ${i+1} status=${[3,7,11].includes(i)?'ERR-427':'ok'} cursor=${i+1}；固定 Revision rev-long-1`)].join('\n')},
+    {revisionId:'rev-duplicate-1', path:'/sources/archive/report.md', scope:'sources', media:'text/markdown', hash:'sha256:5555555555555555555555555555555555555555555555555555555555555555', text:'归档报告：旧版本仅用于对照'},
+    {revisionId:'rev-duplicate-2', path:'/artifacts/report.md', scope:'artifacts', media:'text/markdown', hash:'sha256:6666666666666666666666666666666666666666666666666666666666666666', text:'发布产物：正式产物由 work revision 发布并保留 provenance'},
+    {revisionId:'rev-binary-1', path:'/sources/data/archive.bin', scope:'sources', media:'application/octet-stream', hash:'sha256:7777777777777777777777777777777777777777777777777777777777777777', text:'\u0000\u0001binary'},
+    {revisionId:'rev-revoked-1', path:'/sources/revoked/old.md', scope:'sources', media:'text/markdown', hash:'sha256:8888888888888888888888888888888888888888888888888888888888888888', text:'已撤销来源，不应进入检索结果', revoked:true},
+    {revisionId:'rev-work-1', path:'/work/tasks/q7/scratch.md', scope:'work', media:'text/markdown', hash:'sha256:9999999999999999999999999999999999999999999999999999999999999999', text:'mutable scratch：只属于当前 Task，不进入长期 file_search\n精确恢复游标为 cursor=4'}
+  ];
+  corpus.unshift(...Array.from({length:24},(_,i)=>({revisionId:`rev-noise-${String(i).padStart(2,'0')}`,path:`/sources/noise/decoy-${String(i).padStart(2,'0')}.txt`,scope:'sources',media:'text/plain',hash:`sha256:${String(i+10).padStart(64,'0')}`,text:`索引噪声样本 ${String(i).padStart(2,'0')}，不是目标运行手册\nERR-427 2026-08-17 revision manifest cursor=4`})));
+  const taskState = {last:null, observations:0, rejected:0, scenarioStep:{}};
+  const synonyms = {恢复:['恢复','重试','继续','recovery','resume'], 版本:['版本','Revision','不可变','hash'], 错误:['错误','失败','error','ERR'], 队列:['队列','queued','queue']};
+
+  // 返回业务 scope 可见且未撤销的 Revision
+  function visibleFiles(scope='sources') { return corpus.filter(f => f.scope===scope && !f.revoked && f.media.startsWith('text/')); }
+  // 校验模型提交的逻辑路径，拒绝宿主路径和穿越
+  function validatePath(path) { if (path.includes('..') || path.includes('\0')) return {ok:false, error:'path_traversal_denied'}; return {ok:true}; }
+  // 生成带有完整稳定身份的 Tool Observation
+  function observe(tool, input, output, extra={}) { taskState.observations++; if(extra.status==='rejected') taskState.rejected++; const result={observationId:`obs-${String(taskState.observations).padStart(3,'0')}`, tool, input, output, ...extra}; taskState.last=result; render(); return result; }
+  // 返回结构化文件列表，cursor 只代表本次有界分页
+  function fileList({scope='sources', prefix='', glob='', limit=20, cursor=0}={}) { const pathCheck=validatePath(prefix); if(!pathCheck.ok) return observe('file_list',{scope,prefix,glob,limit,cursor},null,{status:'rejected',error:pathCheck.error,truncated:false,next_cursor:null,continuation_required:false}); let files=visibleFiles(scope).filter(f=>f.path.startsWith('/'+prefix.replace(/^\//,''))).filter(f=>!glob || glob==='**/*.md' && f.path.endsWith('.md')); const page=files.slice(Number(cursor),Number(cursor)+limit); const truncated=Number(cursor)+limit<files.length; return observe('file_list',{scope,prefix,glob,limit,cursor},page.map(f=>({entryId:`entry-${f.revisionId}`,revisionId:f.revisionId,path:f.path,media:f.media,size:f.text.length,hash:f.hash})),{status:'ok',truncated,next_cursor:truncated?Number(cursor)+limit:null,continuation_required:truncated}); }
+  // 在固定 Revision 上执行有界 literal 或默认 regex grep
+  function fileGrep({scope='sources', pattern, mode='literal', caseSensitive=false, before=0, after=0, limit=20, cursor=0, revisionIds}={}) { if(!pattern) return observe('file_grep',{pattern},null,{status:'rejected',error:'empty_pattern',truncated:false,next_cursor:null,continuation_required:false}); let files=(revisionIds?corpus.filter(f=>revisionIds.includes(f.revisionId)):visibleFiles(scope)); if(revisionIds&&(files.length!==new Set(revisionIds).size||files.some(f=>f.revoked))) return observe('file_grep',{pattern,revisionIds},null,{status:'rejected',error:'revision_not_found',truncated:false,next_cursor:null,continuation_required:false}); if(files.some(f=>f.media==='application/octet-stream')) return observe('file_grep',{pattern},null,{status:'rejected',error:'unsupported_media_type',truncated:false,next_cursor:null,continuation_required:false}); let re; try { const flags=caseSensitive?'g':'gi'; re=mode==='literal'?new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),flags):new RegExp(pattern,flags); } catch { return observe('file_grep',{pattern,mode},null,{status:'rejected',error:'invalid_regex',truncated:false,next_cursor:null,continuation_required:false}); } const matches=[]; files.forEach(f=>{ const lines=f.text.split('\n'); lines.forEach((line,i)=>{ if(re.test(line)){ const from=Math.max(0,i-before),to=Math.min(lines.length,i+after+1); matches.push({revisionId:f.revisionId,hash:f.hash,path:f.path,line:i+1,byteStart:lines.slice(0,i).join('\n').length+i,preview:lines.slice(from,to).join('\n')}); re.lastIndex=0; }}); }); const page=matches.slice(Number(cursor),Number(cursor)+limit); const truncated=Number(cursor)+limit<matches.length; return observe('file_grep',{scope,pattern,mode,caseSensitive,before,after,limit,cursor,revisionIds},page,{status:'ok',truncated,next_cursor:truncated?Number(cursor)+limit:null,continuation_required:truncated}); }
+  // 按固定 Revision 返回行窗口或尾部，输出 line/byte locator
+  function fileRead({revisionId,startLine=1,lineCount=5,tailLines,cursor}={}) { const f=corpus.find(x=>x.revisionId===revisionId); if(!f||f.revoked) return observe('file_read',{revisionId},null,{status:'rejected',error:'revision_not_found',truncated:false,next_cursor:null,continuation_required:false}); if(!f.media.startsWith('text/')) return observe('file_read',{revisionId},null,{status:'rejected',error:'unsupported_media_type',truncated:false,next_cursor:null,continuation_required:false}); const lines=f.text.split('\n'); const paginated=cursor!==undefined||(startLine===1&&tailLines===undefined); let start=tailLines?Math.max(0,lines.length-tailLines):cursor!==undefined?Number(cursor):Math.max(0,startLine-1); let count=tailLines||lineCount; const selected=lines.slice(start,start+count); const truncated=paginated&&start+count<lines.length; const output={revisionId:f.revisionId,path:f.path,hash:f.hash,lines:selected.map((text,i)=>({line:start+i+1,byteStart:lines.slice(0,start+i).join('\n').length+(start+i),text}))}; return observe('file_read',{revisionId,startLine,lineCount,tailLines,cursor},output,{status:'ok',truncated,next_cursor:truncated?start+count:null,continuation_required:truncated}); }
+  // 以同义词打分模拟 ACL 前置的 FTS/vector/RRF 导航
+  function fileSearch(query,{topK=5}={}) { const q=query.toLowerCase(); const scored=[...visibleFiles('sources'),...visibleFiles('artifacts')].map(f=>{ let score=0; Object.values(synonyms).flat().forEach(word=>{if(q.includes(word.toLowerCase())&&f.text.toLowerCase().includes(word.toLowerCase())) score+=2;}); q.split(/\s+/).forEach(word=>{if(word.length>1&&f.text.toLowerCase().includes(word)) score+=1;}); return {f,score}; }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,topK).map(x=>({revisionId:x.f.revisionId,hash:x.f.hash,path:x.f.path,chunkLocator:{startLine:1,endLine:Math.min(3,x.f.text.split('\n').length)},score:x.score,receipt:'fts+vector+rrf+rerank(fake)'})); return observe('file_search',{query,topK},scored,{status:'ok',truncated:false,next_cursor:null,continuation_required:false}); }
+  // 模拟只读 raw shell 上界，结果只用于对照，不暴露为候选生产接口
+  function rawShell(query) { const hits=corpus.filter(f=>!f.revoked&&f.media.startsWith('text/')).flatMap(f=>f.text.split('\n').map((line,i)=>line.toLowerCase().includes(query.toLowerCase())?{revisionId:f.revisionId,path:f.path,line:i+1,text:line}:null).filter(Boolean)); return {tool:'raw_shell_upper_bound',hits}; }
+  // 运行一次自由操作并刷新页面状态
+  function runAction(action) { if(action==='searchConcept') return fileSearch('恢复与版本'); if(action==='grepExact') return fileGrep({pattern:'ERR-427',before:1,after:1}); if(action==='readWindow') return fileRead({revisionId:'rev-runbook-1',startLine:2,lineCount:2}); if(action==='readTail') return fileRead({revisionId:'rev-long-1',tailLines:3}); if(action==='listMarkdown') return fileList({scope:'sources',glob:'**/*.md'}); if(action==='unsafePath') return fileList({scope:'sources',prefix:'../secrets'}); if(action==='readBinary') return fileRead({revisionId:'rev-binary-1'}); }
+  const taskTypes=['exact','concept','mixed'];
+  // 生成固定的 24 个实验任务和可验证的目标 Revision
+  function buildTasks() { const exact=[['ERR-427','恢复队列运行手册','rev-runbook-1'],['2026-08-17','恢复队列运行手册','rev-runbook-1'],['revision manifest','恢复队列运行手册','rev-runbook-1'],['cursor=4','当前 Task 的 mutable work scratch','rev-work-1'],['ERR-427','长日志中的错误记录','rev-long-1'],['不可变版本','Unicode 恢复策略','rev-unicode-1'],['稳定 locator','Unicode 恢复策略','rev-unicode-1'],['provenance','正式发布产物','rev-duplicate-2']].map((x,i)=>({id:`E${i+1}`,type:'exact',query:x[0],context:x[1],target:x[2]})); const concept=['恢复策略','版本定位','错误处理','文件空间','Unicode 路径','不可变内容','恢复队列','发布产物'].map((q,i)=>({id:`C${i+1}`,type:'concept',query:q,target:['rev-unicode-1','rev-space-1','rev-runbook-1','rev-space-1','rev-unicode-1','rev-space-1','rev-runbook-1','rev-duplicate-2'][i]})); const mixed=[['恢复队列','ERR-427','恢复队列运行手册','rev-runbook-1'],['文件空间','不可变','Research File Space 说明','rev-space-1'],['Unicode','稳定 locator','Unicode 恢复策略','rev-unicode-1'],['长日志','ERR-427','长日志中的错误记录','rev-long-1'],['发布','provenance','正式发布产物','rev-duplicate-2'],['恢复策略','版本','Unicode 恢复策略','rev-unicode-1'],['错误处理','2026-08-17','恢复队列运行手册','rev-runbook-1'],['版本定位','cursor=4','长日志中的版本定位','rev-long-1']].map((x,i)=>({id:`M${i+1}`,type:'mixed',query:x[0],exact:x[1],context:x[2],target:x[3]})); return [...exact,...concept,...mixed]; }
+  // 模拟两个模型在 A/B/C 组的 Tool 规划并执行可观察链路
+  function runTask(task,group,model) { let firstTool, calls=[], invalid=0, recovered=0, locator=false; if(group==='C'){ firstTool='raw_shell'; const hit=rawShell(task.exact||task.query).hits.find(h=>h.revisionId===task.target); locator=!!hit; calls=['raw_shell']; return {task,group,model,firstTool,calls,invalid,recovered,locator,bytes:JSON.stringify(hit||{}).length}; } if(group==='A'){ firstTool='file_search'; const nav=fileSearch(task.query); calls.push('file_search'); const candidate=nav.output.some(x=>x.revisionId===task.target); if(task.type==='exact'){ locator=false; } else if(task.type==='mixed'){ const exactHit=nav.output.find(x=>x.revisionId===task.target); locator=!!exactHit && !!fileRead({revisionId:task.target,startLine:1,lineCount:3}).output; calls.push('file_read'); } else { locator=candidate && !!fileRead({revisionId:task.target,startLine:1,lineCount:3}).output; calls.push('file_read'); } return {task,group,model,firstTool,calls,invalid,recovered,locator,bytes:180+calls.length*80}; }
+    firstTool=task.type==='concept'?'file_search':task.type==='exact'?'file_grep':'file_search'; if(model==='beta'&&task.type==='exact'&&task.id==='E3'){ firstTool='file_search'; invalid=1; } if(task.type==='concept'){ const nav=fileSearch(task.query); calls.push('file_search'); locator=nav.output.some(x=>x.revisionId===task.target); if(locator) { fileRead({revisionId:task.target,startLine:1,lineCount:3}); calls.push('file_read'); } } else if(task.type==='exact'){ const grep=fileGrep({pattern:task.query,revisionIds:[task.target],before:1,after:1,limit:2}); calls.push('file_grep'); const hit=grep.output&&grep.output.find(x=>x.revisionId===task.target); if(hit){ fileRead({revisionId:task.target,startLine:hit.line,lineCount:1}); calls.push('file_read'); locator=true; } } else { const nav=fileSearch(task.query); calls.push('file_search'); const candidate=nav.output.find(x=>x.revisionId===task.target); if(candidate){ const grep=fileGrep({pattern:task.exact,revisionIds:[task.target],before:1,after:1}); calls.push('file_grep'); const hit=grep.output&&grep.output.find(x=>x.revisionId===task.target); if(hit){ fileRead({revisionId:task.target,startLine:hit.line,lineCount:1}); calls.push('file_read'); locator=true; } else { recovered=1; } } } return {task,group,model,firstTool,calls,invalid,recovered,locator,bytes:220+calls.length*100}; }
+  // 汇总三组实验指标并渲染逐任务结果
+  function runExperiment() { const model=document.getElementById('model').value; const tasks=buildTasks(); const rows=[]; ['A','B','C'].forEach(group=>tasks.forEach(task=>rows.push(group==='B'?runTask(task,group,model):runTask(task,group,model)))); const summary=['A','B','C'].map(group=>{ const rs=rows.filter(r=>r.group===group); const byType=type=>{const t=rs.filter(r=>r.task.type===type);return Math.round(t.filter(r=>r.locator).length/t.length*100)}; return {group,overall:Math.round(rs.filter(r=>r.locator).length/rs.length*100),exact:byType('exact'),concept:byType('concept'),mixed:byType('mixed'),invalid:rs.reduce((n,r)=>n+r.invalid,0),bytes:rs.reduce((n,r)=>n+r.bytes,0)}; }); const b=summary.find(x=>x.group==='B'),a=summary.find(x=>x.group==='A'); document.getElementById('experimentSummary').innerHTML=`<table><thead><tr><th>组</th><th>总体 locator</th><th>精确</th><th>概念</th><th>混合</th><th>无效调用</th><th>Observation bytes</th></tr></thead><tbody>${summary.map(s=>`<tr><td><b>${s.group}</b></td><td>${s.overall}%</td><td>${s.exact}%</td><td>${s.concept}%</td><td>${s.mixed}%</td><td>${s.invalid}</td><td>${s.bytes}</td></tr>`).join('')}</tbody></table><p><span class="tag ${b.exact>=90&&b.mixed>=90?'good':'warn'}">B 精确/混合建议门槛：${b.exact>=90&&b.mixed>=90?'达到':'未达到'}</span> <span class="tag ${b.concept>=a.concept-5?'good':'warn'}">B 概念相对 A：${b.concept-a.concept} 个百分点</span> <span class="tag warn">真实 provider：未验证</span></p>`; document.querySelector('#taskTable tbody').innerHTML=rows.filter(r=>r.group==='B').map(r=>`<tr><td>${r.task.id}</td><td>${r.task.type}</td><td><code>${r.firstTool}</code></td><td><span class="tag ${r.locator?'good':'bad'}">${r.locator?'成功':'失败'}</span></td><td>${r.recovered?'cursor 恢复':'无'} / ${r.invalid}</td><td>${r.locator?'可复现':'需调整 schema 或 planner'}</td></tr>`).join(''); }
+  // 渲染当前状态、最近 Observation 和 fixture 清单
+  function render() { const last=taskState.last; document.getElementById('state').innerHTML=`<div class="metric"><b>${taskState.observations}</b><span>Observation 次数</span></div><div class="metric"><b>${taskState.rejected}</b><span>安全拒绝</span></div><div class="metric"><b>${last?last.tool:'-'}</b><span>最近 Tool</span></div><div class="metric"><b>${last?.status||last?.output?'已返回':'待操作'}</b><span>状态</span></div>`; if(last){ const ok=last.status==='ok'; document.getElementById('lastObservation').className=`result ${ok?'good':'bad'}`; document.getElementById('lastObservation').textContent=JSON.stringify(last,null,2); } document.getElementById('fixtureTable').innerHTML=corpus.map(f=>`<tr><td><code>${f.revisionId}</code></td><td>${f.path}</td><td>${f.scope}</td><td>${f.media}</td><td><code>${f.hash.slice(0,18)}…</code></td><td><span class="tag ${f.revoked?'bad':f.scope==='work'?'warn':'good'}">${f.revoked?'revoked':f.scope==='work'?'mutable':'可读'}</span></td></tr>`).join(''); }
+  document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>runAction(b.dataset.action)));
+  document.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); document.querySelectorAll('.scenario').forEach(x=>x.classList.remove('active')); b.classList.add('active'); document.getElementById(`scenario-${b.dataset.tab}`).classList.add('active');}));
+  document.querySelectorAll('[data-step]').forEach(b=>b.addEventListener('click',()=>{ const s=b.dataset.step; if(s==='mixed1') fileSearch('恢复队列错误处理'); if(s==='mixed2') fileGrep({pattern:'ERR-427',revisionIds:['rev-runbook-1'],before:1,after:1}); if(s==='mixed3') fileRead({revisionId:'rev-runbook-1',startLine:2,lineCount:2}); if(s==='truncate1') fileGrep({pattern:'ERR-427',revisionIds:['rev-long-1'],limit:2}); if(s==='truncate2') fileGrep({pattern:'ERR-427',revisionIds:['rev-long-1'],limit:2,cursor:2}); if(s==='truncate3') fileRead({revisionId:'rev-long-1',startLine:4,lineCount:1}); if(s==='revision1') fileRead({revisionId:'rev-runbook-1',startLine:2,lineCount:1}); if(s==='revision2') { const f=corpus.find(x=>x.revisionId==='rev-runbook-1'); f.path='/sources/runbook/renamed-errors.md'; observe('namespace_rename_simulation',{revisionId:f.revisionId},{revisionId:f.revisionId,hash:f.hash,path:f.path},{status:'ok'}); } if(s==='revision3') fileRead({revisionId:'rev-runbook-1',startLine:2,lineCount:1}); if(s==='security1') fileList({scope:'sources',prefix:'../secrets'}); if(s==='security2') fileRead({revisionId:'rev-binary-1'}); if(s==='security3') observe('file_write',{path:'/sources/runbook/errors.md'},{message:'writes are only allowed under current Task /work'},{status:'rejected',error:'read_only_source'}); }));
+  document.getElementById('runExperiment').addEventListener('click',runExperiment); document.getElementById('clearExperiment').addEventListener('click',()=>{document.getElementById('experimentSummary').innerHTML='<p>尚未运行实验</p>';document.querySelector('#taskTable tbody').innerHTML='';});
+  render();
+</script>
+</body>
+</html>
