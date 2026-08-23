@@ -290,6 +290,87 @@ class TaskOutcome(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class TaskModelTurn(Base):
+    """保存一次有界 Model Turn 的规范化输出或失败事实"""
+
+    __tablename__ = "task_model_turns"
+    __table_args__ = (UniqueConstraint("task_id", "turn_ordinal"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    fencing_epoch: Mapped[int] = mapped_column(Integer)
+    turn_ordinal: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="committed")
+    output_kind: Mapped[str] = mapped_column(String(32))
+    output: Mapped[dict[str, object] | None] = mapped_column(JSON, default=None)
+    usage: Mapped[dict[str, int | float] | None] = mapped_column(JSON, default=None)
+    provider_reference: Mapped[str | None] = mapped_column(String(500), default=None)
+    failure_reason: Mapped[str | None] = mapped_column(String(200), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TaskObservation(Base):
+    """保存 Tool Call 的有界、可恢复观察结果"""
+
+    __tablename__ = "task_observations"
+    __table_args__ = (UniqueConstraint("task_id", "observation_ref"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[UUID] = mapped_column(
+        ForeignKey("task_model_turns.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    observation_ref: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(32))
+    result_reference: Mapped[str | None] = mapped_column(String(1000), default=None)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    evidence_gain: Mapped[bool] = mapped_column(Boolean, default=False)
+    failure_ref: Mapped[str | None] = mapped_column(String(1000), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TaskResultProposalRecord(Base):
+    """保存模型的结果提案，直到 Controller 形成确定性 Task Outcome"""
+
+    __tablename__ = "task_result_proposals"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[UUID] = mapped_column(
+        ForeignKey("task_model_turns.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    result_reference: Mapped[str | None] = mapped_column(String(1000), default=None)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    covered_criteria: Mapped[list[str]] = mapped_column(JSON, default=list)
+    valid: Mapped[bool] = mapped_column(Boolean, default=False)
+    rejection_reason: Mapped[str | None] = mapped_column(String(200), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 @event.listens_for(ResearchPlan, "before_update")
 @event.listens_for(ResearchPlan, "before_delete")
 def reject_research_plan_mutation(_mapper: object, _connection: object, _target: object) -> None:
@@ -302,6 +383,33 @@ def reject_research_plan_mutation(_mapper: object, _connection: object, _target:
 def reject_task_outcome_mutation(_mapper: object, _connection: object, _target: object) -> None:
     """Task outcomes are append-only business facts."""
     raise ValueError("TaskOutcome is immutable")
+
+
+@event.listens_for(TaskModelTurn, "before_update")
+@event.listens_for(TaskModelTurn, "before_delete")
+def reject_task_model_turn_mutation(
+    _mapper: object, _connection: object, _target: object
+) -> None:
+    """Model Turns are append-only business facts."""
+    raise ValueError("TaskModelTurn is immutable")
+
+
+@event.listens_for(TaskObservation, "before_update")
+@event.listens_for(TaskObservation, "before_delete")
+def reject_task_observation_mutation(
+    _mapper: object, _connection: object, _target: object
+) -> None:
+    """Tool Observations are append-only business facts."""
+    raise ValueError("TaskObservation is immutable")
+
+
+@event.listens_for(TaskResultProposalRecord, "before_update")
+@event.listens_for(TaskResultProposalRecord, "before_delete")
+def reject_task_result_proposal_mutation(
+    _mapper: object, _connection: object, _target: object
+) -> None:
+    """Result proposals are append-only business facts."""
+    raise ValueError("TaskResultProposalRecord is immutable")
 
 
 class Todo(Base):

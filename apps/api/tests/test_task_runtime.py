@@ -3,13 +3,28 @@ from uuid import UUID
 
 import pytest
 from deep_researcher.app import create_app
-from deep_researcher.models import ResearchPlan, ResearchTask, RunEvent, TaskOutcome
+from deep_researcher.models import (
+    ResearchPlan,
+    ResearchRun,
+    ResearchTask,
+    RunEvent,
+    TaskModelTurn,
+    TaskObservation,
+    TaskOutcome,
+    TaskResultProposalRecord,
+)
 from deep_researcher.settings import Settings
 from deep_researcher.task_runtime import (
     DeterministicTaskAdapter,
+    DeterministicTaskModelGateway,
+    DeterministicTaskToolAdapter,
+    ReActTaskController,
     StaleTaskClaimError,
     TaskExecutionResult,
+    TaskObservationResult,
+    TaskResultProposal,
     TaskRuntime,
+    TaskToolCall,
 )
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -278,3 +293,265 @@ def test_advance_uses_deterministic_adapter_and_unlocks_dependency(tmp_path) -> 
 
     assert second_outcome is not None
     assert second_outcome.kind == "completed"
+
+
+def test_react_controller_round_trips_observation_before_result_proposal(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'bounded-loop.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "bounded-loop"},
+            json={"content": "测试 Observation 回流"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task_id = task.id
+            criteria = tuple(task.success_criteria)
+            tool_name = task.allowed_tools[0] if task.allowed_tools else "web_search"
+            session.commit()
+        claim = runtime.claim(task_id, lease_owner="bounded-worker")
+        assert claim is not None
+        model = DeterministicTaskModelGateway(
+            [
+                TaskToolCall(tool_name=tool_name, arguments={"query": "bounded"}),
+                TaskResultProposal(
+                    result_reference="result:bounded",
+                    evidence_refs=("evidence:bounded",),
+                    covered_criteria=criteria,
+                ),
+            ]
+        )
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=model,
+            tool_adapter=DeterministicTaskToolAdapter(
+                TaskObservationResult(
+                    result_reference="observation:bounded",
+                    evidence_refs=("evidence:bounded",),
+                    evidence_gain=True,
+                )
+            ),
+        )
+
+        first = controller.advance(claim)
+        second = controller.advance(claim)
+        replay = controller.advance(claim)
+        with app.state.session_factory() as session:
+            observations = session.scalars(
+                select(TaskObservation).where(TaskObservation.task_id == task_id)
+            ).all()
+            turns = session.scalars(
+                select(TaskModelTurn).where(TaskModelTurn.task_id == task_id)
+            ).all()
+            proposals = session.scalars(
+                select(TaskResultProposalRecord).where(TaskResultProposalRecord.task_id == task_id)
+            ).all()
+
+    assert first.status == "runnable"
+    assert second.status == "terminal"
+    assert second.outcome_ref == replay.outcome_ref
+    assert len(observations) == len(proposals) == 1
+    assert len(turns) == 2
+
+
+def test_react_controller_rejects_model_owned_outcome_and_repairs_once(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'bounded-repair.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "bounded-repair"},
+            json={"content": "测试非法模型输出"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task_id = task.id
+            criteria = tuple(task.success_criteria)
+            session.commit()
+        claim = runtime.claim(task_id, lease_owner="repair-worker")
+        assert claim is not None
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [TaskExecutionResult(result_reference="model-cannot-complete")],
+                repairs=[
+                    TaskResultProposal(
+                        result_reference="result:repaired",
+                        evidence_refs=("evidence:repaired",),
+                        covered_criteria=criteria,
+                    )
+                ],
+            ),
+        )
+
+        result = controller.advance(claim)
+        with app.state.session_factory() as session:
+            turn = session.scalar(
+                select(TaskModelTurn).where(TaskModelTurn.task_id == task_id)
+            )
+            outcome = session.scalar(select(TaskOutcome).where(TaskOutcome.task_id == task_id))
+
+    assert result.status == "terminal"
+    assert outcome is not None
+    assert outcome.kind == "completed"
+    assert turn is not None
+    assert turn.output_kind == "result_proposal"
+
+
+def test_react_controller_stops_after_two_successful_turns_without_evidence_gain(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'bounded-no-gain.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "bounded-no-gain"},
+            json={"content": "测试无证据增益停止"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task_id = task.id
+            tool_name = task.allowed_tools[0] if task.allowed_tools else "web_search"
+            session.commit()
+        claim = runtime.claim(task_id, lease_owner="no-gain-worker")
+        assert claim is not None
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [
+                    TaskToolCall(tool_name=tool_name, arguments={}),
+                    TaskToolCall(tool_name=tool_name, arguments={}),
+                ]
+            ),
+            tool_adapter=DeterministicTaskToolAdapter(
+                TaskObservationResult(result_reference="observation:no-gain")
+            ),
+        )
+
+        first = controller.advance(claim)
+        second = controller.advance(claim)
+
+    assert first.status == "runnable"
+    assert second.status == "terminal"
+    assert second.reason == "no_evidence_gain"
+
+
+def test_react_controller_turn_budget_and_cancellation_are_terminal_facts(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'bounded-budget.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "bounded-budget"},
+            json={"content": "测试 turn budget"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task_id = task.id
+            tool_name = task.allowed_tools[0] if task.allowed_tools else "web_search"
+            session.commit()
+        claim = runtime.claim(task_id, lease_owner="budget-worker")
+        assert claim is not None
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway(
+                [
+                    TaskToolCall(tool_name=tool_name, arguments={}),
+                    TaskToolCall(tool_name=tool_name, arguments={}),
+                ]
+            ),
+            tool_adapter=DeterministicTaskToolAdapter(
+                TaskObservationResult(
+                    result_reference="observation:budget", evidence_gain=True
+                )
+            ),
+            max_turns=1,
+        )
+        first = controller.advance(claim)
+        exhausted = controller.advance(claim)
+
+        created_cancel = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "bounded-cancel"},
+            json={"content": "测试取消"},
+        ).json()
+        cancel_task_id: UUID
+        with app.state.session_factory.begin() as session:
+            cancel_run = session.get(ResearchRun, UUID(created_cancel["run_id"]))
+            assert cancel_run is not None
+            cancel_task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == cancel_run.id)
+                .order_by(ResearchTask.ordinal)
+            )
+            assert cancel_task is not None
+            cancel_task_id = cancel_task.id
+        cancel_claim = runtime.claim(cancel_task_id, lease_owner="cancel-worker")
+        assert cancel_claim is not None
+        with app.state.session_factory.begin() as session:
+            cancel_run = session.get(ResearchRun, UUID(created_cancel["run_id"]))
+            assert cancel_run is not None
+            cancel_run.cancel_requested_at = datetime.now(UTC)
+        cancelled = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=DeterministicTaskModelGateway([]),
+        ).advance(cancel_claim)
+        with app.state.session_factory() as session:
+            cancel_outcome = session.scalar(
+                select(TaskOutcome).where(TaskOutcome.task_id == cancel_task_id)
+            )
+
+    assert first.status == "runnable"
+    assert exhausted.status == "terminal"
+    assert exhausted.reason == "turn_budget_exhausted"
+    assert cancelled.status == "terminal"
+    assert cancel_outcome is not None
+    assert cancel_outcome.kind == "cancelled"
