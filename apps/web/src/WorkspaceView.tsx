@@ -25,8 +25,23 @@ type ResearchSourceList = { items: ResearchSource[] };
 type DocumentList = { items: WorkspaceDocument[] };
 type RunCreated = { run_id: string; assistant_message_id: string; status: string };
 type RunReference = { run_id: string; status: string };
-type ResearchTask = { ordinal: number; title: string; status: string; failure_impact: string | null };
-type RunDetail = { run_id: string; status: string; tasks: ResearchTask[] };
+type ResearchTask = {
+  ordinal: number;
+  title: string;
+  status: string;
+  state: "ready" | "running" | "terminal";
+  failure_impact: string | null;
+  goal: string;
+  success_criteria: string[];
+  dependencies: number[];
+  outcome_ref: string | null;
+};
+type RunDetail = {
+  run_id: string;
+  status: string;
+  plan: { version: number; plan_hash: string; goal: string } | null;
+  tasks: ResearchTask[];
+};
 type AgentTodo = {
   id: string;
   ordinal: number;
@@ -851,7 +866,19 @@ export function WorkspaceView({
                 );
               })}
               {Array.isArray(plan) && (
-                <section className="run-plan"><strong>研究计划</strong>{plan.map((task, index) => <span key={index}>{String((task as { title?: string }).title ?? "研究任务")}</span>)}</section>
+                <section className="run-plan">
+                  <strong>研究计划</strong>
+                  {plan.map((task, index) => {
+                    const item = task as { title?: string; state?: string; status?: string };
+                    const state = item.state ?? (item.status === "completed" ? "terminal" : item.status);
+                    return (
+                      <span key={index}>
+                        {String(item.title ?? "研究任务")}
+                        <small>{state === "terminal" ? "已结束" : state === "running" ? "运行中" : "待运行"}</small>
+                      </span>
+                    );
+                  })}
+                </section>
               )}
             </div>
             {toolApprovals.filter((approval) => approval.status === "pending").map((approval) => (

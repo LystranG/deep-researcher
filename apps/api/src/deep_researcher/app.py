@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 from uuid import UUID
 
 import anyio
@@ -53,6 +53,7 @@ from deep_researcher.models import (
     MessageAttachment,
     ResearchClaimEvidence,
     ResearchLedger,
+    ResearchPlan,
     ResearchRecord,
     ResearchRun,
     ResearchTask,
@@ -65,6 +66,7 @@ from deep_researcher.models import (
     SourceMapWork,
     SourceSnapshot,
     StopDecision,
+    TaskOutcome,
     Todo,
     ToolApproval,
     ToolCall,
@@ -105,6 +107,7 @@ from deep_researcher.settings import Settings
 from deep_researcher.skills import SOURCE_COMPARISON_MANIFEST, manifest_hash, validate_manifest
 from deep_researcher.source_map import missing_source_map_chunk_ids
 from deep_researcher.storage import FileTooLargeError, LocalObjectStore
+from deep_researcher.task_runtime import persist_plan_v1
 from deep_researcher.tool_execution import (
     DisabledMcpGateway,
     McpGateway,
@@ -221,12 +224,26 @@ class ResearchTaskResponse(BaseModel):
     ordinal: int
     title: str
     status: str
+    state: str
     failure_impact: str | None
     role: str
     depth: int
     token_budget: int
     time_budget_seconds: int
     allowed_tools: list[str]
+    goal: str
+    success_criteria: list[str]
+    dependencies: list[int]
+    local_budget: dict[str, object]
+    outcome_ref: str | None
+
+
+class ResearchPlanResponse(BaseModel):
+    version: int
+    status: str
+    goal: str
+    plan_hash: str
+    tasks: list[dict[str, object]]
 
 
 class ModelUsageResponse(BaseModel):
@@ -237,6 +254,7 @@ class ModelUsageResponse(BaseModel):
 
 
 class RunDetailResponse(RunStatusResponse):
+    plan: ResearchPlanResponse | None
     tasks: list[ResearchTaskResponse]
     usage: ModelUsageResponse | None
 
@@ -1776,6 +1794,7 @@ def create_app(
         )
         session.add(run)
         session.flush()
+        research_plan = persist_plan_v1(session, run, content)
         session.add(
             ResearchLedger(
                 workspace_id=conversation.workspace_id,
@@ -1790,9 +1809,37 @@ def create_app(
                 run_id=run.id,
                 seq=1,
                 type="run_queued",
+                event_key="run-queued",
                 payload={"message": "研究已进入队列"},
             )
         )
+        plan_tasks = [
+            {
+                **task,
+                "status": "ready" if not task["dependencies"] else "pending",
+                "state": "ready" if not task["dependencies"] else "pending",
+            }
+            for task in cast(
+                list[dict[str, object]],
+                research_plan.snapshot.get("tasks", []),
+            )
+        ]
+        session.add(
+            RunEvent(
+                workspace_id=conversation.workspace_id,
+                run_id=run.id,
+                seq=2,
+                type="plan_created",
+                event_key="plan-created:v1",
+                payload={
+                    "version": research_plan.version,
+                    "plan_hash": research_plan.plan_hash,
+                    "goal": research_plan.goal,
+                    "tasks": plan_tasks,
+                },
+            )
+        )
+        run.next_event_seq = 3
         workspace = session.get(Workspace, conversation.workspace_id)
         if workspace is not None:
             extract_explicit_memory(
@@ -1880,21 +1927,71 @@ def create_app(
         tasks = session.scalars(
             select(ResearchTask).where(ResearchTask.run_id == run.id).order_by(ResearchTask.ordinal)
         ).all()
+        plan = session.scalar(
+            select(ResearchPlan)
+            .where(ResearchPlan.run_id == run.id)
+            .order_by(ResearchPlan.version.desc())
+        )
+        outcomes = {
+            outcome.task_id: outcome
+            for outcome in session.scalars(
+                select(TaskOutcome).where(TaskOutcome.run_id == run.id)
+            )
+        }
+        task_by_ordinal = {task.ordinal: task.id for task in tasks}
+        ready_ordinals = {
+            task.ordinal
+            for task in tasks
+            if all(
+                dependency in task_by_ordinal
+                and outcomes.get(task_by_ordinal[dependency]) is not None
+                and outcomes[task_by_ordinal[dependency]].kind == "completed"
+                for dependency in task.dependencies
+            )
+        }
         usage = session.scalar(select(UsageLedger).where(UsageLedger.run_id == run.id))
         return RunDetailResponse(
             run_id=str(run.id),
             status=run.status,
+            plan=(
+                ResearchPlanResponse(
+                    version=plan.version,
+                    status=plan.status,
+                    goal=plan.goal,
+                    plan_hash=plan.plan_hash,
+                    tasks=cast(list[dict[str, object]], plan.snapshot.get("tasks", [])),
+                )
+                if plan is not None
+                else None
+            ),
             tasks=[
                 ResearchTaskResponse(
                     ordinal=task.ordinal,
                     title=task.title,
                     status=task.status,
+                    state=(
+                        "terminal"
+                        if task.status
+                        in {"completed", "failed", "cancelled", "skipped", "superseded"}
+                        else "running"
+                        if task.status == "running"
+                        else "ready"
+                        if task.ordinal in ready_ordinals
+                        else "pending"
+                    ),
                     failure_impact=task.failure_impact,
                     role=task.role,
                     depth=task.depth,
                     token_budget=task.token_budget,
                     time_budget_seconds=task.time_budget_seconds,
                     allowed_tools=task.allowed_tools,
+                    goal=task.goal,
+                    success_criteria=task.success_criteria,
+                    dependencies=task.dependencies,
+                    local_budget=task.local_budget,
+                    outcome_ref=(
+                        outcomes[task.id].outcome_ref if task.id in outcomes else None
+                    ),
                 )
                 for task in tasks
             ],

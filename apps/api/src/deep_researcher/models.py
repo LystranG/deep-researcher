@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -183,6 +184,28 @@ class ResearchRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class ResearchPlan(Base):
+    """保存 Research Run 的不可变计划版本快照"""
+
+    __tablename__ = "research_plans"
+    __table_args__ = (UniqueConstraint("run_id", "version"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    parent_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    goal: Mapped[str] = mapped_column(Text)
+    plan_hash: Mapped[str] = mapped_column(String(64))
+    snapshot: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class ResearchTask(Base):
     __tablename__ = "research_tasks"
     __table_args__ = (UniqueConstraint("run_id", "ordinal"),)
@@ -194,8 +217,16 @@ class ResearchTask(Base):
     run_id: Mapped[UUID] = mapped_column(
         ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
     )
+    plan_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("research_plans.id", ondelete="CASCADE"), index=True, default=None
+    )
+    plan_version: Mapped[int] = mapped_column(Integer, default=1)
     ordinal: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(240))
+    goal: Mapped[str] = mapped_column(Text, default="")
+    success_criteria: Mapped[list[str]] = mapped_column(JSON, default=list)
+    dependencies: Mapped[list[int]] = mapped_column(JSON, default=list)
+    local_budget: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     role: Mapped[str] = mapped_column(String(32), default="researcher")
     depth: Mapped[int] = mapped_column(Integer, default=1)
     token_budget: Mapped[int] = mapped_column(Integer, default=2000)
@@ -203,8 +234,74 @@ class ResearchTask(Base):
     allowed_tools: Mapped[list[str]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     failure_impact: Mapped[str | None] = mapped_column(Text, default=None)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    fencing_epoch: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class TaskClaim(Base):
+    """保存每次 ResearchTask 领取的租约和单调 fencing epoch"""
+
+    __tablename__ = "task_claims"
+    __table_args__ = (UniqueConstraint("task_id", "fencing_epoch"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    lease_owner: Mapped[str] = mapped_column(String(120))
+    fencing_epoch: Mapped[int] = mapped_column(Integer)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class TaskOutcome(Base):
+    """保存一个 ResearchTask 至多一次的不可变终态结果"""
+
+    __tablename__ = "task_outcomes"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    fencing_epoch: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(32))
+    outcome_ref: Mapped[str] = mapped_column(String(200), unique=True)
+    result_reference: Mapped[str | None] = mapped_column(String(1000), default=None)
+    evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    failure_ref: Mapped[str | None] = mapped_column(String(1000), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+@event.listens_for(ResearchPlan, "before_update")
+@event.listens_for(ResearchPlan, "before_delete")
+def reject_research_plan_mutation(_mapper: object, _connection: object, _target: object) -> None:
+    """Plan revisions are append-only business facts."""
+    raise ValueError("ResearchPlan is immutable")
+
+
+@event.listens_for(TaskOutcome, "before_update")
+@event.listens_for(TaskOutcome, "before_delete")
+def reject_task_outcome_mutation(_mapper: object, _connection: object, _target: object) -> None:
+    """Task outcomes are append-only business facts."""
+    raise ValueError("TaskOutcome is immutable")
 
 
 class Todo(Base):

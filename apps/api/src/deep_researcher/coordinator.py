@@ -2,7 +2,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -43,6 +43,8 @@ from deep_researcher.models import (
     SourceChunk,
     SourceSnapshot,
     StopDecision,
+    TaskClaim,
+    TaskOutcome,
     Todo,
     WebAcquisitionAttempt,
     WorkspaceSkillGrant,
@@ -434,6 +436,14 @@ class ResearchCoordinator:
                     run.status = "cancelled"
                     event_type = "run_cancelled"
                     event_payload: dict[str, object] = {"message": "研究已停止"}
+                    self._persist_task_outcomes(
+                        session,
+                        run,
+                        session.scalars(
+                            select(ResearchTask).where(ResearchTask.run_id == run.id)
+                        ).all(),
+                        lease_owner=lease_owner,
+                    )
                 else:
                     message = session.get(Message, run.assistant_message_id)
                     completed_tasks = session.scalars(
@@ -526,9 +536,15 @@ class ResearchCoordinator:
                         unsupported_claims=unsupported_claims,
                     )
                     for completed_task in completed_tasks:
-                        if completed_task.status in {"pending", "running"}:
+                        if completed_task.status in {"pending", "ready", "running"}:
                             completed_task.status = "completed"
                             completed_task.completed_at = datetime.now(UTC)
+                    self._persist_task_outcomes(
+                        session,
+                        run,
+                        completed_tasks,
+                        lease_owner=lease_owner,
+                    )
                     remaining_todos = session.scalars(
                         select(Todo).where(
                             Todo.run_id == run.id,
@@ -720,72 +736,117 @@ class ResearchCoordinator:
                 or (lease_owner is not None and run.lease_owner != lease_owner)
             ):
                 return
-            existing_task = session.scalar(
-                select(ResearchTask.id).where(ResearchTask.run_id == run_id).limit(1)
-            )
-            if existing_task is None:
-                trigger = session.get(Message, run.trigger_message_id)
-                question = trigger.content if trigger is not None else ""
-                for task in tasks:
+            trigger = session.get(Message, run.trigger_message_id)
+            question = trigger.content if trigger is not None else ""
+            existing_tasks = {
+                task.ordinal: task
+                for task in session.scalars(
+                    select(ResearchTask).where(ResearchTask.run_id == run_id)
+                )
+            }
+            for task in tasks:
+                research_task = existing_tasks.get(task["ordinal"])
+                if research_task is None:
                     research_task = ResearchTask(
-                            workspace_id=run.workspace_id,
-                            run_id=run.id,
-                            ordinal=task["ordinal"],
-                            title=task["title"],
-                            role=task["role"],
-                            depth=task["depth"],
-                            token_budget=task["token_budget"],
-                            time_budget_seconds=task["time_budget_seconds"],
-                            allowed_tools=task["allowed_tools"],
-                            status="running" if task["ordinal"] == 1 else "pending",
-                        )
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        ordinal=task["ordinal"],
+                        title=task["title"],
+                        goal=task["goal"],
+                        success_criteria=task["success_criteria"],
+                        dependencies=task["dependencies"],
+                        local_budget=task["local_budget"],
+                        role=task["role"],
+                        depth=task["depth"],
+                        token_budget=task["token_budget"],
+                        time_budget_seconds=task["time_budget_seconds"],
+                        allowed_tools=task["allowed_tools"],
+                        status="ready" if not task["dependencies"] else "pending",
+                    )
                     session.add(research_task)
                     session.flush()
-                    kind = "python_sandbox" if task["role"] == "python_sandbox" else "research"
-                    execution = None
-                    if kind == "python_sandbox":
-                        execution = SandboxExecution(
-                            workspace_id=run.workspace_id,
-                            run_id=run.id,
-                            requested_by_user_id=run.initiated_by_user_id,
-                            purpose="按研究计划完成受限计算",
-                            code=self._sandbox_code(question),
-                            input_message_ids=[str(run.trigger_message_id)],
-                            input_attachment_ids=[],
-                            timeout_seconds=task["time_budget_seconds"],
-                            status="queued",
-                        )
-                        session.add(execution)
-                        session.flush()
-                        if self._sandbox_submitter is None:
-                            execution.status = "unavailable"
-                            execution.error_message = "Sandbox Worker 未配置"
-                        sandbox_jobs.append(execution.id)
+                kind = "python_sandbox" if task["role"] == "python_sandbox" else "research"
+                todo = session.scalar(
+                    select(Todo).where(
+                        Todo.run_id == run_id,
+                        Todo.idempotency_key == f"plan:{task['ordinal']}:{kind}",
+                    )
+                )
+                if todo is not None:
+                    continue
+                execution = None
+                if kind == "python_sandbox":
+                    execution = SandboxExecution(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        requested_by_user_id=run.initiated_by_user_id,
+                        purpose="按研究计划完成受限计算",
+                        code=self._sandbox_code(question),
+                        input_message_ids=[str(run.trigger_message_id)],
+                        input_attachment_ids=[],
+                        timeout_seconds=task["time_budget_seconds"],
+                        status="queued",
+                    )
+                    session.add(execution)
+                    session.flush()
+                    if self._sandbox_submitter is None:
+                        execution.status = "unavailable"
+                        execution.error_message = "Sandbox Worker 未配置"
+                    sandbox_jobs.append(execution.id)
+                session.add(
+                    Todo(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        research_task_id=research_task.id,
+                        ordinal=task["ordinal"],
+                        title=task["title"],
+                        purpose=(
+                            "Agent 根据研究需要创建的 Python 计算"
+                            if kind == "python_sandbox"
+                            else task["title"]
+                        ),
+                        kind=kind,
+                        status=(
+                            "failed"
+                            if kind == "python_sandbox" and self._sandbox_submitter is None
+                            else "running" if not task["dependencies"] else "pending"
+                        ),
+                        idempotency_key=f"plan:{task['ordinal']}:{kind}",
+                        sandbox_execution_id=execution.id if execution is not None else None,
+                        failure_reason=(
+                            "Sandbox Worker 未配置，未执行代码"
+                            if kind == "python_sandbox" and self._sandbox_submitter is None
+                            else None
+                        ),
+                    )
+                )
+            first_task = next(
+                (task for task in existing_tasks.values() if not task.dependencies),
+                None,
+            )
+            if first_task is None:
+                first_task = session.scalar(
+                    select(ResearchTask).where(
+                        ResearchTask.run_id == run_id,
+                        ResearchTask.ordinal == min(task["ordinal"] for task in tasks),
+                    )
+                )
+            if first_task is not None:
+                owner = lease_owner or f"coordinator:{run.id}"
+                if first_task.status != "running" or first_task.lease_owner != owner:
+                    now = datetime.now(UTC)
+                    first_task.status = "running"
+                    first_task.lease_owner = owner
+                    first_task.lease_expires_at = now + timedelta(seconds=60)
+                    first_task.fencing_epoch += 1
                     session.add(
-                        Todo(
-                            workspace_id=run.workspace_id,
-                            run_id=run.id,
-                            research_task_id=research_task.id,
-                            ordinal=task["ordinal"],
-                            title=task["title"],
-                            purpose=(
-                                "Agent 根据研究需要创建的 Python 计算"
-                                if kind == "python_sandbox"
-                                else task["title"]
-                            ),
-                            kind=kind,
-                            status=(
-                                "failed"
-                                if kind == "python_sandbox" and self._sandbox_submitter is None
-                                else "running" if task["ordinal"] == 1 else "pending"
-                            ),
-                            idempotency_key=f"plan:{task['ordinal']}:{kind}",
-                            sandbox_execution_id=execution.id if execution is not None else None,
-                            failure_reason=(
-                                "Sandbox Worker 未配置，未执行代码"
-                                if kind == "python_sandbox" and self._sandbox_submitter is None
-                                else None
-                            ),
+                        TaskClaim(
+                            workspace_id=first_task.workspace_id,
+                            run_id=first_task.run_id,
+                            task_id=first_task.id,
+                            lease_owner=owner,
+                            fencing_epoch=first_task.fencing_epoch,
+                            lease_expires_at=first_task.lease_expires_at,
                         )
                     )
         if self._sandbox_submitter is not None:
@@ -805,7 +866,7 @@ class ResearchCoordinator:
                     for task in tasks
                 ]
             },
-            event_key="graph-plan-created",
+            event_key="plan-created:v1",
             lease_owner=lease_owner,
         )
         for task in tasks:
@@ -821,6 +882,13 @@ class ResearchCoordinator:
                 event_key=f"todo-created:{task['ordinal']}",
                 lease_owner=lease_owner,
             )
+        self._append_event(
+            run_id,
+            "task_running",
+            {"ordinal": 1},
+            event_key="task-running:1",
+            lease_owner=lease_owner,
+        )
         self._append_event(
             run_id,
             "task_started",
@@ -1967,6 +2035,92 @@ class ResearchCoordinator:
         except RunEventRejectedError:
             return
 
+    def _persist_task_outcomes(
+        self,
+        session: Session,
+        run: ResearchRun,
+        tasks: Sequence[ResearchTask],
+        *,
+        lease_owner: str | None,
+    ) -> None:
+        """Publish one immutable outcome and terminal event for every finished task."""
+        owner = lease_owner or f"coordinator:{run.id}"
+        now = datetime.now(UTC)
+        for task in tasks:
+            if task.status not in {
+                "completed",
+                "failed",
+                "cancelled",
+                "skipped",
+                "superseded",
+            }:
+                continue
+            outcome = session.scalar(
+                select(TaskOutcome).where(TaskOutcome.task_id == task.id)
+            )
+            if outcome is None:
+                active_claim = session.scalar(
+                    select(TaskClaim).where(
+                        TaskClaim.task_id == task.id,
+                        TaskClaim.fencing_epoch == task.fencing_epoch,
+                    )
+                )
+                if task.lease_owner != owner or active_claim is None:
+                    task.fencing_epoch += 1
+                    task.lease_owner = owner
+                    task.lease_expires_at = now
+                    active_claim = TaskClaim(
+                        workspace_id=task.workspace_id,
+                        run_id=task.run_id,
+                        task_id=task.id,
+                        lease_owner=owner,
+                        fencing_epoch=task.fencing_epoch,
+                        lease_expires_at=now,
+                    )
+                    session.add(active_claim)
+                outcome = TaskOutcome(
+                    workspace_id=task.workspace_id,
+                    run_id=task.run_id,
+                    task_id=task.id,
+                    fencing_epoch=task.fencing_epoch,
+                    kind=task.status,
+                    outcome_ref=f"task-outcome:{task.id}",
+                    result_reference=(
+                        f"task-result:{task.id}" if task.status == "completed" else None
+                    ),
+                    evidence_refs=[],
+                    failure_ref=task.failure_impact,
+                )
+                session.add(outcome)
+                if active_claim is not None:
+                    active_claim.released_at = now
+                task.lease_owner = None
+                task.lease_expires_at = None
+            event_key = f"task-terminal:{task.id}"
+            if session.scalar(
+                select(RunEvent.id).where(
+                    RunEvent.run_id == run.id,
+                    RunEvent.event_key == event_key,
+                )
+            ) is None:
+                seq = run.next_event_seq
+                run.next_event_seq += 1
+                session.add(
+                    RunEvent(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        seq=seq,
+                        type="task_terminal",
+                        event_key=event_key,
+                        payload={
+                            "task_id": str(task.id),
+                            "ordinal": task.ordinal,
+                            "kind": outcome.kind,
+                            "outcome_ref": outcome.outcome_ref,
+                        },
+                    )
+                )
+
     def _cancel(self, run_id: UUID, *, lease_owner: str | None = None) -> None:
         with self._sequence_lock, self._session_factory.begin() as session:
             run = session.scalar(
@@ -1984,11 +2138,19 @@ class ResearchCoordinator:
             pending_tasks = session.scalars(
                 select(ResearchTask).where(
                     ResearchTask.run_id == run.id,
-                    ResearchTask.status.in_({"pending", "running"}),
+                    ResearchTask.status.in_({"pending", "ready", "running"}),
                 )
             ).all()
             for task in pending_tasks:
                 task.status = "cancelled"
+            self._persist_task_outcomes(
+                session,
+                run,
+                session.scalars(
+                    select(ResearchTask).where(ResearchTask.run_id == run.id)
+                ).all(),
+                lease_owner=lease_owner,
+            )
             seq = run.next_event_seq
             run.next_event_seq += 1
             session.add(
@@ -2038,7 +2200,7 @@ class ResearchCoordinator:
             active_tasks = session.scalars(
                 select(ResearchTask).where(
                     ResearchTask.run_id == run.id,
-                    ResearchTask.status.in_({"pending", "running"}),
+                    ResearchTask.status.in_({"pending", "ready", "running"}),
                 )
             ).all()
             budget_exhausted = isinstance(error, BudgetExceededError)
@@ -2053,6 +2215,14 @@ class ResearchCoordinator:
                         if budget_exhausted
                         else "研究运行失败，任务未能完成"
                     )
+            self._persist_task_outcomes(
+                session,
+                run,
+                session.scalars(
+                    select(ResearchTask).where(ResearchTask.run_id == run.id)
+                ).all(),
+                lease_owner=lease_owner,
+            )
             self._finalize_ledger(
                 session,
                 run,
