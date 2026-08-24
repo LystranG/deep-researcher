@@ -894,6 +894,7 @@ class CoverageSnapshot(Base):
     citation_count: Mapped[int] = mapped_column(Integer, default=0)
     verified_claim_count: Mapped[int] = mapped_column(Integer, default=0)
     complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    items: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -926,8 +927,10 @@ class StopDecision(Base):
     ledger_id: Mapped[UUID] = mapped_column(
         ForeignKey("research_ledgers.id", ondelete="CASCADE"), unique=True, index=True
     )
+    route: Mapped[str] = mapped_column(String(32), default="failed")
     reason: Mapped[str] = mapped_column(String(64))
     completeness: Mapped[str] = mapped_column(String(32))
+    details: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

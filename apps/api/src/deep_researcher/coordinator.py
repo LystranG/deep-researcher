@@ -2309,14 +2309,33 @@ class ResearchCoordinator:
                     for description in outcome.gap_descriptions
                 ]
             )
-        session.add(
-            StopDecision(
-                workspace_id=run.workspace_id,
-                ledger_id=ledger.id,
-                reason=outcome.reason,
-                completeness="complete" if outcome.complete else "partial",
-            )
+        existing_decision = session.scalar(
+            select(StopDecision).where(StopDecision.ledger_id == ledger.id)
         )
+        if existing_decision is None:
+            decision_route = (
+                "complete"
+                if outcome.status == "completed"
+                else outcome.status
+                if outcome.status
+                in {"replan", "partial", "failed", "cancelled"}
+                else "failed"
+            )
+            session.add(
+                StopDecision(
+                    workspace_id=run.workspace_id,
+                    ledger_id=ledger.id,
+                    route=decision_route,
+                    reason=outcome.reason,
+                    completeness="complete" if outcome.complete else "partial",
+                    details={
+                        "route": decision_route,
+                        "gaps": list(outcome.gap_descriptions),
+                        "conflicts": [],
+                        "stop_reason": outcome.reason,
+                    },
+                )
+            )
         return outcome.status
 
 

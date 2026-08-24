@@ -1,6 +1,32 @@
 from typing import Literal, TypedDict
 
 from deep_researcher.agents.researcher import ResearchFinding
+from deep_researcher.verifier import (
+    ClaimVerification,
+    CoverageItem,
+    GlobalVerifier,
+    RunVerifier,
+    VerificationBarrierError,
+    VerificationDecision,
+    VerificationFacts,
+    Verifier,
+    decide_verification,
+)
+
+__all__ = [
+    "ClaimVerification",
+    "CoverageItem",
+    "GlobalVerifier",
+    "RunVerifier",
+    "VerificationBarrierError",
+    "VerificationDecision",
+    "VerificationFacts",
+    "VerificationResult",
+    "Verifier",
+    "decide_verification",
+    "verify",
+    "verify_evidence_candidate",
+]
 
 
 class VerificationResult(TypedDict):
