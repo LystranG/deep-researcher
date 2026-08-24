@@ -4,14 +4,14 @@
 
 ## 本地启动
 
-要求：Python 3.13、uv 0.12+、Node.js 24+、npm 11+。所有 shell 命令按项目规则使用 `rtk` 前缀。
+要求：Python 3.13、uv 0.12+、Node.js 24+、npm 11+。
 
 ```bash
-rtk uv sync
-rtk npm --prefix apps/web install
-rtk uv run alembic upgrade head
-rtk make dev-api
-rtk make dev-web
+uv sync
+npm --prefix apps/web install
+uv run alembic upgrade head
+make dev-api
+make dev-web
 ```
 
 浏览器访问 `http://127.0.0.1:5173`。默认数据库是 `var/deep-researcher.db`，默认对象目录是 `var/objects`。没有 OpenAI key 时走本地抽取式研究 Adapter；它会基于实际可见的会话纠正和文档 Evidence Span 回答，不会伪装成外部模型调用。
@@ -32,7 +32,7 @@ DEEP_RESEARCHER_BRAVE_SEARCH_API_KEY=你的BraveSearch密钥
 使用 PostgreSQL 的完整本地部署：
 
 ```bash
-rtk docker-compose -f infra/docker-compose.yml up --build
+docker-compose -f infra/docker-compose.yml up --build
 ```
 
 然后访问 `http://127.0.0.1:8080`。
@@ -40,7 +40,7 @@ rtk docker-compose -f infra/docker-compose.yml up --build
 ## 验证
 
 ```bash
-rtk make verify
+make verify
 ```
 
 外部 OpenAI 调用不属于无凭证测试的通过证据；有凭证集成结果必须单独报告。

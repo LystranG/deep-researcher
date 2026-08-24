@@ -7,7 +7,7 @@
 - API 负责身份、Workspace ACL、Message/Research Run 创建、取消和审批命令
 - 独立 Worker 通过 PostgreSQL queue 领取 Research Run，并持有 lease、heartbeat 和 attempt
 - LangGraph checkpoint 使用 `thread_id=run:{run_id}`；业务表仍是用户可见状态、SSE、Citation、Memory 和 Tool Approval 的事实源
-- Schema 只通过 `rtk uv run alembic upgrade head` 迁移，应用不得调用 ORM 自动建表
+- Schema 只通过 `uv run alembic upgrade head` 迁移，应用不得调用 ORM 自动建表
 - SQLite 只用于本地开发和 deterministic 验收；多 Worker、行锁与持久 checkpoint 必须使用真实 PostgreSQL
 
 ## 2. MCP 与审批安全边界
@@ -44,14 +44,14 @@ SQLite 开发环境：
 
 1. 停止 API 和 Worker
 2. 在同一时间点备份数据库文件与对象目录
-3. 恢复后运行 `rtk uv run alembic upgrade head`
+3. 恢复后运行 `uv run alembic upgrade head`
 4. 通过 `/healthz`、登录、Workspace 列表和一个只读 Research Run 检查恢复结果
 
 PostgreSQL 环境：
 
 1. 停止新 Run 入队并等待正在执行的外部调用结束
 2. 使用 `pg_dump` 备份业务库，同时备份对象存储
-3. 恢复对象存储和数据库后运行 `rtk uv run alembic upgrade head`
+3. 恢复对象存储和数据库后运行 `uv run alembic upgrade head`
 4. 启动 API，再启动 Worker
 5. 检查 Alembic head、Worker heartbeat、过期 lease 接管、SSE 重放和 Citation 下载
 
@@ -60,14 +60,14 @@ PostgreSQL 环境：
 ## 5. 验证命令
 
 ```bash
-rtk uv run pytest apps/api/tests
-rtk uv run pytest apps/api/tests/integration/test_postgres_event_log.py
-rtk uv run ruff check apps/api/src apps/api/tests
-rtk uv run mypy apps/api/src/deep_researcher
-rtk npm --prefix apps/web test -- --run
-rtk npm --prefix apps/web run typecheck
-rtk npm --prefix apps/web run build
-rtk env PLAYWRIGHT_BROWSERS_PATH=/private/tmp/deep-researcher-playwright npm --prefix apps/web run test:e2e
+uv run pytest apps/api/tests
+uv run pytest apps/api/tests/integration/test_postgres_event_log.py
+uv run ruff check apps/api/src apps/api/tests
+uv run mypy apps/api/src/deep_researcher
+npm --prefix apps/web test -- --run
+npm --prefix apps/web run typecheck
+npm --prefix apps/web run build
+env PLAYWRIGHT_BROWSERS_PATH=/private/tmp/deep-researcher-playwright npm --prefix apps/web run test:e2e
 ```
 
 只有配置 `DEEP_RESEARCHER_POSTGRES_TEST_URL` 后，PostgreSQL 专项才构成当前迁移、预算、审批并发和 checkpoint 恢复证据。OpenAI/LiteLLM、Brave Search、远程 MCP 和外部签名服务必须分别使用真实配置验证；缺少配置时报告 skipped 或 unverified。
