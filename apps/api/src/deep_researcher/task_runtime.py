@@ -374,12 +374,28 @@ def persist_plan_v1(session: Session, run: ResearchRun, question: str) -> Resear
 
 
 class TaskRuntime:
-    """Claim, advance, and finalize tasks using only database facts."""
+    """Schedule, claim, advance, and finalize tasks using database facts."""
 
-    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        *,
+        max_fan_out: int = 4,
+    ) -> None:
+        if max_fan_out < 1:
+            raise ValueError("max_fan_out must be greater than zero")
         self._session_factory = session_factory
+        self._max_fan_out = max_fan_out
 
     def refresh_ready(self, run_id: UUID) -> list[UUID]:
+        """Recover expired claims and return the current dependency-ready frontier.
+
+        A task remains pending when a dependency has anything other than a
+        completed outcome. This is deliberately stricter than looking at task
+        status so failed, cancelled, incomplete, and superseded outcomes never
+        unlock descendants.
+        """
+        now = datetime.now(UTC)
         with self._session_factory.begin() as session:
             tasks = session.scalars(
                 select(ResearchTask)
@@ -396,12 +412,61 @@ class TaskRuntime:
             for task in tasks:
                 if task.status in TERMINAL_TASK_KINDS:
                     continue
+                if (
+                    task.status == "running"
+                    and task.lease_expires_at is not None
+                    and _as_utc(task.lease_expires_at) <= now
+                    and task.id not in outcomes
+                ):
+                    task.status = "ready"
+                    task.lease_owner = None
+                    task.lease_expires_at = None
                 dependencies = _dependency_ids(tasks, task)
                 if all(outcomes.get(task_id) == "completed" for task_id in dependencies):
-                    if task.status == "pending":
+                    if task.status in {"pending", "ready"}:
                         task.status = "ready"
-                    ready.append(task.id)
+                    if task.status == "ready":
+                        ready.append(task.id)
             return ready
+
+    def ready_frontier(self, run_id: UUID) -> list[UUID]:
+        """Return all dependency-ready tasks; claims enforce the fan-out limit."""
+        return self.refresh_ready(run_id)
+
+    def barrier_satisfied(self, run_id: UUID) -> bool:
+        """Whether every task in the current runnable stage has an outcome."""
+        with self._session_factory() as session:
+            tasks = session.scalars(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == run_id)
+                .order_by(ResearchTask.ordinal)
+            ).all()
+            outcomes = {
+                outcome.task_id: outcome.kind
+                for outcome in session.scalars(
+                    select(TaskOutcome).where(TaskOutcome.run_id == run_id)
+                )
+            }
+            active = [
+                task
+                for task in tasks
+                if task.status in {"ready", "running"}
+                or (
+                    task.status == "pending"
+                    and all(
+                        outcomes.get(dependency_id) == "completed"
+                        for dependency_id in _dependency_ids(tasks, task)
+                    )
+                )
+            ]
+            terminal_without_outcome = [
+                task
+                for task in tasks
+                if task.status in TERMINAL_TASK_KINDS and task.id not in outcomes
+            ]
+            return not terminal_without_outcome and all(
+                task.id in outcomes for task in active
+            )
 
     def claim(
         self,
@@ -425,6 +490,17 @@ class TaskRuntime:
                 return None
             if not _dependencies_completed(session, task):
                 return None
+            if task.status != "running":
+                active_count = len(
+                    session.scalars(
+                        select(ResearchTask.id).where(
+                            ResearchTask.run_id == task.run_id,
+                            ResearchTask.status == "running",
+                        )
+                    ).all()
+                )
+                if active_count >= self._max_fan_out:
+                    return None
             if (
                 task.status == "running"
                 and task.lease_expires_at is not None

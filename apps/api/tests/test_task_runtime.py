@@ -790,3 +790,95 @@ def test_waiting_tool_resumes_by_stable_reference_and_observation_reaches_next_t
     assert len(observations) == 2
     assert model.contexts[1].previous_observation is not None
     assert model.contexts[1].previous_observation.result_reference == "observation:approved"
+
+
+def test_failed_outcome_does_not_unlock_dependency(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'runtime-dag-failure.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "runtime-dag-failure"},
+            json={"content": "测试失败依赖不会解锁"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            tasks = session.scalars(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            ).all()
+            first_id, second_id = tasks[0].id, tasks[1].id
+
+        first_claim = runtime.claim(first_id, lease_owner="dag-worker")
+        assert first_claim is not None
+        runtime.record_outcome(
+            first_claim,
+            TaskExecutionResult(kind="failed", failure_ref="upstream-failed"),
+        )
+
+        assert second_id not in runtime.refresh_ready(UUID(created["run_id"]))
+        assert runtime.claim(second_id, lease_owner="dag-worker") is None
+
+
+def test_independent_tasks_respect_fan_out_and_form_a_barrier(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'runtime-dag-fanout.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "runtime-dag-fanout"},
+            json={"content": "测试独立任务有限并发"},
+        ).json()
+        run_id = UUID(created["run_id"])
+        with app.state.session_factory.begin() as session:
+            tasks = session.scalars(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == run_id)
+                .order_by(ResearchTask.ordinal)
+            ).all()
+            tasks[1].dependencies = []
+            tasks[2].dependencies = [2]
+            first_id, second_id = tasks[0].id, tasks[1].id
+            third_id = tasks[2].id
+
+        runtime = TaskRuntime(app.state.session_factory, max_fan_out=1)
+        frontier = runtime.ready_frontier(run_id)
+        assert {first_id, second_id} == set(frontier)
+
+        first_claim = runtime.claim(first_id, lease_owner="fanout-worker")
+        assert first_claim is not None
+        assert runtime.claim(second_id, lease_owner="fanout-worker") is None
+
+        runtime.record_outcome(
+            first_claim,
+            TaskExecutionResult(result_reference="first-independent"),
+        )
+        second_claim = runtime.claim(second_id, lease_owner="fanout-worker")
+        assert second_claim is not None
+        assert not runtime.barrier_satisfied(run_id)
+
+        runtime.record_outcome(
+            second_claim,
+            TaskExecutionResult(result_reference="second-independent"),
+        )
+        assert not runtime.barrier_satisfied(run_id)
+        third_claim = runtime.claim(third_id, lease_owner="fanout-worker")
+        assert third_claim is not None
+        runtime.record_outcome(
+            third_claim,
+            TaskExecutionResult(result_reference="third-dependent"),
+        )
+        assert runtime.barrier_satisfied(run_id)
