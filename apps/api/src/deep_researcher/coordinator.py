@@ -14,6 +14,10 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.agents.planner import TaskSpec
 from deep_researcher.agents.researcher import ResearchFinding
+from deep_researcher.citation_validator import (
+    CitationValidationError,
+    validate_citation_drafts,
+)
 from deep_researcher.event_log import RunEventLog, RunEventRejectedError
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.model_gateway import BudgetExceededError, ModelGateway
@@ -308,6 +312,17 @@ class ResearchCoordinator:
                     return
             answer = graph_state["answer"]
             citation_drafts = graph_state["citation_drafts"]
+            try:
+                validate_citation_drafts(
+                    answer,
+                    citation_drafts,
+                    len(citable_sources(graph_state["research_context"])),
+                )
+            except CitationValidationError:
+                # A malformed provider draft must never become a persisted
+                # Citation. The answer remains publishable only as a
+                # citation-free partial result.
+                citation_drafts = []
             reduction = (
                 self._source_map_ledger.reduce(run_id, run.workspace_id, map_budget)
                 if self._requires_whole_page_map(question)
