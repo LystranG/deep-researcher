@@ -36,11 +36,28 @@ type ResearchTask = {
   dependencies: number[];
   outcome_ref: string | null;
 };
+type ResearchFileRevision = {
+  ref: { kind: "source" | "work" | "artifact"; id: string; revision: string };
+  name: string;
+  status: string;
+  content_hash: string;
+  size_bytes: number;
+  media_type: string;
+  failure_reason: string | null;
+  parent_ref?: { kind: string; id: string; revision: string };
+  source_ref?: { kind: string; id: string; revision: string };
+};
+type ResearchFiles = {
+  sources: ResearchFileRevision[];
+  work: ResearchFileRevision[];
+  artifacts: ResearchFileRevision[];
+};
 type RunDetail = {
   run_id: string;
   status: string;
   plan: { version: number; plan_hash: string; goal: string } | null;
   tasks: ResearchTask[];
+  files: ResearchFiles;
 };
 type AgentTodo = {
   id: string;
@@ -109,6 +126,12 @@ export function WorkspaceView({
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [latestRunId, setLatestRunId] = useState<string | null>(null);
   const [persistedTasks, setPersistedTasks] = useState<ResearchTask[]>([]);
+  const [researchFiles, setResearchFiles] = useState<ResearchFiles>({
+    sources: [],
+    work: [],
+    artifacts: [],
+  });
+  const [showResearchFiles, setShowResearchFiles] = useState(false);
   const [toolApprovals, setToolApprovals] = useState<ToolApproval[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -145,6 +168,8 @@ export function WorkspaceView({
     setActiveRunId(null);
     setLatestRunId(null);
     setPersistedTasks([]);
+    setResearchFiles({ sources: [], work: [], artifacts: [] });
+    setShowResearchFiles(false);
     setShowConversationForm(false);
     setShowDocuments(false);
     setDocuments([]);
@@ -161,6 +186,7 @@ export function WorkspaceView({
     setResearchSources([]);
     setSelectedResearchSource(null);
     setShowResearchSources(false);
+    setShowResearchFiles(false);
     setEvidenceCheck(null);
     void apiRequest<ConversationList>(
       `/api/v1/workspaces/${workspace.id}/conversations`,
@@ -225,6 +251,7 @@ export function WorkspaceView({
         token,
       );
       setPersistedTasks(latest?.tasks ?? []);
+      setResearchFiles(latest?.files ?? { sources: [], work: [], artifacts: [] });
       setLatestRunId(latest?.run_id ?? null);
       if (latest?.run_id) {
         await loadSandboxTodos(latest.run_id);
@@ -309,6 +336,7 @@ export function WorkspaceView({
       token,
     );
     setPersistedTasks(latest?.tasks ?? []);
+    setResearchFiles(latest?.files ?? { sources: [], work: [], artifacts: [] });
     setLatestRunId(latest?.run_id ?? run.run_id);
     await loadSandboxTodos(latest?.run_id ?? run.run_id);
     await loadResearchSources(latest?.run_id ?? run.run_id);
@@ -839,6 +867,7 @@ export function WorkspaceView({
                 <button onClick={loadSkills}>扩展</button>
                 {latestRunId && <button onClick={() => setShowSandbox(true)}>Python 沙箱</button>}
                 {latestRunId && <button onClick={() => setShowResearchSources(true)}>研究来源</button>}
+                {latestRunId && <button onClick={() => setShowResearchFiles(true)}>研究文件</button>}
                 <button onClick={renameConversation}>重命名</button>
                 <button onClick={archiveConversation}>归档</button>
                 <button className="danger-link" onClick={deleteConversation}>删除</button>
@@ -969,6 +998,28 @@ export function WorkspaceView({
               <blockquote>{selectedResearchSource.content}</blockquote>
             </article>
           )}
+        </aside>
+      )}
+      {showResearchFiles && (
+        <aside className="document-drawer">
+          <button className="drawer-close" onClick={() => setShowResearchFiles(false)}>关闭</button>
+          <span className="eyebrow">RESEARCH FILES</span>
+          <h3>研究文件版本</h3>
+          {(["sources", "work", "artifacts"] as const).map((kind) => (
+            <section className="sandbox-result" key={kind}>
+              <strong>{kind === "sources" ? "冻结来源" : kind === "work" ? "工作版本" : "已发布产物"}</strong>
+              {researchFiles[kind].length === 0 && <p>暂无文件。</p>}
+              {researchFiles[kind].map((file) => (
+                <div key={`${file.ref.id}:${file.ref.revision}`}>
+                  <p>{file.name} · {file.status}</p>
+                  <small title={file.content_hash}>
+                    {file.ref.kind}:{file.ref.id.slice(0, 8)}@{file.ref.revision} · {file.size_bytes} 字节
+                  </small>
+                  {file.failure_reason && <p className="error-banner">{file.failure_reason}</p>}
+                </div>
+              ))}
+            </section>
+          ))}
         </aside>
       )}
       {evidenceCheck && (

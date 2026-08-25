@@ -348,6 +348,7 @@ class TaskObservation(Base):
     status: Mapped[str] = mapped_column(String(32))
     result_reference: Mapped[str | None] = mapped_column(String(1000), default=None)
     evidence_refs: Mapped[list[str]] = mapped_column(JSON, default=list)
+    file_refs: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
     evidence_gain: Mapped[bool] = mapped_column(Boolean, default=False)
     failure_ref: Mapped[str | None] = mapped_column(String(1000), default=None)
     logical_call_ref: Mapped[str | None] = mapped_column(String(300), default=None)
@@ -380,6 +381,105 @@ class TaskResultProposalRecord(Base):
     covered_criteria: Mapped[list[str]] = mapped_column(JSON, default=list)
     valid: Mapped[bool] = mapped_column(Boolean, default=False)
     rejection_reason: Mapped[str | None] = mapped_column(String(200), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ResearchSourceMount(Base):
+    """Run 创建时冻结的只读来源版本。"""
+
+    __tablename__ = "research_source_mounts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "normalized_name"),
+        UniqueConstraint("run_id", "source_type", "source_entity_id", "source_revision"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    normalized_name: Mapped[str] = mapped_column(String(1000))
+    source_type: Mapped[str] = mapped_column(String(32))
+    source_entity_id: Mapped[UUID] = mapped_column(index=True)
+    source_revision: Mapped[str] = mapped_column(String(100))
+    media_type: Mapped[str] = mapped_column(String(200))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str | None] = mapped_column(String(2000), default=None)
+    text_content: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ResearchWorkRevision(Base):
+    """Task 私有工作文件的一次不可变提交。"""
+
+    __tablename__ = "research_work_revisions"
+    __table_args__ = (
+        UniqueConstraint("task_id", "file_id", "revision"),
+        UniqueConstraint("task_id", "idempotency_key"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    file_id: Mapped[UUID] = mapped_column(index=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    normalized_name: Mapped[str] = mapped_column(String(1000))
+    revision: Mapped[int] = mapped_column(Integer)
+    parent_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("research_work_revisions.id", ondelete="RESTRICT"),
+        index=True,
+        default=None,
+    )
+    content: Mapped[str] = mapped_column(Text)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(200), default="text/plain")
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(32), default="committed")
+    failure_reason: Mapped[str | None] = mapped_column(String(500), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ResearchArtifactRevision(Base):
+    """从已提交 Work Revision 显式发布的不可变产物。"""
+
+    __tablename__ = "research_artifact_revisions"
+    __table_args__ = (
+        UniqueConstraint("run_id", "idempotency_key"),
+        UniqueConstraint("run_id", "normalized_name", "revision"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    artifact_id: Mapped[UUID] = mapped_column(index=True)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    published_by_task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="RESTRICT"), index=True
+    )
+    work_revision_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_work_revisions.id", ondelete="RESTRICT"), index=True
+    )
+    normalized_name: Mapped[str] = mapped_column(String(1000))
+    revision: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(200))
+    idempotency_key: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(32), default="published")
+    failure_reason: Mapped[str | None] = mapped_column(String(500), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -422,6 +522,19 @@ def reject_task_result_proposal_mutation(
 ) -> None:
     """Result proposals are append-only business facts."""
     raise ValueError("TaskResultProposalRecord is immutable")
+
+
+@event.listens_for(ResearchSourceMount, "before_update")
+@event.listens_for(ResearchSourceMount, "before_delete")
+@event.listens_for(ResearchWorkRevision, "before_update")
+@event.listens_for(ResearchWorkRevision, "before_delete")
+@event.listens_for(ResearchArtifactRevision, "before_update")
+@event.listens_for(ResearchArtifactRevision, "before_delete")
+def reject_research_file_fact_mutation(
+    _mapper: object, _connection: object, _target: object
+) -> None:
+    """Research File Space facts are append-only."""
+    raise ValueError("Research File Space facts are immutable")
 
 
 class Todo(Base):
@@ -840,6 +953,7 @@ class EvidenceSpan(Base):
     start_offset: Mapped[int] = mapped_column(Integer)
     end_offset: Mapped[int] = mapped_column(Integer)
     content_hash: Mapped[str] = mapped_column(String(64))
+    file_ref: Mapped[dict[str, str] | None] = mapped_column(JSON, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -1053,6 +1167,7 @@ class Citation(Base):
     derived_evidence_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("derived_evidence.id"), index=True, default=None
     )
+    file_ref: Mapped[dict[str, str] | None] = mapped_column(JSON, default=None)
     label: Mapped[int] = mapped_column(Integer)
     answer_start: Mapped[int] = mapped_column(Integer)
     answer_end: Mapped[int] = mapped_column(Integer)
@@ -1185,6 +1300,7 @@ class DerivedEvidence(Base):
     input_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     input_attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     input_evidence_span_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_file_refs: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
     stdout: Mapped[str] = mapped_column(Text)
     stdout_hash: Mapped[str] = mapped_column(String(64))
     result_hash: Mapped[str] = mapped_column(String(64))

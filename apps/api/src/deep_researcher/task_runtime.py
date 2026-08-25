@@ -101,6 +101,7 @@ class TaskObservationResult:
     status: str = "succeeded"
     result_reference: str | None = None
     evidence_refs: tuple[str, ...] = ()
+    file_refs: tuple[dict[str, str], ...] = ()
     evidence_gain: bool = False
     failure_ref: str | None = None
     summary: str | None = None
@@ -1327,6 +1328,7 @@ class ReActTaskController:
                     status=observation.status,
                     result_reference=observation.result_reference,
                     evidence_refs=list(observation.evidence_refs),
+                    file_refs=list(observation.file_refs),
                     evidence_gain=observation.evidence_gain,
                     failure_ref=observation.failure_ref,
                     logical_call_ref=turn.logical_call_ref,

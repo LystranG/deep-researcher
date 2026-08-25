@@ -126,6 +126,58 @@ class RunEventProjector:
                     lease_owner,
                 )
 
+        for revision in self._mappings(facts.get("file_revisions")):
+            ref = revision.get("ref")
+            if isinstance(ref, Mapping):
+                ref_id = self._identifier(ref, "id", "")
+                ref_revision = str(ref.get("revision", ""))
+                if ref_id and ref_revision:
+                    self._append(
+                        run_id,
+                        "file_revision_committed",
+                        self._payload(
+                            revision,
+                            (
+                                "ref",
+                                "name",
+                                "status",
+                                "content_hash",
+                                "size_bytes",
+                                "media_type",
+                                "parent_ref",
+                                "failure_reason",
+                            ),
+                        ),
+                        f"file-revision:{ref_id}:{ref_revision}",
+                        lease_owner,
+                    )
+
+        for artifact in self._mappings(facts.get("artifacts")):
+            ref = artifact.get("ref")
+            if isinstance(ref, Mapping):
+                ref_id = self._identifier(ref, "id", "")
+                ref_revision = str(ref.get("revision", ""))
+                if ref_id and ref_revision:
+                    self._append(
+                        run_id,
+                        "artifact_published",
+                        self._payload(
+                            artifact,
+                            (
+                                "ref",
+                                "source_ref",
+                                "name",
+                                "status",
+                                "content_hash",
+                                "size_bytes",
+                                "media_type",
+                                "failure_reason",
+                            ),
+                        ),
+                        f"artifact:{ref_id}:{ref_revision}",
+                        lease_owner,
+                    )
+
         verifier = facts.get("verifier")
         if isinstance(verifier, Mapping):
             decision_id = self._identifier(verifier, "id", "")

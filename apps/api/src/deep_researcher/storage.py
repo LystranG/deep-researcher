@@ -49,3 +49,7 @@ class LocalObjectStore:
         if not candidate.is_relative_to(self._root):
             raise ValueError("非法对象路径")
         return candidate
+
+    def read_bytes(self, key: str) -> bytes:
+        """Read an object through the storage adapter without exposing its host path."""
+        return self.path_for(key).read_bytes()

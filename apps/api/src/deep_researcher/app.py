@@ -83,6 +83,11 @@ from deep_researcher.models import (
     WorkspaceSkillGrant,
 )
 from deep_researcher.quota import QuotaService
+from deep_researcher.research_file_space import (
+    ResearchFileStore,
+    freeze_run_sources,
+    research_file_tool_definitions,
+)
 from deep_researcher.retrieval import (
     EmbeddingGateway,
     HybridRetrieval,
@@ -107,7 +112,7 @@ from deep_researcher.settings import Settings
 from deep_researcher.skills import SOURCE_COMPARISON_MANIFEST, manifest_hash, validate_manifest
 from deep_researcher.source_map import missing_source_map_chunk_ids
 from deep_researcher.storage import FileTooLargeError, LocalObjectStore
-from deep_researcher.task_runtime import persist_plan_v1
+from deep_researcher.task_runtime import ToolRegistry, persist_plan_v1
 from deep_researcher.tool_execution import (
     DisabledMcpGateway,
     McpGateway,
@@ -257,6 +262,7 @@ class RunDetailResponse(RunStatusResponse):
     plan: ResearchPlanResponse | None
     tasks: list[ResearchTaskResponse]
     usage: ModelUsageResponse | None
+    files: dict[str, list[dict[str, object]]]
 
 
 class LedgerCoverageResponse(BaseModel):
@@ -774,6 +780,8 @@ def create_app(
         ),
     )
     object_store = LocalObjectStore(resolved_settings.object_store_root)
+    research_file_store = ResearchFileStore(session_factory, object_store)
+    task_tool_registry = ToolRegistry(research_file_tool_definitions(research_file_store))
     document_processor = DocumentProcessor(
         session_factory,
         object_store,
@@ -855,6 +863,8 @@ def create_app(
         app.state.run_coordinator = coordinator
         app.state.tool_execution = tool_execution
         app.state.graph_runner = resolved_graph_runner
+        app.state.research_file_store = research_file_store
+        app.state.task_tool_registry = task_tool_registry
         if embedded_worker_enabled:
             run_worker.start()
         yield
@@ -872,6 +882,8 @@ def create_app(
     app.state.run_coordinator = coordinator
     app.state.tool_execution = tool_execution
     app.state.graph_runner = resolved_graph_runner
+    app.state.research_file_store = research_file_store
+    app.state.task_tool_registry = task_tool_registry
 
     def get_session() -> Iterator[Session]:
         yield from session_scope(session_factory)
@@ -1794,6 +1806,7 @@ def create_app(
         )
         session.add(run)
         session.flush()
+        frozen_sources = freeze_run_sources(session, run, attachments)
         research_plan = persist_plan_v1(session, run, content)
         session.add(
             ResearchLedger(
@@ -1839,7 +1852,30 @@ def create_app(
                 },
             )
         )
-        run.next_event_seq = 3
+        for offset, source in enumerate(frozen_sources, start=3):
+            session.add(
+                RunEvent(
+                    workspace_id=run.workspace_id,
+                    run_id=run.id,
+                    seq=offset,
+                    type="file_revision_committed",
+                    event_key=f"file-revision:{source.id}:{source.source_revision}",
+                    payload={
+                        "ref": {
+                            "kind": "source",
+                            "id": str(source.id),
+                            "revision": source.source_revision,
+                        },
+                        "name": source.normalized_name,
+                        "status": "frozen",
+                        "content_hash": source.content_hash,
+                        "size_bytes": source.size_bytes,
+                        "media_type": source.media_type,
+                        "failure_reason": None,
+                    },
+                )
+            )
+        run.next_event_seq = 3 + len(frozen_sources)
         workspace = session.get(Workspace, conversation.workspace_id)
         if workspace is not None:
             extract_explicit_memory(
@@ -1950,6 +1986,7 @@ def create_app(
             )
         }
         usage = session.scalar(select(UsageLedger).where(UsageLedger.run_id == run.id))
+        files = research_file_store.list_run(run.workspace_id, run.id)
         return RunDetailResponse(
             run_id=str(run.id),
             status=run.status,
@@ -2005,6 +2042,7 @@ def create_app(
                 if usage is not None
                 else None
             ),
+            files=files,
         )
 
     @app.get("/api/v1/runs/{run_id}/ledger", response_model=ResearchLedgerResponse)

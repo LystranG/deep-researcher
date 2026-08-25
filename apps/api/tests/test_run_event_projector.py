@@ -134,3 +134,51 @@ def test_partial_is_a_terminal_completed_event_and_unknown_task_status_is_ignore
     assert len(log.events) == 1
     assert log.events[0]["type"] == "run_completed"
     assert log.events[0]["event_key"] == f"run-terminal:{run_id}"
+
+
+def test_committed_file_revisions_and_publish_are_projected_with_stable_refs() -> None:
+    log = RecordingEventLog()
+    projector = RunEventProjector(log)
+    run_id = uuid4()
+    source_ref = {"kind": "source", "id": str(uuid4()), "revision": "1"}
+    work_ref = {"kind": "work", "id": str(uuid4()), "revision": "2"}
+    artifact_ref = {"kind": "artifact", "id": str(uuid4()), "revision": "1"}
+
+    projector.project_committed(
+        run_id,
+        {
+            "file_revisions": [
+                {
+                    "ref": source_ref,
+                    "name": "facts.txt",
+                    "status": "frozen",
+                    "content_hash": "a" * 64,
+                    "file_content": "must not leak",
+                },
+                {
+                    "ref": work_ref,
+                    "name": "summary.md",
+                    "status": "committed",
+                    "failure_reason": None,
+                },
+            ],
+            "artifacts": [
+                {
+                    "ref": artifact_ref,
+                    "source_ref": work_ref,
+                    "name": "summary.md",
+                    "status": "published",
+                    "failure_reason": None,
+                }
+            ],
+        },
+    )
+
+    assert [event["type"] for event in log.events] == [
+        "file_revision_committed",
+        "file_revision_committed",
+        "artifact_published",
+    ]
+    assert log.events[0]["payload"]["ref"] == source_ref
+    assert "file_content" not in log.events[0]["payload"]
+    assert log.events[2]["payload"]["source_ref"] == work_ref
