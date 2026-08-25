@@ -589,6 +589,7 @@ class ResearchCoordinator:
                         run_id=run.id,
                         seq=seq,
                         type=event_type,
+                        event_key=f"run-terminal:{run.id}",
                         payload=event_payload,
                     )
                 )
@@ -684,10 +685,30 @@ class ResearchCoordinator:
         lease_owner: str | None,
     ) -> None:
         """幂等投影 Graph 更新并固化 Planner 任务"""
+        committed_update = update
         if node_name == "planner":
             tasks = cast(list[TaskSpec], update.get("tasks", []))
             self._materialize_plan(run_id, tasks, lease_owner=lease_owner)
             self._reserve_budget(run_id, tasks, lease_owner=lease_owner)
+            committed_update = {
+                **update,
+                "committed_facts": {
+                    "plan": {
+                        "version": 1,
+                        "tasks": [
+                            {
+                                "ordinal": task["ordinal"],
+                                "role": task["role"],
+                                "title": task["title"],
+                                "status": (
+                                    "running" if task["ordinal"] == 1 else "pending"
+                                ),
+                            }
+                            for task in tasks
+                        ],
+                    }
+                },
+            }
         elif node_name == "researcher":
             self._record_researcher_outcome(
                 run_id,
@@ -729,7 +750,7 @@ class ResearchCoordinator:
                 lease_owner=lease_owner,
             )
         self._projector.project(
-            run_id, node_name, update, lease_owner=lease_owner
+            run_id, node_name, committed_update, lease_owner=lease_owner
         )
 
     def _materialize_plan(
@@ -1972,6 +1993,7 @@ class ResearchCoordinator:
                     run_id=run.id,
                     seq=seq,
                     type="run_cancelled",
+                    event_key=f"run-terminal:{run.id}",
                     payload={"message": "研究已停止"},
                 )
             )
@@ -2259,6 +2281,7 @@ class ResearchCoordinator:
                         run_id=run.id,
                         seq=assistant_seq,
                         type="assistant_delta",
+                        event_key="assistant-failure",
                         payload={"content": public_message},
                     )
                 )
@@ -2270,6 +2293,7 @@ class ResearchCoordinator:
                     run_id=run.id,
                     seq=seq,
                     type="run_failed",
+                    event_key=f"run-terminal:{run.id}",
                     payload={"message": "研究失败", "detail": safe_detail},
                 )
             )
