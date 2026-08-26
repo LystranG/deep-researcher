@@ -658,6 +658,8 @@ class McpToolResponse(BaseModel):
     name: str
     description: str
     input_schema: dict[str, object]
+    output_schema: dict[str, object] | None = None
+    annotations: dict[str, object] | None = None
 
 
 class McpToolListResponse(BaseModel):

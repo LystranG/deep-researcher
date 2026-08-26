@@ -321,6 +321,7 @@ class TaskModelTurn(Base):
     logical_call_ref: Mapped[str | None] = mapped_column(String(300), default=None)
     parameters_hash: Mapped[str | None] = mapped_column(String(64), default=None)
     safe_summary: Mapped[str | None] = mapped_column(String(1000), default=None)
+    tool_snapshot: Mapped[dict[str, object] | None] = mapped_column(JSON, default=None)
     failure_reason: Mapped[str | None] = mapped_column(String(200), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 

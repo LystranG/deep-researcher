@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol, TypedDict
@@ -119,6 +120,46 @@ class ToolDefinition:
     risk: str = "safe"
     handler: TaskToolAdapter | None = None
     requires_approval: bool = False
+    description: str = ""
+    output_schema: dict[str, object] | None = None
+    annotations: dict[str, object] | None = None
+    provider: str = "builtin"
+
+
+@dataclass(frozen=True)
+class ToolRegistrySnapshot:
+    """Immutable tool definitions bound to one Model Turn."""
+
+    snapshot_id: str
+    definitions: tuple[ToolDefinition, ...]
+
+    def get(self, name: str) -> ToolDefinition | None:
+        return next(
+            (definition for definition in self.definitions if definition.name == name),
+            None,
+        )
+
+    def validate(self, definition: ToolDefinition, arguments: dict[str, object]) -> str | None:
+        return _validate_tool_schema(definition.input_schema, arguments, "$")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.snapshot_id,
+            "tools": [
+                {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "input_schema": deepcopy(definition.input_schema),
+                    "output_schema": deepcopy(definition.output_schema),
+                    "result_contract": deepcopy(definition.result_contract),
+                    "risk": definition.risk,
+                    "requires_approval": definition.requires_approval,
+                    "annotations": deepcopy(definition.annotations),
+                    "provider": definition.provider,
+                }
+                for definition in self.definitions
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -148,6 +189,33 @@ class ToolRegistry:
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
         return tuple(self._definitions.values())
+
+    def snapshot(self) -> ToolRegistrySnapshot:
+        """Freeze definitions and copy schemas before a Model Turn starts."""
+        payload = [
+            {
+                "name": definition.name,
+                "input_schema": definition.input_schema,
+                "output_schema": definition.output_schema,
+                "result_contract": definition.result_contract,
+                "risk": definition.risk,
+                "requires_approval": definition.requires_approval,
+                "annotations": definition.annotations,
+                "provider": definition.provider,
+            }
+            for definition in self.definitions()
+        ]
+        canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        frozen = tuple(
+            replace(
+                definition,
+                input_schema=deepcopy(definition.input_schema),
+                output_schema=deepcopy(definition.output_schema),
+                annotations=deepcopy(definition.annotations),
+            )
+            for definition in self.definitions()
+        )
+        return ToolRegistrySnapshot(hashlib.sha256(canonical.encode()).hexdigest(), frozen)
 
     def validate(self, definition: ToolDefinition, arguments: dict[str, object]) -> str | None:
         return _validate_tool_schema(definition.input_schema, arguments, "$")
@@ -217,6 +285,7 @@ class TaskTurnContext:
     success_criteria: tuple[str, ...]
     allowed_tools: tuple[str, ...]
     previous_observation: TaskObservationResult | None = None
+    tool_snapshot: ToolRegistrySnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -629,7 +698,7 @@ class ReActTaskController:
         self._session_factory = session_factory
         self._model_gateway = model_gateway
         self._tool_adapter = tool_adapter
-        self._tool_registry = tool_registry
+        self._tool_registry = tool_registry.snapshot() if tool_registry is not None else None
         self._tool_policy = tool_policy or ToolPolicy()
         self._max_turns = max_turns
         self._no_evidence_gain_limit = no_evidence_gain_limit
@@ -780,6 +849,7 @@ class ReActTaskController:
                 success_criteria=tuple(task.success_criteria),
                 allowed_tools=tuple(task.allowed_tools),
                 previous_observation=_observation_draft(latest_observation),
+                tool_snapshot=self._tool_registry,
             )
 
         output, repair_failed = self._complete_turn(context)
@@ -1242,6 +1312,7 @@ class ReActTaskController:
                 output=_proposal_payload(proposal),
                 usage=proposal.usage,
                 provider_reference=proposal.provider_reference,
+                tool_snapshot=self._tool_registry.as_dict() if self._tool_registry else None,
             )
             session.add(turn)
             session.flush()
@@ -1302,6 +1373,7 @@ class ReActTaskController:
                 logical_call_ref=output.logical_call_ref,
                 parameters_hash=output.parameters_hash,
                 safe_summary=output.safe_summary,
+                tool_snapshot=self._tool_registry.as_dict() if self._tool_registry else None,
             )
             session.add(turn)
             session.flush()

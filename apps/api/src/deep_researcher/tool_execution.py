@@ -2,7 +2,7 @@ import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from threading import Lock
-from typing import Protocol, TypedDict
+from typing import NotRequired, Protocol, TypedDict
 from uuid import UUID
 
 from sqlalchemy import select
@@ -23,6 +23,8 @@ class McpToolDescriptor(TypedDict):
     name: str
     description: str
     input_schema: dict[str, object]
+    output_schema: NotRequired[dict[str, object] | None]
+    annotations: NotRequired[dict[str, object] | None]
 
 
 AGENT_TOOL_ALLOWLIST: dict[str, frozenset[str]] = {
