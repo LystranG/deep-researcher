@@ -1250,6 +1250,102 @@ class MemoryConflict(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class SandboxJob(Base):
+    """耐久的逻辑 Python Sandbox Tool Job。"""
+
+    __tablename__ = "sandbox_jobs"
+    __table_args__ = (
+        UniqueConstraint("invocation_key"),
+        CheckConstraint(
+            "purpose IN ('inspect_data', 'transform_artifact', 'derive_evidence')",
+            name="ck_sandbox_jobs_purpose",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
+    )
+    task_id: Mapped[UUID] = mapped_column(
+        ForeignKey("research_tasks.id", ondelete="CASCADE"), index=True
+    )
+    tool_call_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("tool_calls.id", ondelete="SET NULL"), index=True, default=None
+    )
+    invocation_key: Mapped[str] = mapped_column(String(300), unique=True)
+    parameters_hash: Mapped[str] = mapped_column(String(64))
+    purpose: Mapped[str] = mapped_column(String(32))
+    code: Mapped[str] = mapped_column(Text)
+    input_refs: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
+    timeout_seconds: Mapped[int] = mapped_column(Integer)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    error_category: Mapped[str | None] = mapped_column(String(64), default=None)
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class SandboxAttempt(Base):
+    """一次物理执行尝试，允许 Worker 崩溃后由新 Attempt 接管。"""
+
+    __tablename__ = "sandbox_attempts"
+    __table_args__ = (UniqueConstraint("job_id", "attempt_number"),)
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_jobs.id", ondelete="CASCADE"), index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), default="leased", index=True)
+    lease_owner: Mapped[str] = mapped_column(String(120))
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    executor_node_id: Mapped[str | None] = mapped_column(String(120), default=None)
+    executor_reference: Mapped[str | None] = mapped_column(String(300), default=None)
+    input_manifest: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
+    output_staging_key: Mapped[str | None] = mapped_column(String(500), default=None)
+    retryable: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_category: Mapped[str | None] = mapped_column(String(64), default=None)
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class SandboxObservation(Base):
+    """逻辑 Job 的至多一个有效终态 Observation。"""
+
+    __tablename__ = "sandbox_observations"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_jobs.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    attempt_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_attempts.id", ondelete="RESTRICT"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32))
+    attempt_count: Mapped[int] = mapped_column(Integer)
+    stdout_preview: Mapped[str] = mapped_column(Text, default="")
+    stderr_preview: Mapped[str] = mapped_column(Text, default="")
+    file_refs: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
+    result_reference: Mapped[str | None] = mapped_column(String(1000), default=None)
+    error_category: Mapped[str | None] = mapped_column(String(64), default=None)
+    error_message: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class SandboxExecution(Base):
     __tablename__ = "sandbox_executions"
 

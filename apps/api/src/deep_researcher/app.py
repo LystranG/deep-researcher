@@ -59,6 +59,7 @@ from deep_researcher.models import (
     ResearchTask,
     RunEvent,
     SandboxExecution,
+    SandboxJob,
     SkillInstallation,
     SkillPackage,
     SkillVersion,
@@ -106,6 +107,11 @@ from deep_researcher.sandbox import (
     SandboxInputMount,
     SandboxRequest,
     SandboxUnavailableError,
+)
+from deep_researcher.sandbox_jobs import (
+    SandboxJobError,
+    SandboxJobService,
+    python_execute_tool_definition,
 )
 from deep_researcher.security import hash_access_token, hash_password, issue_access_token
 from deep_researcher.settings import Settings
@@ -544,6 +550,21 @@ class SandboxExecutionResponse(BaseModel):
     derived_evidence: DerivedEvidenceResponse | None
 
 
+class SandboxJobResponse(BaseModel):
+    id: str
+    run_id: str
+    task_id: str
+    invocation_key: str
+    purpose: str
+    status: str
+    attempt_count: int
+    input_refs: list[dict[str, str]]
+    error_category: str | None
+    error_message: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
 class EvidenceCheckRequest(BaseModel):
     message_version: int = Field(ge=1)
     start_char: int = Field(ge=0)
@@ -781,7 +802,17 @@ def create_app(
     )
     object_store = LocalObjectStore(resolved_settings.object_store_root)
     research_file_store = ResearchFileStore(session_factory, object_store)
-    task_tool_registry = ToolRegistry(research_file_tool_definitions(research_file_store))
+    sandbox_job_service = SandboxJobService(
+        session_factory,
+        research_file_store,
+        max_timeout_seconds=resolved_settings.sandbox_max_timeout_seconds,
+    )
+    task_tool_registry = ToolRegistry(
+        (
+            *research_file_tool_definitions(research_file_store),
+            python_execute_tool_definition(sandbox_job_service),
+        )
+    )
     document_processor = DocumentProcessor(
         session_factory,
         object_store,
@@ -864,6 +895,7 @@ def create_app(
         app.state.tool_execution = tool_execution
         app.state.graph_runner = resolved_graph_runner
         app.state.research_file_store = research_file_store
+        app.state.sandbox_job_service = sandbox_job_service
         app.state.task_tool_registry = task_tool_registry
         if embedded_worker_enabled:
             run_worker.start()
@@ -883,6 +915,7 @@ def create_app(
     app.state.tool_execution = tool_execution
     app.state.graph_runner = resolved_graph_runner
     app.state.research_file_store = research_file_store
+    app.state.sandbox_job_service = sandbox_job_service
     app.state.task_tool_registry = task_tool_registry
 
     def get_session() -> Iterator[Session]:
@@ -3690,6 +3723,51 @@ def create_app(
     ) -> SandboxExecutionResponse:
         execution = accessible_sandbox_execution(session, user, execution_id)
         return sandbox_execution_response(session, execution)
+
+    def sandbox_job_response(job: SandboxJob) -> SandboxJobResponse:
+        return SandboxJobResponse(
+            id=str(job.id),
+            run_id=str(job.run_id),
+            task_id=str(job.task_id),
+            invocation_key=job.invocation_key,
+            purpose=job.purpose,
+            status=job.status,
+            attempt_count=job.attempt_count,
+            input_refs=list(job.input_refs),
+            error_category=job.error_category,
+            error_message=job.error_message,
+            created_at=job.created_at,
+            completed_at=job.completed_at,
+        )
+
+    def accessible_sandbox_job(
+        session: Session, user: User, job_id: UUID
+    ) -> SandboxJob:
+        job = session.scalar(
+            select(SandboxJob)
+            .join(WorkspaceMember, WorkspaceMember.workspace_id == SandboxJob.workspace_id)
+            .where(SandboxJob.id == job_id, WorkspaceMember.user_id == user.id)
+        )
+        if job is None:
+            raise HTTPException(status_code=404, detail="Sandbox Job 不存在")
+        return job
+
+    @app.get("/api/v1/sandbox-jobs/{job_id}", response_model=SandboxJobResponse)
+    def get_sandbox_job(
+        job_id: UUID, session: SessionDependency, user: CurrentUser
+    ) -> SandboxJobResponse:
+        return sandbox_job_response(accessible_sandbox_job(session, user, job_id))
+
+    @app.post("/api/v1/sandbox-jobs/{job_id}/cancel", response_model=SandboxJobResponse)
+    def cancel_sandbox_job(
+        job_id: UUID, session: SessionDependency, user: CurrentUser
+    ) -> SandboxJobResponse:
+        accessible_sandbox_job(session, user, job_id)
+        try:
+            job = sandbox_job_service.cancel(job_id)
+        except SandboxJobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return sandbox_job_response(job)
 
     @app.post(
         "/api/v1/sandbox-executions/{execution_id}/cancel",
