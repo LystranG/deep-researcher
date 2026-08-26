@@ -320,7 +320,6 @@ class TaskToolAdapter(Protocol):
     def execute(self, claim: TaskClaim, call: TaskToolCall) -> TaskObservationResult:
         """返回结构化 Observation，不返回模型可直接使用的 Task Outcome"""
 
-
 class TaskAdapter(Protocol):
     def execute(self, claim: TaskClaim) -> TaskExecutionResult:
         """Perform one bounded task quantum and return a deterministic proposal."""
@@ -745,22 +744,6 @@ class ReActTaskController:
                     TaskResultProposalRecord.id.desc(),
                 )
             )
-            if (
-                latest_turn is not None
-                and latest_turn.output_kind == "tool_call"
-                and latest_observation is None
-            ):
-                reason = "tool_observation_lost"
-                outcome = self._task_runtime.record_outcome(
-                    claim, TaskExecutionResult(kind="failed", failure_ref=reason)
-                )
-                return TaskAdvanceResult(
-                    status="terminal",
-                    task_id=task.id,
-                    turn_ordinal=latest_turn.turn_ordinal,
-                    outcome_ref=outcome.outcome_ref,
-                    reason=reason,
-                )
             if pending_proposal is not None:
                 replay_outcome = self._task_runtime.record_outcome(
                     claim,
@@ -852,6 +835,23 @@ class ReActTaskController:
                 tool_snapshot=self._tool_registry,
             )
 
+        # The previous process may have persisted the logical Tool Call and
+        # completed its side effect before dying. Reconcile that call before
+        # asking the model for another decision.
+        if (
+            latest_turn is not None
+            and latest_turn.output_kind == "tool_call"
+            and latest_observation is None
+        ):
+            recovered = self._recover_inflight_tool(claim, latest_turn)
+            if recovered is not None:
+                return self._finish_observation(
+                    claim,
+                    latest_turn,
+                    recovered,
+                    f"task-observation:{claim.task_id}:{latest_turn.turn_ordinal}",
+                )
+
         output, repair_failed = self._complete_turn(context)
         if repair_failed:
             self._persist_failed_turn(claim, turn_ordinal, "invalid_model_output")
@@ -929,6 +929,52 @@ class ReActTaskController:
         if isinstance(normalized, TaskResultProposal):
             return self._commit_result_proposal(claim, turn_ordinal, normalized)
         return self._execute_tool_call(claim, turn_ordinal, context, normalized)
+
+    def _recover_inflight_tool(
+        self, claim: TaskClaim, turn: TaskModelTurn
+    ) -> TaskObservationResult | None:
+        """Reconcile a tool call whose process died before Observation commit.
+
+        The logical call was written before the adapter ran. Recovery therefore
+        never asks the model for another decision. Durable adapters can expose
+        ``recover`` to look up the existing operation; local deterministic
+        adapters may safely reuse ``execute`` when it is idempotent by the
+        stable logical call reference.
+        """
+        call = _task_tool_call_from_payload(turn.output)
+        if call is None:
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="invalid_tool_call",
+                error_category="protocol",
+            )
+        registry = self._tool_registry
+        definition = registry.get(call.tool_name) if registry is not None else None
+        handler = definition.handler if definition is not None else self._tool_adapter
+        if handler is None:
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="tool_adapter_unavailable",
+                error_category="execution",
+            )
+        recover = getattr(handler, "recover", None)
+        operation = recover if callable(recover) else handler.execute
+        try:
+            result = operation(claim, call)
+        except Exception as exc:
+            category = _failure_category(exc)
+            return TaskObservationResult(
+                status="failed",
+                failure_ref=category,
+                error_category=category,
+            )
+        if not isinstance(result, TaskObservationResult):
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="invalid_tool_observation",
+                error_category="protocol",
+            )
+        return result
 
     def _complete_turn(self, context: TaskTurnContext) -> tuple[object, bool]:
         try:

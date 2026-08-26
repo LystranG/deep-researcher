@@ -30,7 +30,7 @@ from deep_researcher.task_runtime import (
     ToolRegistry,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 
 class ResumableWaitingAdapter:
@@ -54,6 +54,32 @@ class ResumableWaitingAdapter:
         return TaskObservationResult(
             result_reference="observation:approved",
             evidence_refs=("evidence:approved",),
+            evidence_gain=True,
+        )
+
+
+class RecoverableAdapter:
+    """模拟外部副作用已完成、进程在 Observation 提交前崩溃。"""
+
+    def __init__(self) -> None:
+        self.execute_calls = 0
+        self.recover_calls = 0
+
+    def execute(self, claim, call):
+        del claim, call
+        self.execute_calls += 1
+        return TaskObservationResult(
+            result_reference="observation:external-once",
+            evidence_refs=("evidence:external-once",),
+            evidence_gain=True,
+        )
+
+    def recover(self, claim, call):
+        del claim, call
+        self.recover_calls += 1
+        return TaskObservationResult(
+            result_reference="observation:external-once",
+            evidence_refs=("evidence:external-once",),
             evidence_gain=True,
         )
 
@@ -393,6 +419,68 @@ def test_react_controller_round_trips_observation_before_result_proposal(tmp_pat
     assert second.outcome_ref == replay.outcome_ref
     assert len(observations) == len(proposals) == 1
     assert len(turns) == 2
+
+
+def test_react_controller_recovers_inflight_tool_without_second_model_turn(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'inflight-recovery.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "inflight-recovery"},
+            json={"content": "测试工具副作用恢复"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            task_id = task.id
+            tool_name = task.allowed_tools[0] if task.allowed_tools else "web_search"
+            session.commit()
+        claim = runtime.claim(task_id, lease_owner="recovery-worker")
+        assert claim is not None
+        adapter = RecoverableAdapter()
+        model = DeterministicTaskModelGateway(
+            [TaskToolCall(tool_name=tool_name, arguments={"query": "once"})]
+        )
+        controller = ReActTaskController(
+            app.state.session_factory,
+            model_gateway=model,
+            tool_adapter=adapter,
+        )
+
+        first = controller.advance(claim)
+        assert first.status == "runnable"
+        with app.state.session_factory.begin() as session:
+            session.execute(
+                delete(TaskObservation).where(TaskObservation.task_id == task_id)
+            )
+
+        recovered = controller.advance(claim)
+        with app.state.session_factory() as session:
+            observation = session.scalar(
+                select(TaskObservation).where(TaskObservation.task_id == task_id)
+            )
+            turns = session.scalars(
+                select(TaskModelTurn).where(TaskModelTurn.task_id == task_id)
+            ).all()
+
+    assert recovered.status == "runnable"
+    assert adapter.execute_calls == 1
+    assert adapter.recover_calls == 1
+    assert len(model.contexts) == 1
+    assert observation is not None
+    assert len(turns) == 1
 
 
 def test_react_controller_rejects_model_owned_outcome_and_repairs_once(tmp_path) -> None:

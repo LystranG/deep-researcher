@@ -1985,18 +1985,26 @@ class ResearchCoordinator:
             run.status = "cancelled"
             run.completed_at = cancelled_at
             self._finalize_ledger(session, run, status="cancelled")
-            seq = run.next_event_seq
-            run.next_event_seq += 1
-            session.add(
-                RunEvent(
-                    workspace_id=run.workspace_id,
-                    run_id=run.id,
-                    seq=seq,
-                    type="run_cancelled",
-                    event_key=f"run-terminal:{run.id}",
-                    payload={"message": "研究已停止"},
+            event_key = f"run-terminal:{run.id}"
+            existing_terminal_event = session.scalar(
+                select(RunEvent).where(
+                    RunEvent.run_id == run.id,
+                    RunEvent.event_key == event_key,
                 )
             )
+            if existing_terminal_event is None:
+                seq = run.next_event_seq
+                run.next_event_seq += 1
+                session.add(
+                    RunEvent(
+                        workspace_id=run.workspace_id,
+                        run_id=run.id,
+                        seq=seq,
+                        type="run_cancelled",
+                        event_key=event_key,
+                        payload={"message": "研究已停止"},
+                    )
+                )
             result_status = run.status
         if waiting_approval:
             self._tool_execution.cancel_pending(run_id)
