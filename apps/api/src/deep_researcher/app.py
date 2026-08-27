@@ -14,7 +14,15 @@ from uuid import UUID
 import anyio
 from alembic import command
 from alembic.config import Config
-from fastapi import Depends, FastAPI, Header, HTTPException, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, EmailStr, Field
@@ -2281,6 +2289,7 @@ def create_app(
     def upload_attachment(
         conversation_id: UUID,
         file: UploadFile,
+        background_tasks: BackgroundTasks,
         session: SessionDependency,
         user: CurrentUser,
     ) -> AttachmentResponse:
@@ -2313,7 +2322,9 @@ def create_app(
         attachment.size_bytes = size_bytes
         attachment.sha256 = sha256
         session.commit()
-        file_executor.submit(document_processor.process, attachment.id)
+        # Run only after the request transaction and dependency session have
+        # fully completed, so the processor cannot race the upload commit.
+        background_tasks.add_task(document_processor.process, attachment.id)
         return attachment_response(attachment)
 
     @app.get("/api/v1/attachments/{attachment_id}", response_model=AttachmentResponse)

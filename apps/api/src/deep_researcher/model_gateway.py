@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Protocol, cast
@@ -59,7 +60,9 @@ class ExtractiveModelGateway:
         if "source-comparison" in context.skills and evidence is None:
             yield "来源比较：当前没有可定位资料，无法完成多来源对照。"
         elif evidence is not None:
-            yield f"根据资料：{evidence} [1]"
+            # Numeric markers in source text are prose, not Writer citations.
+            safe_evidence = re.sub(r"\[(\d+)]", r"(\1)", evidence)
+            yield f"根据资料：{safe_evidence} [1]"
         elif context.correction is not None:
             yield f"根据当前会话中的纠正：{context.correction}"
         elif context.memory is not None:

@@ -1,5 +1,6 @@
 import asyncio
 import operator
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -19,7 +20,11 @@ from deep_researcher.agents.researcher import (
 )
 from deep_researcher.agents.verifier import VerificationResult, verify
 from deep_researcher.agents.writer import WriterOutput, write
-from deep_researcher.citation_validator import CitationDraft, validate_answer
+from deep_researcher.citation_validator import (
+    CitationDraft,
+    CitationValidationError,
+    validate_answer,
+)
 from deep_researcher.model_gateway import ExtractiveModelGateway, ModelGateway
 from deep_researcher.research_context import (
     FrozenResearchContext,
@@ -227,9 +232,18 @@ async def _run_writer(
 def _run_citation_validator(state: ResearchState) -> dict[str, object]:
     """校验 Writer 草稿并只返回可公开的安全回答"""
     sources = citable_sources(state["research_context"])
-    validation = validate_answer(
-        state["draft_answer"], [source["text"] for source in sources if "text" in source]
-    )
+    try:
+        validation = validate_answer(
+            state["draft_answer"], [source["text"] for source in sources if "text" in source]
+        )
+    except CitationValidationError as exc:
+        # Some providers repeat a citation marker while composing. Preserve
+        # the answer as a citation-free partial result; unknown markers remain
+        # hard failures because they cannot be bound to frozen evidence.
+        if "重复 Citation" not in str(exc):
+            raise
+        answer = re.sub(r"\[\d+]", "", state["draft_answer"]).strip()
+        return {"answer": answer, "answer_deltas": [answer], "citation_drafts": []}
     return {
         "answer": validation.answer,
         "answer_deltas": [validation.answer],
