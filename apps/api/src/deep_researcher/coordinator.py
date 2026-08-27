@@ -685,6 +685,21 @@ class ResearchCoordinator:
         lease_owner: str | None,
     ) -> None:
         """幂等投影 Graph 更新并固化 Planner 任务"""
+        stage_by_node = {
+            "planner": "planning",
+            "researcher": "researching",
+            "verifier": "verifying",
+            "writer": "writing",
+        }
+        stage = stage_by_node.get(node_name)
+        if stage is not None:
+            self._append_event(
+                run_id,
+                "run_progress",
+                {"stage": stage},
+                event_key=f"run-stage:{stage}",
+                lease_owner=lease_owner,
+            )
         committed_update = update
         if node_name == "planner":
             tasks = cast(list[TaskSpec], update.get("tasks", []))

@@ -852,19 +852,19 @@ class ReActTaskController:
                     f"task-observation:{claim.task_id}:{latest_turn.turn_ordinal}",
                 )
 
-        output, repair_failed = self._complete_turn(context)
-        if repair_failed:
-            self._persist_failed_turn(claim, turn_ordinal, "invalid_model_output")
+        output, failure_reason = self._complete_turn(context)
+        if failure_reason is not None:
+            self._persist_failed_turn(claim, turn_ordinal, failure_reason)
             outcome = self._task_runtime.record_outcome(
                 claim,
-                TaskExecutionResult(kind="failed", failure_ref="invalid_model_output"),
+                TaskExecutionResult(kind="failed", failure_ref=failure_reason),
             )
             return TaskAdvanceResult(
                 status="terminal",
                 task_id=claim.task_id,
                 turn_ordinal=turn_ordinal,
                 outcome_ref=outcome.outcome_ref,
-                reason="invalid_model_output",
+                reason=failure_reason,
             )
         try:
             normalized = _normalize_task_model_output(output)
@@ -976,37 +976,37 @@ class ReActTaskController:
             )
         return result
 
-    def _complete_turn(self, context: TaskTurnContext) -> tuple[object, bool]:
+    def _complete_turn(self, context: TaskTurnContext) -> tuple[object, str | None]:
         try:
             output = self._model_gateway.complete_task_turn(context)
         except InvalidTaskModelOutputError as exc:
             repair = getattr(self._model_gateway, "repair_task_turn", None)
             if not callable(repair):
-                return exc, True
+                return exc, "invalid_model_output"
             try:
                 repaired = repair(context, exc)
             except Exception:
-                return exc, True
+                return exc, "invalid_model_output"
             try:
                 _normalize_task_model_output(repaired)
             except InvalidTaskModelOutputError:
-                return repaired, True
-            return repaired, False
+                return repaired, "invalid_model_output"
+            return repaired, None
         except Exception as exc:
-            return exc, True
+            return exc, _failure_category(exc)
         try:
             _normalize_task_model_output(output)
         except InvalidTaskModelOutputError:
             repair = getattr(self._model_gateway, "repair_task_turn", None)
             if not callable(repair):
-                return output, True
+                return output, "invalid_model_output"
             try:
                 repaired = repair(context, output)
                 _normalize_task_model_output(repaired)
             except Exception:
-                return output, True
-            return repaired, False
-        return output, False
+                return output, "invalid_model_output"
+            return repaired, None
+        return output, None
 
     def _execute_tool_call(
         self,

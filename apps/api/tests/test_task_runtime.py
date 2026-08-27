@@ -539,6 +539,74 @@ def test_react_controller_rejects_model_owned_outcome_and_repairs_once(tmp_path)
     assert turn.output_kind == "result_proposal"
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (TimeoutError(), "provider_timeout"),
+        (type("RateLimitError", (RuntimeError,), {"status_code": 429})(), "provider_rate_limited"),
+        (RuntimeError("provider unavailable"), "provider_error"),
+    ],
+)
+def test_react_controller_persists_provider_failures_without_repair(
+    tmp_path, error, reason
+) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'provider-failure.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    app = create_app(settings, embedded_worker=False)
+
+    with TestClient(app) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        created = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": f"provider-failure-{reason}"},
+            json={"content": "测试 provider 失败分类"},
+        ).json()
+        runtime = TaskRuntime(app.state.session_factory)
+        with app.state.session_factory() as session:
+            task = session.scalar(
+                select(ResearchTask)
+                .where(ResearchTask.run_id == UUID(created["run_id"]))
+                .order_by(ResearchTask.ordinal)
+            )
+            assert task is not None
+            claim = runtime.claim(task.id, lease_owner="provider-worker")
+        assert claim is not None
+
+        class FailingGateway:
+            repair_calls = 0
+
+            def complete_task_turn(self, _context):
+                raise error
+
+            def repair_task_turn(self, _context, _invalid):
+                self.repair_calls += 1
+                raise AssertionError("provider failures must not trigger controlled repair")
+
+        gateway = FailingGateway()
+        result = ReActTaskController(
+            app.state.session_factory, model_gateway=gateway
+        ).advance(claim)
+        with app.state.session_factory() as session:
+            turn = session.scalar(
+                select(TaskModelTurn).where(TaskModelTurn.task_id == claim.task_id)
+            )
+            outcome = session.scalar(
+                select(TaskOutcome).where(TaskOutcome.task_id == claim.task_id)
+            )
+
+    assert result.status == "terminal"
+    assert result.reason == reason
+    assert gateway.repair_calls == 0
+    assert turn is not None
+    assert turn.failure_reason == reason
+    assert outcome is not None
+    assert outcome.kind == "failed"
+    assert outcome.failure_ref == reason
+
+
 def test_react_controller_stops_after_two_successful_turns_without_evidence_gain(tmp_path) -> None:
     settings = Settings(
         database_url=f"sqlite:///{tmp_path / 'bounded-no-gain.db'}",
