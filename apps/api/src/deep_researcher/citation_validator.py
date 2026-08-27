@@ -58,22 +58,17 @@ def validate_citation_drafts(
 def validate_answer(
     answer: str, evidence: str | list[str] | None
 ) -> CitationValidationResult:
-    """拒绝冻结 SourceSet 之外的引用并执行抽取式降级"""
+    """拒绝冻结 SourceSet 之外的引用，不改写 Writer 草稿。"""
     evidences = [evidence] if isinstance(evidence, str) else (evidence or [])
-    labels = {int(label) for label in re.findall(r"\[(\d+)]", answer)}
-    allowed_labels = set(range(1, len(evidences) + 1))
-    if labels - allowed_labels or (evidences and not labels):
-        answer = (
-            f"根据资料：{evidences[0]} [1]" if evidences else "当前没有可核验资料。"
-        )
-        labels = {1} if evidences else set()
     citation_drafts: list[CitationDraft] = []
-    for label in sorted(labels):
+    for marker in re.finditer(r"\[(\d+)]", answer):
+        label = int(marker.group(1))
         citation_drafts.append(
             {
                 "label": label,
-                "answer_start": answer.index(f"[{label}]"),
-                "answer_end": answer.index(f"[{label}]") + len(f"[{label}]"),
+                "answer_start": marker.start(),
+                "answer_end": marker.end(),
             }
         )
-    return CitationValidationResult(answer=answer, citations=tuple(citation_drafts))
+    citations = validate_citation_drafts(answer, citation_drafts, len(evidences))
+    return CitationValidationResult(answer=answer, citations=citations)

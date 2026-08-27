@@ -318,11 +318,10 @@ class ResearchCoordinator:
                     citation_drafts,
                     len(citable_sources(graph_state["research_context"])),
                 )
-            except CitationValidationError:
-                # A malformed provider draft must never become a persisted
-                # Citation. The answer remains publishable only as a
-                # citation-free partial result.
-                citation_drafts = []
+            except CitationValidationError as exc:
+                raise CitationValidationError(
+                    "Writer 输出包含无法绑定到当前 Research Run 的 Citation"
+                ) from exc
             reduction = (
                 self._source_map_ledger.reduce(run_id, run.workspace_id, map_budget)
                 if self._requires_whole_page_map(question)
@@ -474,10 +473,14 @@ class ResearchCoordinator:
                         label = citation_draft["label"]
                         citable = citable_sources(final_research_context)
                         if label < 1 or label > len(citable):
-                            continue
+                            raise CitationValidationError(
+                                "Citation label 不属于当前 Research Run 的可发布证据"
+                            )
                         source = citable[label - 1]
                         if not self._valid_citation_source(session, run, source):
-                            continue
+                            raise CitationValidationError(
+                                "Citation 来源不属于当前 Research Run 或已不再可验证"
+                            )
                         citation = Citation(
                             workspace_id=run.workspace_id,
                             message_id=message.id,
@@ -501,22 +504,25 @@ class ResearchCoordinator:
                                 DerivedEvidence.workspace_id == run.workspace_id,
                             )
                         )
-                        if derived_evidence is not None:
-                            citation = Citation(
-                                workspace_id=run.workspace_id,
-                                message_id=message.id,
-                                derived_evidence_id=derived_evidence.id,
-                                label=derived_citation_draft.label,
-                                answer_start=derived_citation_draft.answer_start,
-                                answer_end=derived_citation_draft.answer_end,
-                                evidence_start=derived_citation_draft.evidence_start,
-                                evidence_end=derived_citation_draft.evidence_end,
-                                source_hash=derived_citation_draft.source_hash,
+                        if derived_evidence is None:
+                            raise CitationValidationError(
+                                "派生 Citation 不属于当前 Research Run"
                             )
-                            session.add(citation)
-                            session.flush()
-                            citation_ids.append(str(citation.id))
-                            persisted_citations.append(citation)
+                        citation = Citation(
+                            workspace_id=run.workspace_id,
+                            message_id=message.id,
+                            derived_evidence_id=derived_evidence.id,
+                            label=derived_citation_draft.label,
+                            answer_start=derived_citation_draft.answer_start,
+                            answer_end=derived_citation_draft.answer_end,
+                            evidence_start=derived_citation_draft.evidence_start,
+                            evidence_end=derived_citation_draft.evidence_end,
+                            source_hash=derived_citation_draft.source_hash,
+                        )
+                        session.add(citation)
+                        session.flush()
+                        citation_ids.append(str(citation.id))
+                        persisted_citations.append(citation)
                     verification_status = (
                         map_verification_status
                         or (

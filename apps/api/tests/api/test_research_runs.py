@@ -37,6 +37,13 @@ class BudgetProbeGateway:
         yield "预算测试模型结论"
 
 
+class InvalidCitationGateway:
+    """模拟 Writer 输出不属于当前 Run Evidence 的引用。"""
+
+    async def astream_answer(self, context):
+        yield "错误引用 [2]"
+
+
 class CancellableStreamingGateway:
     """持续生成直到运行时取消 token 生效"""
 
@@ -194,6 +201,41 @@ def test_workspace_quota_failure_stops_before_model_conclusion(tmp_path) -> None
     assert "event: run_failed" in events.text
     assert "event: assistant_delta" not in events.text
     assert "预算测试模型结论" not in events.text
+
+
+def test_invalid_writer_citation_fails_without_publishing_a_message(tmp_path) -> None:
+    settings = Settings(
+        database_url=f"sqlite:///{tmp_path / 'test.db'}",
+        object_store_root=tmp_path / "objects",
+    )
+    with running_worker_client(
+        settings,
+        model_gateway=InvalidCitationGateway(),
+        web_search_gateway=DisabledWebSearchGateway(),
+    ) as client:
+        headers = register(client)
+        conversation_id = create_conversation(client, headers)
+        run = client.post(
+            f"/api/v1/conversations/{conversation_id}/messages",
+            headers={**headers, "Idempotency-Key": "invalid-writer-citation"},
+            json={"content": "引用必须可验证"},
+        ).json()
+        events = client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
+        detail = client.get(
+            f"/api/v1/conversations/{conversation_id}/latest-run", headers=headers
+        ).json()
+        messages = client.get(
+            f"/api/v1/conversations/{conversation_id}/messages", headers=headers
+        ).json()["items"]
+        citations = client.get(
+            f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
+        ).json()["items"]
+
+    assert detail["status"] == "failed"
+    assert messages[-1]["content"] == ""
+    assert citations == []
+    assert "event: run_failed" in events.text
+    assert "错误引用 [2]" not in events.text
 
 
 def test_complex_research_budget_failure_skips_downstream_work_and_exposes_impact(tmp_path) -> None:

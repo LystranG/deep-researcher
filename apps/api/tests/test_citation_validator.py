@@ -1,6 +1,7 @@
 import pytest
 from deep_researcher.citation_validator import (
     CitationValidationError,
+    validate_answer,
     validate_citation_drafts,
 )
 
@@ -41,3 +42,8 @@ def test_validate_citation_drafts_rejects_repeated_visible_markers() -> None:
 
     with pytest.raises(CitationValidationError):
         validate_citation_drafts("事实 [1]，补充 [1]", drafts, evidence_count=1)
+
+
+def test_validate_answer_rejects_unknown_markers_instead_of_rewriting_the_draft() -> None:
+    with pytest.raises(CitationValidationError, match="无效 Citation"):
+        validate_answer("不存在的引用 [2]", ["唯一证据"])
