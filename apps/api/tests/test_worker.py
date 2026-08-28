@@ -26,6 +26,15 @@ class Runtime:
         self.calls.append((run_id, lease_owner))
 
 
+class SandboxRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run_once(self) -> bool:
+        self.calls += 1
+        return True
+
+
 def test_worker_executes_the_configured_runtime_entrypoint() -> None:
     queue = Queue()
     runtime = Runtime()
@@ -34,3 +43,12 @@ def test_worker_executes_the_configured_runtime_entrypoint() -> None:
     assert worker.run_once() is True
     assert runtime.calls == [(queue.run_id, "runtime-worker")]
     assert queue.released == [(queue.run_id, "runtime-worker")]
+
+
+def test_worker_polls_sandbox_runtime_when_run_queue_is_empty() -> None:
+    queue = Queue()
+    queue.claim = lambda _owner: None
+    sandbox = SandboxRuntime()
+
+    assert RunWorker(queue, Runtime(), sandbox_runtime=sandbox).run_once() is True
+    assert sandbox.calls == 1

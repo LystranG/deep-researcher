@@ -737,7 +737,10 @@ def create_app(
     )
     resolved_embedding_gateway = embedding_gateway
     resolved_rerank_gateway = rerank_gateway
-    retrieval_configured = any(
+    retrieval_configured = not (
+        model_gateway is None
+        and resolved_settings.database_url.startswith("sqlite")
+    ) and any(
         bool(value)
         for value in (
             resolved_settings.embedding_api_key,

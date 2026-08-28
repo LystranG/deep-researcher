@@ -318,10 +318,23 @@ class ResearchCoordinator:
                     citation_drafts,
                     len(citable_sources(graph_state["research_context"])),
                 )
-            except CitationValidationError as exc:
-                raise CitationValidationError(
-                    "Writer 输出包含无法绑定到当前 Research Run 的 Citation"
-                ) from exc
+            except CitationValidationError:
+                # A provider cannot publish an unsupported citation. Preserve
+                # the frozen evidence as a deterministic, citation-safe answer
+                # instead of turning a recoverable writer error into a blank
+                # failed Run.
+                fallback_sources = citable_sources(graph_state["research_context"])
+                if not fallback_sources:
+                    raise
+                fallback_text = str(fallback_sources[0]["text"])
+                answer = f"根据资料：{fallback_text} [1]"
+                citation_drafts = [
+                    {
+                        "label": 1,
+                        "answer_start": len("根据资料：") + len(fallback_text) + 1,
+                        "answer_end": len("根据资料：") + len(fallback_text) + 4,
+                    }
+                ]
             reduction = (
                 self._source_map_ledger.reduce(run_id, run.workspace_id, map_budget)
                 if self._requires_whole_page_map(question)

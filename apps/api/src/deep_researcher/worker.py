@@ -13,6 +13,11 @@ class RunRuntime(Protocol):
         """Execute one leased Run without owning queue or lease lifecycle."""
 
 
+class SandboxRuntime(Protocol):
+    def run_once(self) -> bool:
+        """Execute one durably claimed Sandbox Job."""
+
+
 class RuntimeV2EntryPoint:
     """Runtime v2 entry point bound to the currently configured run implementation."""
 
@@ -31,11 +36,13 @@ class RunWorker:
         queue: RunQueue,
         runtime: RunRuntime,
         *,
+        sandbox_runtime: SandboxRuntime | None = None,
         poll_interval_seconds: float = 0.05,
         owner: str | None = None,
     ) -> None:
         self._queue = queue
         self._runtime = runtime
+        self._sandbox_runtime = sandbox_runtime
         self._poll_interval_seconds = poll_interval_seconds
         self._owner = owner or f"worker-{uuid4()}"
         self._stop_event = Event()
@@ -45,7 +52,11 @@ class RunWorker:
         """领取并执行一个运行，返回是否实际领取到任务"""
         run_id = self._queue.claim(self._owner)
         if run_id is None:
-            return False
+            return (
+                self._sandbox_runtime.run_once()
+                if self._sandbox_runtime is not None
+                else False
+            )
         heartbeat_stop = Event()
 
         def heartbeat_loop() -> None:

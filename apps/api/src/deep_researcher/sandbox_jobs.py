@@ -423,6 +423,27 @@ class SandboxJobService:
             raise SandboxJobError("sandbox attempt limit exceeds policy")
 
 
+class SandboxJobWorker:
+    """Polls the durable Sandbox Job queue from the dedicated Worker process."""
+
+    def __init__(
+        self,
+        service: SandboxJobService,
+        executor: SandboxExecutor,
+        *,
+        worker_id: str,
+    ) -> None:
+        self._service = service
+        self._executor = executor
+        self._worker_id = worker_id
+
+    def run_once(self) -> bool:
+        return self._service.run_once(
+            worker_id=self._worker_id,
+            executor=self._executor,
+        )
+
+
 class SandboxToolAdapter:
     """Task Tool adapter that queues a Job and returns a durable wait reference."""
 
