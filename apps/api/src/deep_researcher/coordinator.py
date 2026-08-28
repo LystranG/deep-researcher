@@ -1287,9 +1287,20 @@ class ResearchCoordinator:
             if selected is None:
                 return None
             if selected.source_kind == "research_record":
-                return self._frozen_research_record_source(
-                    session, run, UUID(selected.candidate_id)
+                current_source = next(
+                    (
+                        item.candidate
+                        for item in page.items
+                        if item.candidate.source_kind == "source_chunk"
+                    ),
+                    None,
                 )
+                if current_source is not None:
+                    selected = current_source
+                else:
+                    return self._frozen_research_record_source(
+                        session, run, UUID(selected.candidate_id)
+                    )
             selected_chunk = session.get(SourceChunk, UUID(selected.candidate_id))
             return (
                 self._freeze_source_chunk(selected_chunk)

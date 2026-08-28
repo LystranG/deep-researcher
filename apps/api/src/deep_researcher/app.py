@@ -2637,6 +2637,12 @@ def create_app(
                     start_offset=chunk.start_offset,
                     end_offset=chunk.end_offset,
                     content_hash=chunk.content_hash,
+                    embedding=chunk.embedding,
+                    embedding_model=chunk.embedding_model,
+                    embedding_dimensions=chunk.embedding_dimensions,
+                    embedding_status=chunk.embedding_status,
+                    embedding_error=chunk.embedding_error,
+                    indexed_at=chunk.indexed_at,
                 )
             )
         attachment.promoted_document_id = document.id

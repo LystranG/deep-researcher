@@ -333,6 +333,7 @@ class PostgresSourceChunkRetrievalAdapter:
             Attachment.workspace_id == workspace_id,
             Attachment.status == "ready",
             Attachment.deleted_at.is_(None),
+            Attachment.promoted_document_id.is_(None),
         )
         workspace_scope = and_(
             SourceChunk.document_version_id.is_not(None),
