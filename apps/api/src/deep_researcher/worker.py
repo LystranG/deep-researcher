@@ -1,8 +1,26 @@
 from threading import Event, Thread
-from uuid import uuid4
+from typing import Protocol
+from uuid import UUID, uuid4
 
 from deep_researcher.coordinator import ResearchCoordinator
 from deep_researcher.run_queue import RunQueue
+
+
+class RunRuntime(Protocol):
+    """The only execution boundary used by the durable Run worker."""
+
+    def execute_run(self, run_id: UUID, *, lease_owner: str) -> None:
+        """Execute one leased Run without owning queue or lease lifecycle."""
+
+
+class RuntimeV2EntryPoint:
+    """Runtime v2 entry point bound to the currently configured run implementation."""
+
+    def __init__(self, coordinator: ResearchCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def execute_run(self, run_id: UUID, *, lease_owner: str) -> None:
+        self._coordinator.execute_run(run_id, lease_owner=lease_owner)
 
 
 class RunWorker:
@@ -11,13 +29,13 @@ class RunWorker:
     def __init__(
         self,
         queue: RunQueue,
-        coordinator: ResearchCoordinator,
+        runtime: RunRuntime,
         *,
         poll_interval_seconds: float = 0.05,
         owner: str | None = None,
     ) -> None:
         self._queue = queue
-        self._coordinator = coordinator
+        self._runtime = runtime
         self._poll_interval_seconds = poll_interval_seconds
         self._owner = owner or f"worker-{uuid4()}"
         self._stop_event = Event()
@@ -37,7 +55,7 @@ class RunWorker:
         heartbeat_thread = Thread(target=heartbeat_loop, name="research-worker-heartbeat")
         heartbeat_thread.start()
         try:
-            self._coordinator.execute_run(run_id, lease_owner=self._owner)
+            self._runtime.execute_run(run_id, lease_owner=self._owner)
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2)

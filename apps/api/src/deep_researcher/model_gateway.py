@@ -59,16 +59,14 @@ class ExtractiveModelGateway:
         evidence = context.evidences[0] if context.evidences else context.evidence
         if "source-comparison" in context.skills and evidence is None:
             yield "来源比较：当前没有可定位资料，无法完成多来源对照。"
+        elif context.correction is not None:
+            yield f"根据当前会话中的纠正：{context.correction}"
         elif evidence is not None:
             # Numeric markers in source text are prose, not Writer citations.
             safe_evidence = re.sub(r"\[(\d+)]", r"(\1)", evidence)
             yield f"根据资料：{safe_evidence} [1]"
-        elif context.correction is not None:
-            yield f"根据当前会话中的纠正：{context.correction}"
         elif context.memory is not None:
             yield f"根据长期记忆：{context.memory}"
-        elif context.conversation_leads:
-            yield f"根据历史会话线索：{context.conversation_leads[0]}"
         else:
             yield f"已完成对“{context.question}”的初步研究。"
 

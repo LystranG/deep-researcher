@@ -58,6 +58,7 @@ class TaskClaim:
     lease_owner: str
     fencing_epoch: int
     lease_expires_at: datetime
+    run_fencing_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -583,6 +584,9 @@ class TaskRuntime:
                     lease_owner=lease_owner,
                     fencing_epoch=task.fencing_epoch,
                     lease_expires_at=_as_utc(task.lease_expires_at),
+                    run_fencing_epoch=(
+                        run.attempt if run.lease_owner == lease_owner else None
+                    ),
                 )
             task.fencing_epoch += 1
             task.status = "running"
@@ -603,6 +607,7 @@ class TaskRuntime:
                 lease_owner=lease_owner,
                 fencing_epoch=task.fencing_epoch,
                 lease_expires_at=task.lease_expires_at,
+                run_fencing_epoch=run.attempt if run.lease_owner == lease_owner else None,
             )
 
     def record_outcome(self, claim: TaskClaim, result: TaskExecutionResult) -> TaskOutcome:
@@ -624,6 +629,13 @@ class TaskRuntime:
                 or task.lease_expires_at is None
                 or _as_utc(task.lease_expires_at) < datetime.now(UTC)
                 or run is None
+                or (
+                    claim.run_fencing_epoch is not None
+                    and (
+                        run.lease_owner != claim.lease_owner
+                        or run.attempt != claim.run_fencing_epoch
+                    )
+                )
                 or (
                     run.cancel_requested_at is not None
                     and result.kind != "cancelled"

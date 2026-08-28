@@ -39,7 +39,7 @@ from deep_researcher.document_processor import (
 )
 from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.mcp_adapter import LocalTrustedHttpMcpAdapter
-from deep_researcher.model_gateway import ModelGateway, build_model_gateway
+from deep_researcher.model_gateway import ExtractiveModelGateway, ModelGateway, build_model_gateway
 from deep_researcher.models import (
     Artifact,
     Attachment,
@@ -139,8 +139,12 @@ from deep_researcher.web_page import (
     WebAcquisition,
     WebAcquisitionGateway,
 )
-from deep_researcher.web_search import WebSearchGateway, build_web_search_gateway
-from deep_researcher.worker import RunWorker
+from deep_researcher.web_search import (
+    DisabledWebSearchGateway,
+    WebSearchGateway,
+    build_web_search_gateway,
+)
+from deep_researcher.worker import RuntimeV2EntryPoint, RunWorker
 
 
 class RegisterRequest(BaseModel):
@@ -704,15 +708,27 @@ def create_app(
     resolved_settings = settings or Settings()
     engine = build_engine(resolved_settings.database_url)
     session_factory = build_session_factory(engine)
-    resolved_model_gateway = model_gateway or build_model_gateway(
-        api_key=resolved_settings.openai_api_key,
-        api_base=resolved_settings.openai_api_base,
-        model=resolved_settings.openai_model,
-        reasoning_effort=resolved_settings.openai_reasoning_effort,
-    )
-    resolved_web_search_gateway = web_search_gateway or build_web_search_gateway(
-        api_key=resolved_settings.brave_search_api_key
-    )
+    resolved_model_gateway = model_gateway
+    if resolved_model_gateway is None:
+        # SQLite is the deterministic local/test deployment. It must not
+        # accidentally inherit a provider key from the developer shell.
+        if resolved_settings.database_url.startswith("sqlite"):
+            resolved_model_gateway = ExtractiveModelGateway()
+        else:
+            resolved_model_gateway = build_model_gateway(
+                api_key=resolved_settings.openai_api_key,
+                api_base=resolved_settings.openai_api_base,
+                model=resolved_settings.openai_model,
+                reasoning_effort=resolved_settings.openai_reasoning_effort,
+            )
+    if web_search_gateway is not None:
+        resolved_web_search_gateway = web_search_gateway
+    elif resolved_settings.database_url.startswith("sqlite"):
+        resolved_web_search_gateway = DisabledWebSearchGateway()
+    else:
+        resolved_web_search_gateway = build_web_search_gateway(
+            api_key=resolved_settings.brave_search_api_key
+        )
     resolved_web_page_gateway = web_page_gateway or WebAcquisition(
             jina_reader=JinaReaderWebPageAdapter(
                 api_key=resolved_settings.jina_reader_api_key
@@ -844,7 +860,8 @@ def create_app(
     file_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="document-process")
     sandbox_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sandbox")
     run_queue = RunQueue(session_factory)
-    run_worker = RunWorker(run_queue, coordinator)
+    runtime = RuntimeV2EntryPoint(coordinator)
+    run_worker = RunWorker(run_queue, runtime)
     embedded_worker_enabled = embedded_worker
 
     def upgrade_schema() -> None:
@@ -902,6 +919,7 @@ def create_app(
         app.state.run_worker = run_worker
         app.state.run_queue = run_queue
         app.state.run_coordinator = coordinator
+        app.state.runtime = runtime
         app.state.tool_execution = tool_execution
         app.state.graph_runner = resolved_graph_runner
         app.state.research_file_store = research_file_store
@@ -922,6 +940,7 @@ def create_app(
     app.state.run_worker = run_worker
     app.state.run_queue = run_queue
     app.state.run_coordinator = coordinator
+    app.state.runtime = runtime
     app.state.tool_execution = tool_execution
     app.state.graph_runner = resolved_graph_runner
     app.state.research_file_store = research_file_store
@@ -3882,4 +3901,4 @@ def create_app(
     return app
 
 
-app = create_app(embedded_worker=os.getenv("DEEP_RESEARCHER_EMBEDDED_WORKER", "1") == "1")
+app = create_app(embedded_worker=os.getenv("DEEP_RESEARCHER_EMBEDDED_WORKER", "0") == "1")

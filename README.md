@@ -15,6 +15,13 @@ make dev-web
 ```
 
 浏览器访问 `http://127.0.0.1:5173`。默认数据库是 `var/deep-researcher.db`，默认对象目录是 `var/objects`。没有 OpenAI key 时走本地抽取式研究 Adapter；它会基于实际可见的会话纠正和文档 Evidence Span 回答，不会伪装成外部模型调用。
+API 默认不在进程内启动 Research Worker。开发时需要执行 `DEEP_RESEARCHER_EMBEDDED_WORKER=1 make dev-api`，或在另一个终端启动专用 Worker：
+
+```bash
+uv run python -m deep_researcher.worker_main
+```
+
+生产部署必须使用独立 Worker；`infra/docker-compose.yml` 已提供 `api` 和 `worker` 两个服务。
 
 ## 模型与网页检索配置
 
@@ -55,6 +62,6 @@ make verify
 
 - OpenAI Responses 是可选 Adapter，默认模型为当前配置中的 `gpt-5.6-sol`。
 - M1 的本地可复现证据来自 Workspace Document/Conversation Attachment；真实网页搜索凭证集成将在对应报告中单列。
-- Python 绝不回退到宿主执行；当前 Docker Sandbox Adapter 已通过真实隔离测试，但容器化 API 的独立 Sandbox Worker 和生产运行收口尚未完成。
+- Python 绝不回退到宿主执行；当前 Docker Sandbox Adapter 已通过真实隔离测试。
 
 项目不修改兄弟目录 `../backend`，也不在未经明确要求时 commit 或 push。

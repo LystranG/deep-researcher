@@ -22,6 +22,7 @@ services:
     environment:
       DEEP_RESEARCHER_DATABASE_URL: postgresql+psycopg://deep_researcher:deep_researcher@postgres:5432/deep_researcher
       DEEP_RESEARCHER_OBJECT_STORE_ROOT: /data/objects
+      DEEP_RESEARCHER_EMBEDDED_WORKER: "0"
       DEEP_RESEARCHER_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       DEEP_RESEARCHER_OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
       DEEP_RESEARCHER_EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
@@ -35,6 +36,24 @@ services:
         condition: service_healthy
     volumes:
       - object-data:/data/objects
+
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/api.Dockerfile
+    environment:
+      DEEP_RESEARCHER_DATABASE_URL: postgresql+psycopg://deep_researcher:deep_researcher@postgres:5432/deep_researcher
+      DEEP_RESEARCHER_OBJECT_STORE_ROOT: /data/objects
+      DEEP_RESEARCHER_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEP_RESEARCHER_OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
+      DEEP_RESEARCHER_EMBEDDED_WORKER: "0"
+    command: ["sh", "-c", "uv run alembic upgrade head && uv run python -m deep_researcher.worker_main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - object-data:/data/objects
+      - /var/run/docker.sock:/var/run/docker.sock
 
   web:
     build:

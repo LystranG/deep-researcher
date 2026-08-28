@@ -40,6 +40,8 @@ class ReplanRequest:
     remaining_tokens: int | None = None
     remaining_cost_micros: int | None = None
     deadline_available: bool = True
+    lease_owner: str | None = None
+    fencing_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,13 @@ class ReplanGate:
             return "plan_revision_conflict"
         if current.run_id != run.id:
             return "plan_run_mismatch"
+        if (request.lease_owner is None) != (request.fencing_epoch is None):
+            return "missing_worker_fence"
+        if request.lease_owner is not None and (
+            run.lease_owner != request.lease_owner
+            or run.attempt != request.fencing_epoch
+        ):
+            return "stale_worker_fence"
         if run.reservation_status in {"exhausted", "released"}:
             return "budget_exhausted"
         if request.remaining_tokens is not None and request.remaining_tokens <= 0:

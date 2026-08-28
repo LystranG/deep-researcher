@@ -76,6 +76,36 @@ def test_gate_rejects_observation_and_budget_exhaustion() -> None:
     )
 
 
+def test_gate_rejects_stale_worker_fence() -> None:
+    session, run, current = gate_context()
+    run.lease_owner = "worker-current"
+    run.attempt = 3
+
+    assert (
+        ReplanGate().validate(
+            session,
+            run,
+            request(lease_owner="worker-old", fencing_epoch=2),
+            current,
+        )
+        == "stale_worker_fence"
+    )
+
+
+def test_gate_requires_owner_and_epoch_together() -> None:
+    session, run, current = gate_context()
+
+    assert (
+        ReplanGate().validate(
+            session,
+            run,
+            request(lease_owner="worker-current"),
+            current,
+        )
+        == "missing_worker_fence"
+    )
+
+
 def test_gate_rejects_equivalent_plan_and_tool_expansion() -> None:
     session, run, current = gate_context()
     request_data = request()
