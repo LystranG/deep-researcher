@@ -2,6 +2,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
@@ -66,7 +67,11 @@ class DockerSandbox:
         request.output_dir.mkdir(parents=True, exist_ok=True)
         output_dir = request.output_dir.resolve()
         output_dir.chmod(0o777)
-        container_name = f"deep-researcher-sandbox-{uuid4().hex}"
+        identity = execution_key or f"anonymous-{uuid4().hex}"
+        container_name = (
+            "deep-researcher-sandbox-"
+            + sha256(identity.encode("utf-8")).hexdigest()[:32]
+        )
         command = [
             "docker",
             "run",
@@ -124,6 +129,19 @@ class DockerSandbox:
         except FileNotFoundError as exc:
             raise SandboxUnavailableError("Docker CLI 不可用") from exc
         except subprocess.TimeoutExpired:
+            if execution_key is not None:
+                subprocess.run(
+                    ["docker", "rm", "-f", container_name],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                    env=self._docker_cli_env(),
+                )
+            return SandboxResult(status="timed_out", stdout="", stderr="执行超时", artifacts=[])
+        finally:
+            if execution_key is not None:
+                with self._lock:
+                    self._active_containers.pop(execution_key, None)
             subprocess.run(
                 ["docker", "rm", "-f", container_name],
                 capture_output=True,
@@ -131,11 +149,6 @@ class DockerSandbox:
                 check=False,
                 env=self._docker_cli_env(),
             )
-            return SandboxResult(status="timed_out", stdout="", stderr="执行超时", artifacts=[])
-        finally:
-            if execution_key is not None:
-                with self._lock:
-                    self._active_containers.pop(execution_key, None)
 
         if completed.returncode == 125 and any(
             marker in completed.stderr.casefold()
@@ -159,8 +172,10 @@ class DockerSandbox:
         with self._lock:
             container_name = self._active_containers.get(execution_key)
             if container_name is None:
-                self._cancelled_before_start.add(execution_key)
-                return True
+                container_name = (
+                    "deep-researcher-sandbox-"
+                    + sha256(execution_key.encode("utf-8")).hexdigest()[:32]
+                )
         for _ in range(40):
             try:
                 completed = subprocess.run(
@@ -175,4 +190,6 @@ class DockerSandbox:
             if completed.returncode == 0:
                 return True
             time.sleep(0.05)
-        return False
+        with self._lock:
+            self._cancelled_before_start.add(execution_key)
+        return True

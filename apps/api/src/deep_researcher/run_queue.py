@@ -55,7 +55,7 @@ class RunQueue:
             run.attempt += 1
             return RunClaim(run.id, run.attempt)
 
-    def heartbeat(self, run_id: UUID, owner: str) -> bool:
+    def heartbeat(self, run_id: UUID, owner: str, fencing_epoch: int | None = None) -> bool:
         """延长指定 Worker 持有的运行租约"""
         now = datetime.now(UTC)
         with self._session_factory.begin() as session:
@@ -64,6 +64,11 @@ class RunQueue:
                     ResearchRun.id == run_id,
                     ResearchRun.lease_owner == owner,
                     ResearchRun.status.in_({"queued", "running"}),
+                    *(
+                        (ResearchRun.attempt == fencing_epoch,)
+                        if fencing_epoch is not None
+                        else ()
+                    ),
                 )
             )
             if run is None:
@@ -72,13 +77,18 @@ class RunQueue:
             run.lease_expires_at = now + timedelta(seconds=self._lease_seconds)
             return True
 
-    def release(self, run_id: UUID, owner: str) -> None:
+    def release(self, run_id: UUID, owner: str, fencing_epoch: int | None = None) -> None:
         """运行结束后清理 Worker 租约"""
         with self._session_factory.begin() as session:
             run = session.scalar(
                 select(ResearchRun).where(
                     ResearchRun.id == run_id,
                     ResearchRun.lease_owner == owner,
+                    *(
+                        (ResearchRun.attempt == fencing_epoch,)
+                        if fencing_epoch is not None
+                        else ()
+                    ),
                 )
             )
             if run is None:
@@ -86,3 +96,24 @@ class RunQueue:
             if run.status in {"completed", "partial", "cancelled", "failed"}:
                 run.lease_owner = None
                 run.lease_expires_at = None
+
+    def wake(self, run_id: UUID) -> bool:
+        """Make a run with durable waiting work eligible for a fresh claim."""
+        now = datetime.now(UTC)
+        with self._session_factory.begin() as session:
+            run = session.scalar(
+                select(ResearchRun)
+                .where(
+                    ResearchRun.id == run_id,
+                    ResearchRun.cancel_requested_at.is_(None),
+                    ResearchRun.status == "waiting",
+                )
+                .with_for_update()
+            )
+            if run is None:
+                return False
+            run.status = "queued"
+            run.lease_owner = None
+            run.lease_expires_at = None
+            run.heartbeat_at = now
+            return True

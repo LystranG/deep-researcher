@@ -843,6 +843,7 @@ def create_app(
         session_factory,
         research_file_store,
         max_timeout_seconds=resolved_settings.sandbox_max_timeout_seconds,
+        observation_notifier=lambda run_id, _task_id: run_queue.wake(run_id),
     )
     task_tool_registry = ToolRegistry(
         (

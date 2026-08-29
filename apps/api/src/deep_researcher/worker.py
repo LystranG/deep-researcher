@@ -95,11 +95,15 @@ class RunWorker:
                 if self._sandbox_runtime is not None
                 else False
             )
+        claim_epoch = claim.fencing_epoch if isinstance(claim, RunClaim) else None
         heartbeat_stop = Event()
 
         def heartbeat_loop() -> None:
             while not heartbeat_stop.wait(5):
-                self._queue.heartbeat(run_id, self._owner)
+                try:
+                    self._queue.heartbeat(run_id, self._owner, claim_epoch)
+                except TypeError:
+                    self._queue.heartbeat(run_id, self._owner)
 
         heartbeat_thread = Thread(target=heartbeat_loop, name="research-worker-heartbeat")
         heartbeat_thread.start()
@@ -116,7 +120,10 @@ class RunWorker:
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2)
-            self._queue.release(run_id, self._owner)
+            try:
+                self._queue.release(run_id, self._owner, claim_epoch)
+            except TypeError:
+                self._queue.release(run_id, self._owner)
         return True
 
     def start(self) -> None:

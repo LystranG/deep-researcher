@@ -1516,6 +1516,11 @@ class ReActTaskController:
             or _as_utc(task.lease_expires_at) < datetime.now(UTC)
         ):
             raise StaleTaskClaimError("task claim has been fenced")
+        if (
+            claim.run_fencing_epoch is not None
+            and run.attempt != claim.run_fencing_epoch
+        ):
+            raise StaleTaskClaimError("run claim has been fenced")
         return task, run, None
 
 
@@ -1526,7 +1531,10 @@ def _with_call_identity(
         call.arguments, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
     parameters_hash = hashlib.sha256(canonical.encode()).hexdigest()
-    logical_call_ref = f"tool-call:{claim.task_id}:{call.tool_name}:{parameters_hash[:16]}"
+    logical_call_ref = (
+        f"tool-call:{claim.task_id}:turn:{turn_ordinal}:{call.tool_name}:"
+        f"{parameters_hash[:16]}"
+    )
     safe_summary = f"{call.tool_name}({canonical[:900]})"
     return replace(
         call,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -52,6 +53,7 @@ class SandboxExecutionOutput:
     stdout: str = ""
     stderr: str = ""
     file_refs: tuple[dict[str, str], ...] = ()
+    artifact_contents: tuple[tuple[str, str], ...] = ()
     result_reference: str | None = None
     error_category: str | None = None
     error_message: str | None = None
@@ -89,12 +91,14 @@ class SandboxJobService:
         lease_seconds: int = 30,
         max_timeout_seconds: int = 300,
         preview_bytes: int = 100_000,
+        observation_notifier: Callable[[UUID, UUID], object] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._file_store = file_store
         self._lease_seconds = lease_seconds
         self._max_timeout_seconds = max_timeout_seconds
         self._preview_bytes = preview_bytes
+        self._observation_notifier = observation_notifier
 
     def submit(
         self,
@@ -319,6 +323,8 @@ class SandboxJobService:
             attempt = session.get(SandboxAttempt, attempt_id)
             if job is None or attempt is None or attempt.job_id != job.id:
                 raise SandboxJobError("sandbox job or attempt does not exist")
+            run_id = job.run_id
+            task_id = job.task_id
             existing = session.scalar(
                 select(SandboxObservation).where(SandboxObservation.job_id == job.id)
             )
@@ -344,6 +350,18 @@ class SandboxJobService:
                     stderr="sandbox deadline exceeded",
                     error_category="deadline",
                 )
+            file_refs = list(output.file_refs)
+            if output.status == "completed" and output.artifact_contents:
+                for name, content in output.artifact_contents:
+                    artifact = self._file_store.ingest_artifact(
+                        workspace_id=job.workspace_id,
+                        run_id=job.run_id,
+                        task_id=job.task_id,
+                        name=name,
+                        content=content,
+                        idempotency_key=f"sandbox:{job.id}:attempt:{attempt.id}:{name}",
+                    )
+                    file_refs.append(artifact.ref.as_dict())
             now = utc_now()
             attempt.status = output.status
             attempt.completed_at = now
@@ -365,14 +383,21 @@ class SandboxJobService:
                 attempt_count=job.attempt_count,
                 stdout_preview=output.stdout[-self._preview_bytes :],
                 stderr_preview=output.stderr[-self._preview_bytes :],
-                file_refs=list(output.file_refs),
+                file_refs=file_refs,
                 result_reference=output.result_reference,
                 error_category=output.error_category,
                 error_message=output.error_message,
             )
             session.add(observation)
             session.flush()
-            return observation
+            observation_id = observation.id
+        if self._observation_notifier is not None:
+            self._observation_notifier(run_id, task_id)
+        with self._session_factory() as session:
+            persisted = session.get(SandboxObservation, observation_id)
+            if persisted is None:
+                raise SandboxJobError("sandbox observation disappeared after publication")
+            return persisted
 
     def heartbeat(self, *, job_id: UUID, attempt_id: UUID, worker_id: str) -> bool:
         """Extend only the currently fenced Attempt lease."""
@@ -607,14 +632,24 @@ class DockerSandboxJobExecutor:
                 SandboxRequest(
                     code=job.code,
                     input_mounts=mounts,
-                    output_dir=self._output_root / str(job.workspace_id) / str(job.id),
+                    output_dir=(
+                        self._output_root
+                        / str(job.workspace_id)
+                        / str(job.id)
+                        / f"attempt-{attempt.attempt_number}"
+                    ),
                     timeout_seconds=job.timeout_seconds,
                 ),
                 execution_key=f"{job.id}:{attempt.id}",
             )
-            artifact_refs: list[dict[str, str]] = []
+            artifact_contents: list[tuple[str, str]] = []
             if result.status == "completed":
-                output_root = (self._output_root / str(job.workspace_id) / str(job.id)).resolve()
+                output_root = (
+                    self._output_root
+                    / str(job.workspace_id)
+                    / str(job.id)
+                    / f"attempt-{attempt.attempt_number}"
+                ).resolve()
                 for artifact_path in result.artifacts:
                     resolved_artifact = artifact_path.resolve()
                     try:
@@ -628,20 +663,12 @@ class DockerSandboxJobExecutor:
                     except UnicodeDecodeError as exc:
                         raise ValueError("sandbox artifacts must be UTF-8 text") from exc
                     name = str(relative_name)
-                    artifact = self._file_store.ingest_artifact(
-                        workspace_id=job.workspace_id,
-                        run_id=job.run_id,
-                        task_id=job.task_id,
-                        name=name,
-                        content=content,
-                        idempotency_key=f"sandbox:{job.id}:attempt:{attempt.id}:{name}",
-                    )
-                    artifact_refs.append(artifact.ref.as_dict())
+                    artifact_contents.append((name, content))
         return SandboxExecutionOutput(
             status=result.status,
             stdout=result.stdout,
             stderr=result.stderr,
-            file_refs=tuple(artifact_refs),
+            artifact_contents=tuple(artifact_contents),
             result_reference=f"sandbox-job://{job.id}/attempt/{attempt.id}",
             error_category=("deadline" if result.status == "timed_out" else None),
         )
