@@ -610,7 +610,11 @@ class DockerSandboxJobExecutor:
     ) -> SandboxExecutionOutput:
         from tempfile import TemporaryDirectory
 
-        with TemporaryDirectory(prefix=f"sandbox-job-{job.id}-") as input_root:
+        input_base = self._output_root / str(job.workspace_id) / str(job.id)
+        input_base.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(
+            prefix=f"attempt-{attempt.attempt_number}-inputs-", dir=input_base
+        ) as input_root:
             mounts: list[SandboxInputMount] = []
             for _index, value in enumerate(input_refs):
                 if isinstance(value, dict) and value.get("kind") == "evidence_span":
