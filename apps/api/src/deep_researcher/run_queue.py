@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -5,6 +6,12 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.models import ResearchRun
+
+
+@dataclass(frozen=True)
+class RunClaim:
+    run_id: UUID
+    fencing_epoch: int
 
 
 class RunQueue:
@@ -16,6 +23,11 @@ class RunQueue:
 
     def claim(self, owner: str) -> UUID | None:
         """领取一个可执行运行并写入租约"""
+        claim = self.claim_with_epoch(owner)
+        return claim.run_id if claim is not None else None
+
+    def claim_with_epoch(self, owner: str) -> RunClaim | None:
+        """领取运行并返回本次 Worker epoch，供业务事实 fencing。"""
         now = datetime.now(UTC)
         with self._session_factory.begin() as session:
             run = session.scalar(
@@ -41,7 +53,7 @@ class RunQueue:
             run.lease_expires_at = now + timedelta(seconds=self._lease_seconds)
             run.heartbeat_at = now
             run.attempt += 1
-            return run.id
+            return RunClaim(run.id, run.attempt)
 
     def heartbeat(self, run_id: UUID, owner: str) -> bool:
         """延长指定 Worker 持有的运行租约"""

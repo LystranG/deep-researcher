@@ -162,7 +162,7 @@ class ResearchCoordinator:
         self._conversation_segment_submitter = conversation_segment_submitter
         self._research_record_submitter = research_record_submitter
 
-    def execute_run(
+    def execute_runtime_v2(
         self,
         run_id: UUID,
         *,
@@ -817,7 +817,6 @@ class ResearchCoordinator:
             ):
                 return
             trigger = session.get(Message, run.trigger_message_id)
-            question = trigger.content if trigger is not None else ""
             existing_tasks = {
                 task.ordinal: task
                 for task in session.scalars(
@@ -861,7 +860,9 @@ class ResearchCoordinator:
                         run_id=run.id,
                         requested_by_user_id=run.initiated_by_user_id,
                         purpose="按研究计划完成受限计算",
-                        code=self._sandbox_code(question),
+                        code=self._sandbox_code(
+                            trigger.content if trigger is not None else ""
+                        ),
                         input_message_ids=[str(run.trigger_message_id)],
                         input_attachment_ids=[],
                         timeout_seconds=task["time_budget_seconds"],
@@ -869,9 +870,6 @@ class ResearchCoordinator:
                     )
                     session.add(execution)
                     session.flush()
-                    if self._sandbox_submitter is None:
-                        execution.status = "unavailable"
-                        execution.error_message = "Sandbox Worker 未配置"
                     sandbox_jobs.append(execution.id)
                 session.add(
                     Todo(
@@ -886,18 +884,9 @@ class ResearchCoordinator:
                             else task["title"]
                         ),
                         kind=kind,
-                        status=(
-                            "failed"
-                            if kind == "python_sandbox" and self._sandbox_submitter is None
-                            else "running" if not task["dependencies"] else "pending"
-                        ),
+                        status="running" if not task["dependencies"] else "pending",
                         idempotency_key=f"plan:{task['ordinal']}:{kind}",
                         sandbox_execution_id=execution.id if execution is not None else None,
-                        failure_reason=(
-                            "Sandbox Worker 未配置，未执行代码"
-                            if kind == "python_sandbox" and self._sandbox_submitter is None
-                            else None
-                        ),
                     )
                 )
             first_task = next(

@@ -2,13 +2,19 @@ from threading import Event, Thread
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from deep_researcher.run_queue import RunQueue
+from deep_researcher.run_queue import RunClaim, RunQueue
 
 
 class RunRuntime(Protocol):
     """The only execution boundary used by the durable Run worker."""
 
-    def execute_run(self, run_id: UUID, *, lease_owner: str) -> None:
+    def execute_runtime_v2(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        fencing_epoch: int,
+    ) -> None:
         """Execute one leased Run without owning queue or lease lifecycle."""
 
 
@@ -23,8 +29,34 @@ class RuntimeV2EntryPoint:
     def __init__(self, runtime: RunRuntime) -> None:
         self._runtime = runtime
 
-    def execute_run(self, run_id: UUID, *, lease_owner: str) -> None:
-        self._runtime.execute_run(run_id, lease_owner=lease_owner)
+    def execute_runtime_v2(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        fencing_epoch: int | None = None,
+    ) -> None:
+        if fencing_epoch is None:
+            raise RuntimeError("production RunQueue must provide a fencing epoch")
+        self._runtime.execute_runtime_v2(
+            run_id,
+            lease_owner=lease_owner,
+            fencing_epoch=fencing_epoch,
+        )
+
+    def execute_run(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str,
+        fencing_epoch: int | None = None,
+    ) -> None:
+        """Compatibility alias for direct callers; Worker uses Runtime v2."""
+        self.execute_runtime_v2(
+            run_id,
+            lease_owner=lease_owner,
+            fencing_epoch=fencing_epoch,
+        )
 
 
 class RunWorker:
@@ -51,7 +83,12 @@ class RunWorker:
         """领取并执行一个运行，返回是否实际领取到任务"""
         if self._sandbox_runtime is not None and self._sandbox_runtime.run_once():
             return True
-        run_id = self._queue.claim(self._owner)
+        claim = (
+            self._queue.claim_with_epoch(self._owner)
+            if hasattr(self._queue, "claim_with_epoch")
+            else None
+        )
+        run_id = claim.run_id if isinstance(claim, RunClaim) else self._queue.claim(self._owner)
         if run_id is None:
             return (
                 self._sandbox_runtime.run_once()
@@ -67,7 +104,13 @@ class RunWorker:
         heartbeat_thread = Thread(target=heartbeat_loop, name="research-worker-heartbeat")
         heartbeat_thread.start()
         try:
-            self._runtime.execute_run(run_id, lease_owner=self._owner)
+            if not isinstance(claim, RunClaim):
+                raise RuntimeError("production RunQueue must provide a fencing epoch")
+            self._runtime.execute_runtime_v2(
+                run_id,
+                lease_owner=self._owner,
+                fencing_epoch=claim.fencing_epoch,
+            )
             if self._sandbox_runtime is not None:
                 self._sandbox_runtime.run_once()
         finally:
