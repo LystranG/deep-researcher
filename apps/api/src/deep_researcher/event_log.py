@@ -40,6 +40,7 @@ class RunEventLog:
         *,
         event_key: str | None = None,
         lease_owner: str | None = None,
+        fencing_epoch: int | None = None,
     ) -> int:
         with self._process_lock, self._session_factory.begin() as session:
             run = session.scalar(
@@ -59,6 +60,7 @@ class RunEventLog:
                 or run.status in {"cancelled", "failed", "completed", "partial"}
                 or run.cancel_requested_at is not None
                 or (lease_owner is not None and run.lease_owner != lease_owner)
+                or (fencing_epoch is not None and run.attempt != fencing_epoch)
             ):
                 raise RunEventRejectedError("研究运行不再接受新事件")
             seq = run.next_event_seq

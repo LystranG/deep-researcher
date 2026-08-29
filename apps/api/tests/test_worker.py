@@ -52,7 +52,7 @@ def test_runtime_v2_entrypoint_uses_the_runtime_boundary() -> None:
     runtime = Runtime()
     entrypoint = RuntimeV2EntryPoint(runtime)
 
-    entrypoint.execute_run(uuid4(), lease_owner="runtime-worker", fencing_epoch=1)
+    entrypoint.execute_runtime_v2(uuid4(), lease_owner="runtime-worker", fencing_epoch=1)
 
     assert runtime.calls == [(runtime.calls[0][0], "runtime-worker")]
 

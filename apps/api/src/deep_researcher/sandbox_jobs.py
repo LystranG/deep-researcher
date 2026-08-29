@@ -553,22 +553,24 @@ class SandboxJobService:
             )
             if job is None:
                 raise SandboxJobError("sandbox job does not exist")
-            if job.status in TERMINAL_STATUSES:
-                return job
-            job.cancel_requested_at = utc_now()
-            if job.status in {"queued", "retry_wait"}:
-                self._publish_unclaimed_terminal(
-                    session,
-                    job,
-                    worker_id="cancellation",
-                    status="cancelled",
-                    error_category="cancelled",
-                    error_message="sandbox execution was cancelled before execution",
-                    now=utc_now(),
-                )
-            else:
-                job.status = "cancel_requested"
-            return job
+            if job.status not in TERMINAL_STATUSES:
+                job.cancel_requested_at = utc_now()
+                if job.status in {"queued", "retry_wait"}:
+                    self._publish_unclaimed_terminal(
+                        session,
+                        job,
+                        worker_id="cancellation",
+                        status="cancelled",
+                        error_category="cancelled",
+                        error_message="sandbox execution was cancelled before execution",
+                        now=utc_now(),
+                    )
+                else:
+                    job.status = "cancel_requested"
+            result = job
+        if self._observation_notifier is not None and result.status == "cancelled":
+            self._observation_notifier(result.run_id, result.task_id)
+        return result
 
     @staticmethod
     def _validate_request(
@@ -610,9 +612,11 @@ class DockerSandboxJobExecutor:
 
         with TemporaryDirectory(prefix=f"sandbox-job-{job.id}-") as input_root:
             mounts: list[SandboxInputMount] = []
-            for index, value in enumerate(input_refs):
-                if isinstance(value, dict):
+            for _index, value in enumerate(input_refs):
+                if isinstance(value, dict) and value.get("kind") == "evidence_span":
                     continue
+                if isinstance(value, dict):
+                    value = ResearchFileRef.parse(value)
                 snapshot = self._file_store.read(
                     workspace_id=job.workspace_id,
                     run_id=job.run_id,
@@ -620,7 +624,7 @@ class DockerSandboxJobExecutor:
                     ref=value,
                     shared_refs=(value,),
                 )
-                input_path = Path(input_root) / f"{index}-{Path(snapshot.name).name}"
+                input_path = Path(input_root) / Path(snapshot.name).name
                 input_path.write_text(snapshot.content or "", encoding="utf-8")
                 mounts.append(
                     SandboxInputMount(

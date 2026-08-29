@@ -1,6 +1,5 @@
 import hashlib
 import json
-import mimetypes
 import os
 import re
 from collections.abc import AsyncIterator, Iterator
@@ -64,10 +63,12 @@ from deep_researcher.models import (
     ResearchPlan,
     ResearchRecord,
     ResearchRun,
+    ResearchSourceMount,
     ResearchTask,
     RunEvent,
     SandboxExecution,
     SandboxJob,
+    SandboxObservation,
     SkillInstallation,
     SkillPackage,
     SkillVersion,
@@ -111,12 +112,7 @@ from deep_researcher.retrieval import (
     TiktokenTokenEstimator,
 )
 from deep_researcher.run_queue import RunQueue
-from deep_researcher.sandbox import (
-    DockerSandbox,
-    SandboxInputMount,
-    SandboxRequest,
-    SandboxUnavailableError,
-)
+from deep_researcher.sandbox import DockerSandbox
 from deep_researcher.sandbox_jobs import (
     DockerSandboxJobExecutor,
     SandboxJobError,
@@ -825,25 +821,99 @@ def create_app(
         graph_runner=resolved_graph_runner,
         embedding_gateway=resolved_embedding_gateway,
         retrieval=retrieval,
-        sandbox_submitter=lambda execution_id: sandbox_executor.submit(
-            run_sandbox_execution, execution_id
-        ),
-        sandbox_canceller=lambda execution_id: sandbox.cancel(str(execution_id)),
         conversation_segment_submitter=lambda conversation_id: file_executor.submit(
             conversation_segment_processor.process, conversation_id
         ),
         research_record_submitter=lambda record_id: file_executor.submit(
             research_record_indexer.process, record_id
         ),
+        sandbox_job_submitter=lambda **request: sandbox_job_service.submit(**request),
+        sandbox_job_canceller=lambda job_id: sandbox_job_service.cancel(job_id),
     )
     sandbox = DockerSandbox(image=resolved_settings.sandbox_image)
     object_store = LocalObjectStore(resolved_settings.object_store_root)
     research_file_store = ResearchFileStore(session_factory, object_store)
+
+    def notify_sandbox_observation(run_id: UUID, task_id: UUID) -> None:
+        with session_factory.begin() as session:
+            observation = session.scalar(
+                select(SandboxObservation)
+                .join(SandboxJob, SandboxJob.id == SandboxObservation.job_id)
+                .where(SandboxJob.run_id == run_id, SandboxJob.task_id == task_id)
+            )
+            todo = session.scalar(
+                select(Todo).where(
+                    Todo.run_id == run_id,
+                    Todo.research_task_id == task_id,
+                    Todo.kind == "python_sandbox",
+                )
+            )
+            if observation is None:
+                return
+            execution = session.get(SandboxExecution, observation.job_id)
+            if execution is not None:
+                execution.status = observation.status
+                execution.stdout = observation.stdout_preview
+                execution.stderr = observation.stderr_preview
+                execution.error_message = observation.error_message
+                execution.completed_at = observation.created_at
+                if (
+                    observation.status == "completed"
+                    and session.scalar(
+                        select(DerivedEvidence).where(
+                            DerivedEvidence.sandbox_execution_id == observation.job_id
+                        )
+                    )
+                    is None
+                ):
+                    session.add(
+                        DerivedEvidence(
+                            workspace_id=execution.workspace_id,
+                            run_id=run_id,
+                            sandbox_execution_id=execution.id,
+                            purpose=execution.purpose,
+                            code_hash=hashlib.sha256(execution.code.encode()).hexdigest(),
+                            input_message_ids=list(execution.input_message_ids),
+                            input_attachment_ids=list(execution.input_attachment_ids),
+                            input_evidence_span_ids=list(execution.input_evidence_span_ids),
+                            stdout=observation.stdout_preview,
+                            stdout_hash=hashlib.sha256(
+                                observation.stdout_preview.encode()
+                            ).hexdigest(),
+                            result_hash=hashlib.sha256(
+                                json.dumps(
+                                    {
+                                        "artifact_hashes": [],
+                                        "stdout_hash": hashlib.sha256(
+                                            observation.stdout_preview.encode()
+                                        ).hexdigest(),
+                                    },
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                ).encode()
+                            ).hexdigest(),
+                        )
+                    )
+            if todo is not None and todo.status not in {
+                "completed",
+                "failed",
+                "cancelled",
+                "skipped",
+            }:
+                todo.status = (
+                    "completed" if observation.status == "completed" else "failed"
+                )
+                todo.result_summary = observation.stdout_preview[-2000:] or None
+                todo.failure_reason = observation.error_message
+                todo.completed_at = datetime.now(UTC)
+        run_queue.wake(run_id)
+
     sandbox_job_service = SandboxJobService(
         session_factory,
         research_file_store,
         max_timeout_seconds=resolved_settings.sandbox_max_timeout_seconds,
-        observation_notifier=lambda run_id, _task_id: run_queue.wake(run_id),
+        observation_notifier=notify_sandbox_observation,
     )
     task_tool_registry = ToolRegistry(
         (
@@ -881,7 +951,6 @@ def create_app(
         embedding_gateway=resolved_embedding_gateway,
     )
     file_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="document-process")
-    sandbox_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sandbox")
     embedded_worker_enabled = embedded_worker
 
     def upgrade_schema() -> None:
@@ -952,7 +1021,6 @@ def create_app(
         if embedded_worker_enabled:
             run_worker.stop()
         file_executor.shutdown(wait=True, cancel_futures=True)
-        sandbox_executor.shutdown(wait=True, cancel_futures=True)
         engine.dispose()
 
     app = FastAPI(title="深度研究工作台", lifespan=lifespan)
@@ -3494,222 +3562,9 @@ def create_app(
             raise HTTPException(status_code=404, detail="派生证据不存在")
         return derived_evidence_response(evidence)
 
-    def update_sandbox_todo(
-        worker_session: Session,
-        execution_id: UUID,
-        status_value: str,
-        *,
-        result_summary: str | None = None,
-        failure_reason: str | None = None,
-    ) -> None:
-        """在 Sandbox 事务中更新关联 Todo，取消后清除结果摘要"""
-        todo = worker_session.scalar(
-            select(Todo).where(Todo.sandbox_execution_id == execution_id).with_for_update()
-        )
-        if todo is None or todo.status in {"completed", "skipped", "failed", "cancelled"}:
-            return
-        if status_value in {"timed_out", "unavailable"}:
-            status_value = "failed"
-        todo.status = status_value
-        todo.result_summary = result_summary[:2000] if result_summary else None
-        todo.failure_reason = failure_reason[:1000] if failure_reason else None
-        if status_value == "running" and todo.started_at is None:
-            todo.started_at = datetime.now(UTC)
-        if status_value in {"completed", "skipped", "failed", "cancelled"}:
-            todo.completed_at = datetime.now(UTC)
-
-    def locked_sandbox_state(
-        worker_session: Session, execution_id: UUID
-    ) -> tuple[SandboxExecution | None, ResearchRun | None]:
-        """按 Run 再 SandboxExecution 的固定顺序锁定发布状态"""
-        snapshot = worker_session.get(SandboxExecution, execution_id)
-        if snapshot is None:
-            return None, None
-        run = worker_session.scalar(
-            select(ResearchRun)
-            .where(ResearchRun.id == snapshot.run_id)
-            .with_for_update()
-        )
-        execution = worker_session.scalar(
-            select(SandboxExecution)
-            .where(SandboxExecution.id == execution_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-        return execution, run
-
-    def sandbox_publish_is_cancelled(
-        execution: SandboxExecution, run: ResearchRun | None
-    ) -> bool:
-        """判断 Sandbox 结果是否已失去发布资格"""
-        return (
-            execution.cancel_requested_at is not None
-            or run is None
-            or run.cancel_requested_at is not None
-            or run.status == "cancelled"
-        )
-
-    def run_sandbox_execution(execution_id: UUID) -> None:
-        try:
-            with session_factory.begin() as worker_session:
-                execution, run = locked_sandbox_state(worker_session, execution_id)
-                if execution is None:
-                    return
-                if sandbox_publish_is_cancelled(execution, run):
-                    execution.status = "cancelled"
-                    execution.completed_at = datetime.now(UTC)
-                    update_sandbox_todo(worker_session, execution_id, "cancelled")
-                    return
-                execution.status = "running"
-                execution.started_at = datetime.now(UTC)
-                update_sandbox_todo(worker_session, execution_id, "running")
-                attachment_ids = [UUID(value) for value in execution.input_attachment_ids]
-                attachments = (
-                    worker_session.scalars(
-                        select(Attachment).where(
-                            Attachment.id.in_(attachment_ids),
-                            Attachment.workspace_id == execution.workspace_id,
-                            Attachment.status == "ready",
-                            Attachment.deleted_at.is_(None),
-                        )
-                    ).all()
-                    if attachment_ids
-                    else []
-                )
-                if len(attachments) != len(attachment_ids):
-                    execution.status = "failed"
-                    execution.error_message = "授权输入已失效"
-                    execution.completed_at = datetime.now(UTC)
-                    update_sandbox_todo(
-                        worker_session,
-                        execution_id,
-                        "failed",
-                        failure_reason=execution.error_message,
-                    )
-                    return
-                input_mounts = [
-                    SandboxInputMount(
-                        host_path=object_store.path_for(attachment.storage_key),
-                        container_name=attachment.filename,
-                    )
-                    for attachment in attachments
-                ]
-                workspace_id = execution.workspace_id
-                run_id = execution.run_id
-                code = execution.code
-                timeout_seconds = execution.timeout_seconds
-
-            output_key = f"{workspace_id}/{execution_id}"
-            output_dir = sandbox_output_path(output_key)
-            result = sandbox.execute(
-                SandboxRequest(
-                    code=code,
-                    input_mounts=input_mounts,
-                    output_dir=output_dir,
-                    timeout_seconds=timeout_seconds,
-                ),
-                execution_key=str(execution_id),
-            )
-
-            with session_factory.begin() as worker_session:
-                execution, run = locked_sandbox_state(worker_session, execution_id)
-                if execution is None:
-                    return
-                execution.stdout = result.stdout
-                execution.stderr = result.stderr
-                execution.completed_at = datetime.now(UTC)
-                if sandbox_publish_is_cancelled(execution, run):
-                    execution.status = "cancelled"
-                    update_sandbox_todo(worker_session, execution_id, "cancelled")
-                    return
-                execution.status = result.status
-                if result.status != "completed":
-                    execution.error_message = result.stderr or "沙箱执行失败"
-                    update_sandbox_todo(
-                        worker_session,
-                        execution_id,
-                        result.status,
-                        failure_reason=execution.error_message,
-                    )
-                    return
-                pending_artifacts: list[Artifact] = []
-                artifact_hashes: list[str] = []
-                for artifact_path in result.artifacts:
-                    size_bytes = artifact_path.stat().st_size
-                    if size_bytes > resolved_settings.sandbox_max_artifact_bytes:
-                        execution.status = "failed"
-                        execution.error_message = (
-                            f"研究产物超过 {resolved_settings.sandbox_max_artifact_bytes} 字节"
-                        )
-                        return
-                    relative_name = artifact_path.relative_to(output_dir.resolve()).as_posix()
-                    digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
-                    media_type = (
-                        mimetypes.guess_type(relative_name)[0] or "application/octet-stream"
-                    )
-                    artifact_hashes.append(digest)
-                    pending_artifacts.append(
-                        Artifact(
-                            workspace_id=workspace_id,
-                            run_id=run_id,
-                            sandbox_execution_id=execution.id,
-                            filename=relative_name,
-                            storage_key=f"{output_key}/{relative_name}",
-                            media_type=media_type,
-                            size_bytes=size_bytes,
-                            sha256=digest,
-                        )
-                    )
-                stdout_hash = hashlib.sha256(result.stdout.encode()).hexdigest()
-                worker_session.add_all(pending_artifacts)
-                worker_session.add(
-                    DerivedEvidence(
-                        workspace_id=workspace_id,
-                        run_id=run_id,
-                        sandbox_execution_id=execution.id,
-                        purpose=execution.purpose,
-                        code_hash=hashlib.sha256(code.encode()).hexdigest(),
-                        input_message_ids=list(execution.input_message_ids),
-                        input_attachment_ids=list(execution.input_attachment_ids),
-                        input_evidence_span_ids=list(execution.input_evidence_span_ids),
-                        stdout=result.stdout,
-                        stdout_hash=stdout_hash,
-                        result_hash=sandbox_result_hash(stdout_hash, artifact_hashes),
-                    )
-                )
-                update_sandbox_todo(
-                    worker_session, execution_id, "completed", result_summary=result.stdout
-                )
-        except SandboxUnavailableError as exc:
-            with session_factory.begin() as worker_session:
-                execution = worker_session.get(SandboxExecution, execution_id)
-                if execution is not None:
-                    execution.status = "unavailable"
-                    execution.error_message = str(exc)
-                    execution.completed_at = datetime.now(UTC)
-                    update_sandbox_todo(
-                        worker_session,
-                        execution_id,
-                        "unavailable",
-                        failure_reason=execution.error_message,
-                    )
-        except Exception as exc:
-            with session_factory.begin() as worker_session:
-                execution = worker_session.get(SandboxExecution, execution_id)
-                if execution is not None:
-                    execution.status = "failed"
-                    execution.error_message = str(exc)
-                    execution.completed_at = datetime.now(UTC)
-                    update_sandbox_todo(
-                        worker_session,
-                        execution_id,
-                        "failed",
-                        failure_reason=execution.error_message,
-                    )
-
     @app.post(
         "/api/v1/runs/{run_id}/sandbox-executions",
-        response_model=SandboxExecutionResponse,
+        response_model=SandboxJobResponse,
         status_code=202,
     )
     def create_sandbox_execution(
@@ -3717,7 +3572,7 @@ def create_app(
         payload: SandboxExecutionCreateRequest,
         session: SessionDependency,
         user: CurrentUser,
-    ) -> SandboxExecutionResponse:
+    ) -> SandboxJobResponse:
         run = accessible_run(session, user, run_id)
         if run.cancel_requested_at is not None or run.status == "cancelled":
             raise HTTPException(status_code=409, detail="研究运行已取消")
@@ -3753,26 +3608,74 @@ def create_app(
         )
         if len(evidence_spans) != len(unique_evidence_span_ids):
             raise HTTPException(status_code=404, detail="派生证据输入不属于当前研究运行")
-        filenames = [attachment.filename for attachment in attachments]
-        if len(filenames) != len(set(filenames)):
-            raise HTTPException(status_code=409, detail="沙箱输入文件名不能重复")
-        execution = SandboxExecution(
-            workspace_id=run.workspace_id,
-            run_id=run.id,
-            requested_by_user_id=user.id,
-            purpose=payload.purpose.strip(),
-            code=payload.code,
-            input_message_ids=[str(run.trigger_message_id)],
-            input_attachment_ids=[str(value) for value in payload.attachment_ids],
-            input_evidence_span_ids=[str(value) for value in payload.evidence_span_ids],
-            timeout_seconds=payload.timeout_seconds,
-            status="queued",
+        input_refs: list[dict[str, object]] = [
+            {"kind": "evidence_span", "id": str(value)}
+            for value in payload.evidence_span_ids
+        ]
+        if attachments:
+            mounts = session.scalars(
+                select(ResearchSourceMount).where(
+                    ResearchSourceMount.run_id == run.id,
+                    ResearchSourceMount.source_type == "attachment",
+                    ResearchSourceMount.source_entity_id.in_(unique_attachment_ids),
+                )
+            ).all()
+            if len(mounts) != len(attachments):
+                raise HTTPException(status_code=409, detail="附件尚未冻结到研究文件空间")
+            input_refs.extend(
+                {"kind": "source", "id": str(mount.id), "revision": mount.source_revision}
+                for mount in mounts
+            )
+        task = session.scalar(
+            select(ResearchTask)
+            .where(ResearchTask.run_id == run.id)
+            .order_by(ResearchTask.ordinal)
         )
-        session.add(execution)
-        session.flush()
-        session.commit()
-        sandbox_executor.submit(run_sandbox_execution, execution.id)
-        return sandbox_execution_response(session, execution)
+        if task is None:
+            raise HTTPException(status_code=409, detail="研究运行尚未生成任务")
+        try:
+            job = sandbox_job_service.submit(
+                workspace_id=run.workspace_id,
+                run_id=run.id,
+                task_id=task.id,
+                invocation_key=(
+                    f"user:{run.id}:{user.id}:"
+                    f"{hashlib.sha256(payload.code.encode()).hexdigest()[:32]}"
+                ),
+                purpose="inspect_data",
+                code=payload.code,
+                input_refs=tuple(input_refs),
+                timeout_seconds=payload.timeout_seconds,
+            )
+            legacy_view = session.get(SandboxExecution, job.id)
+            if legacy_view is None:
+                session.add(
+                    SandboxExecution(
+                        id=job.id,
+                        workspace_id=job.workspace_id,
+                        run_id=job.run_id,
+                        requested_by_user_id=user.id,
+                        purpose=job.purpose,
+                        code=job.code,
+                        input_message_ids=[str(run.trigger_message_id)],
+                        input_attachment_ids=[str(value) for value in payload.attachment_ids],
+                        input_evidence_span_ids=[str(value) for value in payload.evidence_span_ids],
+                        timeout_seconds=job.timeout_seconds,
+                        status="queued",
+                    )
+                )
+            todo = session.scalar(
+                select(Todo).where(
+                    Todo.run_id == run.id,
+                    Todo.research_task_id == task.id,
+                    Todo.kind == "python_sandbox",
+                )
+            )
+            if todo is not None:
+                todo.sandbox_execution_id = job.id
+        except SandboxJobError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return sandbox_job_response(job)
 
     @app.get(
         "/api/v1/sandbox-executions/{execution_id}",
@@ -3782,6 +3685,10 @@ def create_app(
         execution_id: UUID, session: SessionDependency, user: CurrentUser
     ) -> SandboxExecutionResponse:
         execution = accessible_sandbox_execution(session, user, execution_id)
+        job = session.get(SandboxJob, execution_id)
+        if job is not None and job.status == "running" and execution.status == "queued":
+            execution.status = "running"
+            execution.started_at = job.started_at
         return sandbox_execution_response(session, execution)
 
     def sandbox_job_response(job: SandboxJob) -> SandboxJobResponse:
@@ -3836,24 +3743,20 @@ def create_app(
     def cancel_sandbox_execution(
         execution_id: UUID, session: SessionDependency, user: CurrentUser
     ) -> SandboxExecutionResponse:
+        """Compatibility route backed exclusively by the durable Sandbox Job."""
         accessible_sandbox_execution(session, user, execution_id)
-        execution, _run = locked_sandbox_state(session, execution_id)
-        if execution is None:
-            raise HTTPException(status_code=404, detail="沙箱执行不存在")
-        if execution.status in {"completed", "failed", "timed_out", "cancelled", "unavailable"}:
-            return sandbox_execution_response(session, execution)
-        execution.cancel_requested_at = datetime.now(UTC)
-        if execution.status == "queued":
-            execution.status = "cancelled"
-            execution.completed_at = datetime.now(UTC)
-        else:
-            execution.status = "cancel_requested"
-        session.commit()
-        if sandbox.cancel(str(execution.id)):
-            execution.status = "cancelled"
-            execution.completed_at = datetime.now(UTC)
+        try:
+            job = sandbox_job_service.cancel(execution_id)
+        except SandboxJobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        execution = session.get(SandboxExecution, execution_id)
+        if execution is not None:
+            execution.status = "cancelled" if job.cancel_requested_at is not None else job.status
+            execution.error_message = job.error_message
+            execution.completed_at = job.completed_at
             session.commit()
-        return sandbox_execution_response(session, execution)
+            return sandbox_execution_response(session, execution)
+        raise HTTPException(status_code=404, detail="沙箱执行不存在")
 
     @app.get("/api/v1/artifacts/{artifact_id}/download", response_class=FileResponse)
     def download_artifact(

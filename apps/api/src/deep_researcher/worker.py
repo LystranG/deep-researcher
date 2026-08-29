@@ -44,21 +44,6 @@ class RuntimeV2EntryPoint:
             fencing_epoch=fencing_epoch,
         )
 
-    def execute_run(
-        self,
-        run_id: UUID,
-        *,
-        lease_owner: str,
-        fencing_epoch: int | None = None,
-    ) -> None:
-        """Compatibility alias for direct callers; Worker uses Runtime v2."""
-        self.execute_runtime_v2(
-            run_id,
-            lease_owner=lease_owner,
-            fencing_epoch=fencing_epoch,
-        )
-
-
 class RunWorker:
     """从数据库队列领取并执行研究运行的 Worker"""
 
@@ -107,6 +92,17 @@ class RunWorker:
 
         heartbeat_thread = Thread(target=heartbeat_loop, name="research-worker-heartbeat")
         heartbeat_thread.start()
+        sandbox_stop = Event()
+        sandbox_thread: Thread | None = None
+        sandbox_runtime = self._sandbox_runtime
+        if sandbox_runtime is not None:
+            def sandbox_loop() -> None:
+                while not sandbox_stop.is_set():
+                    if not sandbox_runtime.run_once():
+                        sandbox_stop.wait(self._poll_interval_seconds)
+
+            sandbox_thread = Thread(target=sandbox_loop, name="sandbox-job-worker")
+            sandbox_thread.start()
         try:
             if not isinstance(claim, RunClaim):
                 raise RuntimeError("production RunQueue must provide a fencing epoch")
@@ -115,9 +111,10 @@ class RunWorker:
                 lease_owner=self._owner,
                 fencing_epoch=claim.fencing_epoch,
             )
-            if self._sandbox_runtime is not None:
-                self._sandbox_runtime.run_once()
         finally:
+            sandbox_stop.set()
+            if sandbox_thread is not None:
+                sandbox_thread.join(timeout=2)
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2)
             try:

@@ -3,6 +3,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -41,6 +42,8 @@ from deep_researcher.models import (
     ResearchTask,
     RunEvent,
     SandboxExecution,
+    SandboxJob,
+    SandboxObservation,
     SkillInstallation,
     SkillPackage,
     SkillVersion,
@@ -81,6 +84,10 @@ from deep_researcher.stop_policy import StopPolicyInput, decide_stop
 from deep_researcher.tool_execution import ToolExecutionService
 from deep_researcher.web_page import WebAcquisitionGateway, WebAcquisitionResult
 from deep_researcher.web_search import SearchResult, SearchUnavailableError, WebSearchGateway
+
+_fencing_epoch_context: ContextVar[int | None] = ContextVar(
+    "research_fencing_epoch", default=None
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +137,8 @@ class ResearchCoordinator:
         graph_runner: ResearchGraphRunner | None = None,
         sandbox_submitter: Callable[[UUID], object] | None = None,
         sandbox_canceller: Callable[[UUID], object] | None = None,
+        sandbox_job_canceller: Callable[[UUID], object] | None = None,
+        sandbox_job_submitter: Callable[..., object] | None = None,
         embedding_gateway: EmbeddingGateway | None = None,
         retrieval: HybridRetrieval | None = None,
         conversation_segment_submitter: Callable[[UUID], object] | None = None,
@@ -157,6 +166,8 @@ class ResearchCoordinator:
         self._graph_runner = graph_runner or ResearchGraphRunner()
         self._sandbox_submitter = sandbox_submitter
         self._sandbox_canceller = sandbox_canceller
+        self._sandbox_job_canceller = sandbox_job_canceller
+        self._sandbox_job_submitter = sandbox_job_submitter
         self._embedding_gateway = embedding_gateway
         self._retrieval = retrieval
         self._conversation_segment_submitter = conversation_segment_submitter
@@ -170,6 +181,7 @@ class ResearchCoordinator:
         fencing_epoch: int | None = None,
     ) -> None:
         """执行持有有效租约的研究运行"""
+        epoch_token = _fencing_epoch_context.set(fencing_epoch)
         try:
             with self._session_factory() as session:
                 run = session.get(ResearchRun, run_id)
@@ -636,6 +648,8 @@ class ResearchCoordinator:
             self._cancel(run_id, lease_owner=lease_owner)
         except Exception as exc:
             self._fail(run_id, str(exc), error=exc, lease_owner=lease_owner)
+        finally:
+            _fencing_epoch_context.reset(epoch_token)
 
     @staticmethod
     def _requires_whole_page_map(question: str) -> bool:
@@ -807,7 +821,7 @@ class ResearchCoordinator:
         """按任务 ordinal 幂等固化 Graph 计划及起始事件"""
         if not tasks:
             return
-        sandbox_jobs: list[UUID] = []
+        sandbox_jobs: list[dict[str, object]] = []
         with self._session_factory.begin() as session:
             run = session.get(ResearchRun, run_id)
             if (
@@ -853,24 +867,20 @@ class ResearchCoordinator:
                 )
                 if todo is not None:
                     continue
-                execution = None
                 if kind == "python_sandbox":
-                    execution = SandboxExecution(
-                        workspace_id=run.workspace_id,
-                        run_id=run.id,
-                        requested_by_user_id=run.initiated_by_user_id,
-                        purpose="按研究计划完成受限计算",
-                        code=self._sandbox_code(
-                            trigger.content if trigger is not None else ""
-                        ),
-                        input_message_ids=[str(run.trigger_message_id)],
-                        input_attachment_ids=[],
-                        timeout_seconds=task["time_budget_seconds"],
-                        status="queued",
+                    sandbox_jobs.append(
+                        {
+                            "workspace_id": run.workspace_id,
+                            "run_id": run.id,
+                            "task_id": research_task.id,
+                            "invocation_key": f"plan:{run.id}:{task['ordinal']}:python",
+                            "purpose": "inspect_data",
+                            "code": self._sandbox_code(
+                                trigger.content if trigger is not None else ""
+                            ),
+                            "timeout_seconds": task["time_budget_seconds"],
+                        }
                     )
-                    session.add(execution)
-                    session.flush()
-                    sandbox_jobs.append(execution.id)
                 session.add(
                     Todo(
                         workspace_id=run.workspace_id,
@@ -886,7 +896,6 @@ class ResearchCoordinator:
                         kind=kind,
                         status="running" if not task["dependencies"] else "pending",
                         idempotency_key=f"plan:{task['ordinal']}:{kind}",
-                        sandbox_execution_id=execution.id if execution is not None else None,
                     )
                 )
             first_task = next(
@@ -918,9 +927,9 @@ class ResearchCoordinator:
                             lease_expires_at=first_task.lease_expires_at,
                         )
                     )
-        if self._sandbox_submitter is not None:
-            for execution_id in sandbox_jobs:
-                self._sandbox_submitter(execution_id)
+        if self._sandbox_job_submitter is not None:
+            for job_request in sandbox_jobs:
+                self._sandbox_job_submitter(**job_request)
         self._append_event(
             run_id,
             "plan_created",
@@ -1088,7 +1097,7 @@ class ResearchCoordinator:
         """等待 Agent Sandbox Todo 终态并返回可引用结果与失败标记"""
         deadline = time.monotonic() + 20
         while True:
-            with self._session_factory() as session:
+            with self._session_factory.begin() as session:
                 run = session.get(ResearchRun, run_id)
                 if (
                     run is None
@@ -1103,12 +1112,73 @@ class ResearchCoordinator:
                     return [], False
                 active = [todo for todo in todos if todo.status in {"pending", "running"}]
                 if not active:
+                    for todo in todos:
+                        job = session.scalar(
+                            select(SandboxJob).where(
+                                SandboxJob.run_id == run_id,
+                                SandboxJob.task_id == todo.research_task_id,
+                            )
+                        )
+                        observation = (
+                            session.scalar(
+                                select(SandboxObservation).where(
+                                    SandboxObservation.job_id == job.id
+                                )
+                            )
+                            if job is not None
+                            else None
+                        )
+                        if (
+                            job is not None
+                            and observation is not None
+                            and observation.status == "completed"
+                            and session.scalar(
+                                select(DerivedEvidence).where(
+                                    DerivedEvidence.sandbox_execution_id == job.id
+                                )
+                            )
+                            is None
+                        ):
+                            session.add(
+                                SandboxExecution(
+                                    id=job.id,
+                                    workspace_id=job.workspace_id,
+                                    run_id=job.run_id,
+                                    purpose=job.purpose,
+                                    code=job.code,
+                                    timeout_seconds=job.timeout_seconds,
+                                    status="completed",
+                                    stdout=observation.stdout_preview,
+                                    stderr=observation.stderr_preview,
+                                    completed_at=observation.created_at,
+                                )
+                            )
+                            session.add(
+                                DerivedEvidence(
+                                    workspace_id=job.workspace_id,
+                                    run_id=job.run_id,
+                                    sandbox_execution_id=job.id,
+                                    purpose=job.purpose,
+                                    code_hash=hashlib.sha256(
+                                        job.code.encode()
+                                    ).hexdigest(),
+                                    stdout=observation.stdout_preview,
+                                    stdout_hash=hashlib.sha256(
+                                        observation.stdout_preview.encode()
+                                    ).hexdigest(),
+                                    result_hash=hashlib.sha256(
+                                        observation.stdout_preview.encode()
+                                    ).hexdigest(),
+                                )
+                            )
+                    session.flush()
                     rows = session.execute(
-                        select(Todo, DerivedEvidence)
+                        select(Todo, SandboxJob, SandboxObservation, DerivedEvidence)
+                        .join(SandboxJob, SandboxJob.task_id == Todo.research_task_id)
+                        .join(SandboxObservation, SandboxObservation.job_id == SandboxJob.id)
                         .join(
                             DerivedEvidence,
-                            DerivedEvidence.sandbox_execution_id
-                            == Todo.sandbox_execution_id,
+                            DerivedEvidence.sandbox_execution_id == SandboxJob.id,
                         )
                         .where(
                             Todo.run_id == run_id,
@@ -1118,11 +1188,11 @@ class ResearchCoordinator:
                         .order_by(Todo.ordinal, Todo.created_at)
                     ).all()
                     results: list[SandboxEvidenceResult] = []
-                    for todo, evidence in rows:
+                    for todo, _job, observation, evidence in rows:
                         if not todo.result_summary:
                             continue
                         summary = todo.result_summary.strip()
-                        evidence_start = evidence.stdout.find(summary)
+                        evidence_start = observation.stdout_preview.find(summary)
                         if evidence_start < 0:
                             continue
                         results.append(
@@ -1131,7 +1201,9 @@ class ResearchCoordinator:
                                 summary=summary,
                                 evidence_start=evidence_start,
                                 evidence_end=evidence_start + len(summary),
-                                result_hash=evidence.result_hash,
+                                result_hash=hashlib.sha256(
+                                    observation.stdout_preview.encode()
+                                ).hexdigest(),
                             )
                         )
                     failed = any(todo.status in {"failed", "skipped"} for todo in todos)
@@ -2016,6 +2088,7 @@ class ResearchCoordinator:
         waiting_approval = False
         result_status: str | None = None
         sandbox_execution_ids: list[UUID] = []
+        sandbox_job_ids: list[UUID] = []
         with self._sequence_lock, self._session_factory.begin() as session:
             run = session.scalar(
                 select(ResearchRun).where(ResearchRun.id == run_id).with_for_update()
@@ -2048,18 +2121,36 @@ class ResearchCoordinator:
                 todo.completed_at = cancelled_at
                 if todo.sandbox_execution_id is not None:
                     sandbox_execution_ids.append(todo.sandbox_execution_id)
-            executions = session.scalars(
+                jobs = session.scalars(
+                    select(SandboxJob).where(
+                        SandboxJob.run_id == run.id,
+                        SandboxJob.task_id == todo.research_task_id,
+                        SandboxJob.status.not_in({"completed", "failed", "timed_out", "cancelled"}),
+                    )
+                ).all()
+                sandbox_job_ids.extend(job.id for job in jobs)
+            sandbox_job_ids.extend(
+                job.id
+                for job in session.scalars(
+                    select(SandboxJob).where(
+                        SandboxJob.run_id == run.id,
+                        SandboxJob.status.not_in(
+                            {"completed", "failed", "timed_out", "cancelled"}
+                        ),
+                    )
+                ).all()
+            )
+            for execution in session.scalars(
                 select(SandboxExecution).where(
                     SandboxExecution.run_id == run.id,
                     SandboxExecution.status.in_(
                         {"queued", "running", "cancel_requested"}
                     ),
                 )
-            ).all()
-            for execution in executions:
+            ).all():
                 execution.cancel_requested_at = cancelled_at
-                if execution.id not in sandbox_execution_ids:
-                    sandbox_execution_ids.append(execution.id)
+                execution.status = "cancelled"
+                execution.completed_at = cancelled_at
             run.status = "cancelled"
             run.completed_at = cancelled_at
             self._finalize_ledger(session, run, status="cancelled")
@@ -2089,6 +2180,9 @@ class ResearchCoordinator:
         for execution_id in sandbox_execution_ids:
             if self._sandbox_canceller is not None:
                 self._sandbox_canceller(execution_id)
+        for job_id in set(sandbox_job_ids):
+            if self._sandbox_job_canceller is not None:
+                self._sandbox_job_canceller(job_id)
         return result_status
 
     def record_sandbox_todo_outcome(
@@ -2145,15 +2239,19 @@ class ResearchCoordinator:
         *,
         event_key: str | None = None,
         lease_owner: str | None = None,
+        fencing_epoch: int | None = None,
     ) -> None:
         """追加可按业务键去重的 RunEvent"""
         try:
+            if fencing_epoch is None:
+                fencing_epoch = _fencing_epoch_context.get()
             self._event_log.append(
                 run_id,
                 event_type,
                 payload,
                 event_key=event_key,
                 lease_owner=lease_owner,
+                fencing_epoch=fencing_epoch,
             )
         except RunEventRejectedError:
             return
