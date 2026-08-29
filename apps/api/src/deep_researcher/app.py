@@ -58,6 +58,7 @@ from deep_researcher.models import (
     MemoryRevision,
     Message,
     MessageAttachment,
+    ResearchArtifactRevision,
     ResearchClaimEvidence,
     ResearchLedger,
     ResearchPlan,
@@ -895,6 +896,37 @@ def create_app(
                             ).hexdigest(),
                         )
                     )
+                for file_ref in observation.file_refs:
+                    artifact_id = file_ref.get("id")
+                    if artifact_id is None:
+                        continue
+                    artifact_revision = session.get(
+                        ResearchArtifactRevision, UUID(artifact_id)
+                    )
+                    if artifact_revision is None:
+                        continue
+                    if session.scalar(
+                        select(Artifact).where(
+                            Artifact.storage_key
+                            == f"{execution.workspace_id}/{execution.id}/"
+                            f"attempt-1/{artifact_revision.normalized_name}"
+                        )
+                    ) is None:
+                        session.add(
+                            Artifact(
+                                workspace_id=execution.workspace_id,
+                                run_id=execution.run_id,
+                                sandbox_execution_id=execution.id,
+                                filename=artifact_revision.normalized_name,
+                                storage_key=(
+                                    f"{execution.workspace_id}/{execution.id}/"
+                                    f"attempt-1/{artifact_revision.normalized_name}"
+                                ),
+                                media_type=artifact_revision.media_type,
+                                size_bytes=artifact_revision.size_bytes,
+                                sha256=artifact_revision.content_hash,
+                            )
+                        )
             if todo is not None and todo.status not in {
                 "completed",
                 "failed",
