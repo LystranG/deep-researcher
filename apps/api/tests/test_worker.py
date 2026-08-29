@@ -1,6 +1,6 @@
 from uuid import uuid4
 
-from deep_researcher.worker import RunWorker
+from deep_researcher.worker import RuntimeV2EntryPoint, RunWorker
 
 
 class Queue:
@@ -33,6 +33,15 @@ class SandboxRuntime:
     def run_once(self) -> bool:
         self.calls += 1
         return True
+
+
+def test_runtime_v2_entrypoint_uses_the_runtime_boundary() -> None:
+    runtime = Runtime()
+    entrypoint = RuntimeV2EntryPoint(runtime)
+
+    entrypoint.execute_run(uuid4(), lease_owner="runtime-worker")
+
+    assert runtime.calls == [(runtime.calls[0][0], "runtime-worker")]
 
 
 def test_worker_executes_the_configured_runtime_entrypoint() -> None:

@@ -79,6 +79,23 @@ class LiteLLMTokenEstimator:
         return int(token_counter(model=self._model, text=text))
 
 
+class TiktokenTokenEstimator:
+    """Local tokenizer estimator that does not load LiteLLM provider metadata."""
+
+    def __init__(self, model: str) -> None:
+        """Resolve the model encoding once for deterministic local accounting."""
+        import tiktoken
+
+        try:
+            self._encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            self._encoding = tiktoken.get_encoding("cl100k_base")
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens without network access."""
+        return max(1, len(self._encoding.encode(text)))
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     """描述单次模型输入的固定预留与 evidence 可用空间"""

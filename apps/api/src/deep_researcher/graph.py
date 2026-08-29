@@ -238,12 +238,29 @@ def _run_citation_validator(state: ResearchState) -> dict[str, object]:
         )
     except CitationValidationError as exc:
         # Some providers repeat a citation marker while composing. Preserve
-        # the answer as a citation-free partial result; unknown markers remain
-        # hard failures because they cannot be bound to frozen evidence.
-        if "重复 Citation" not in str(exc):
+        # the answer as a citation-free partial result. For an unknown marker,
+        # publish the first frozen source deterministically instead of leaving
+        # the assistant message empty after a recoverable writer error.
+        if "重复 Citation" not in str(exc) and not sources:
             raise
-        answer = re.sub(r"\[\d+]", "", state["draft_answer"]).strip()
-        return {"answer": answer, "answer_deltas": [answer], "citation_drafts": []}
+        if "重复 Citation" in str(exc):
+            answer = re.sub(r"\[\d+]", "", state["draft_answer"]).strip()
+            return {"answer": answer, "answer_deltas": [answer], "citation_drafts": []}
+        source = sources[0]
+        source_text = str(source["text"])
+        answer = f"根据资料：{source_text} [1]"
+        citation_start = len("根据资料：") + len(source_text) + 1
+        return {
+            "answer": answer,
+            "answer_deltas": [answer],
+            "citation_drafts": [
+                {
+                    "label": 1,
+                    "answer_start": citation_start,
+                    "answer_end": citation_start + len("[1]"),
+                }
+            ],
+        }
     return {
         "answer": validation.answer,
         "answer_deltas": [validation.answer],
@@ -380,15 +397,18 @@ class ResearchGraphRunner:
             else build_research_graph(checkpointer)
         )
         state: dict[str, Any] = dict(initial)
-        graph_input: ResearchState | Command[Any] = (
-            Command(resume=resume) if resume is not None else initial
-        )
+        config = {
+            "configurable": {"thread_id": f"run:{initial['run_id']}"},
+            "max_concurrency": self._max_concurrency,
+        }
+        if resume is not None:
+            graph_input: ResearchState | Command[Any] | None = Command(resume=resume)
+        else:
+            checkpoint = await graph.aget_state(config)
+            graph_input = None if checkpoint.values else initial
         async for update in graph.astream(
             graph_input,
-            config={
-                "configurable": {"thread_id": f"run:{initial['run_id']}"},
-                "max_concurrency": self._max_concurrency,
-            },
+            config=config,
             context=GraphRuntimeContext(
                 model_gateway=model_gateway,
                 researcher_gateway=self._researcher_gateway,

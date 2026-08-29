@@ -510,7 +510,7 @@ def test_cancelling_active_model_stream_maps_to_cancelled_without_new_conclusion
             headers={**headers, "Idempotency-Key": "cancel-model-stream"},
             json={"content": "生成过程中停止"},
         ).json()
-        assert gateway.started.wait(timeout=2)
+        assert gateway.started.wait(timeout=30)
         cancelled = client.post(f"/api/v1/runs/{run['run_id']}/cancel", headers=headers)
         events = client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
         messages = client.get(

@@ -504,6 +504,34 @@ class ResearchFileStore:
                 return self._artifact_snapshot(replay, session)
             return self._artifact_snapshot(artifact, session)
 
+    def ingest_artifact(
+        self,
+        *,
+        workspace_id: UUID,
+        run_id: UUID,
+        task_id: UUID,
+        name: str,
+        content: str,
+        idempotency_key: str,
+    ) -> ResearchFileSnapshot:
+        """Commit Sandbox text output as work, then publish its artifact ref."""
+        work = self.write(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            task_id=task_id,
+            name=name,
+            content=content,
+            idempotency_key=f"{idempotency_key}:work",
+        )
+        return self.publish(
+            workspace_id=workspace_id,
+            run_id=run_id,
+            task_id=task_id,
+            work_ref=work.ref,
+            name=name,
+            idempotency_key=f"{idempotency_key}:artifact",
+        )
+
     @staticmethod
     def _require_run(session: Session, workspace_id: UUID, run_id: UUID) -> ResearchRun:
         run = session.get(ResearchRun, run_id)

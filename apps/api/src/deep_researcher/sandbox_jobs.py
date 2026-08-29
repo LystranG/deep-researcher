@@ -6,10 +6,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Event, Thread
 from typing import TYPE_CHECKING, Protocol, cast
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from deep_researcher.models import (
@@ -21,6 +23,7 @@ from deep_researcher.models import (
     utc_now,
 )
 from deep_researcher.research_file_space import ResearchFileRef, ResearchFileStore
+from deep_researcher.sandbox import DockerSandbox, SandboxInputMount, SandboxRequest
 
 if TYPE_CHECKING:
     from deep_researcher.task_runtime import (
@@ -206,13 +209,26 @@ class SandboxJobService:
                 return None
             deadline = _utc(job.deadline_at)
             if deadline is not None and deadline <= now:
-                job.status = "timed_out"
-                job.completed_at = now
+                self._publish_unclaimed_terminal(
+                    session,
+                    job,
+                    worker_id=worker_id,
+                    status="timed_out",
+                    error_category="deadline",
+                    error_message="sandbox deadline exceeded before execution",
+                    now=now,
+                )
                 return None
             if job.attempt_count >= job.max_attempts:
-                job.status = "failed"
-                job.error_category = "attempt_limit"
-                job.completed_at = now
+                self._publish_unclaimed_terminal(
+                    session,
+                    job,
+                    worker_id=worker_id,
+                    status="failed",
+                    error_category="attempt_limit",
+                    error_message="sandbox attempt limit exceeded",
+                    now=now,
+                )
                 return None
             job.attempt_count += 1
             job.status = "running"
@@ -230,6 +246,61 @@ class SandboxJobService:
             session.add(attempt)
             session.flush()
             return job, attempt
+
+    def _publish_unclaimed_terminal(
+        self,
+        session: Session,
+        job: SandboxJob,
+        *,
+        worker_id: str,
+        status: str,
+        error_category: str,
+        error_message: str,
+        now: datetime,
+    ) -> None:
+        """Persist a terminal Observation when no physical execution starts."""
+        existing = session.scalar(
+            select(SandboxObservation).where(SandboxObservation.job_id == job.id)
+        )
+        if existing is not None:
+            return
+        attempt = session.scalar(
+            select(SandboxAttempt)
+            .where(SandboxAttempt.job_id == job.id)
+            .order_by(desc(SandboxAttempt.attempt_number))
+        )
+        if attempt is None:
+            attempt = SandboxAttempt(
+                job_id=job.id,
+                attempt_number=job.attempt_count,
+                lease_owner=worker_id,
+                lease_expires_at=now,
+                input_manifest=list(job.input_refs),
+                status=status,
+            )
+            session.add(attempt)
+            session.flush()
+        attempt.status = status
+        attempt.completed_at = now
+        attempt.error_category = error_category
+        attempt.error_message = error_message
+        job.status = status
+        job.error_category = error_category
+        job.error_message = error_message
+        job.completed_at = now
+        job.lease_owner = None
+        job.lease_expires_at = None
+        session.add(
+            SandboxObservation(
+                job_id=job.id,
+                attempt_id=attempt.id,
+                status=status,
+                attempt_count=job.attempt_count,
+                stderr_preview=error_message,
+                error_category=error_category,
+                error_message=error_message,
+            )
+        )
 
     def publish(
         self,
@@ -341,14 +412,74 @@ class SandboxJobService:
             else ref
             for ref in job.input_refs
         )
-        try:
-            output = executor.execute(job=job, attempt=attempt, input_refs=refs)
-        except Exception as exc:
+        finished = Event()
+        result: list[SandboxExecutionOutput] = []
+        error: list[Exception] = []
+
+        def execute_attempt() -> None:
+            try:
+                result.append(executor.execute(job=job, attempt=attempt, input_refs=refs))
+            except Exception as exc:
+                error.append(exc)
+            finally:
+                finished.set()
+
+        execution_thread = Thread(
+            target=execute_attempt,
+            name=f"sandbox-job-{job.id}",
+            daemon=True,
+        )
+        execution_thread.start()
+        lease_lost = False
+        while not finished.wait(1):
+            current_job = self.get(job.id)
+            current_deadline = (
+                _utc(current_job.deadline_at) if current_job is not None else None
+            )
+            if (
+                current_job is None
+                or (current_deadline is not None and current_deadline <= utc_now())
+            ):
+                executor.cancel(attempt)
+                finished.wait()
+                lease_lost = current_job is None
+                break
+            if not self.heartbeat(
+                job_id=job.id,
+                attempt_id=attempt.id,
+                worker_id=worker_id,
+            ):
+                executor.cancel(attempt)
+                finished.wait()
+                current_job = self.get(job.id)
+                lease_lost = (
+                    current_job is None or current_job.cancel_requested_at is None
+                )
+                break
+        if lease_lost:
+            return True
+        if error:
             output = SandboxExecutionOutput(
                 status="failed",
                 error_category="infrastructure",
-                error_message=str(exc),
+                error_message=str(error[0]),
                 retryable=True,
+            )
+        elif result:
+            output = result[0]
+        else:
+            output = SandboxExecutionOutput(
+                status="failed",
+                error_category="cancelled",
+                error_message="sandbox attempt was cancelled",
+                retryable=False,
+            )
+        current_job = self.get(job.id)
+        if current_job is not None and current_job.cancel_requested_at is not None:
+            output = SandboxExecutionOutput(
+                status="cancelled",
+                stderr="sandbox execution was cancelled",
+                error_category="cancelled",
             )
         if output.retryable and job.attempt_count < job.max_attempts:
             self._schedule_retry(job.id, attempt.id, worker_id, output)
@@ -401,8 +532,15 @@ class SandboxJobService:
                 return job
             job.cancel_requested_at = utc_now()
             if job.status in {"queued", "retry_wait"}:
-                job.status = "cancelled"
-                job.completed_at = utc_now()
+                self._publish_unclaimed_terminal(
+                    session,
+                    job,
+                    worker_id="cancellation",
+                    status="cancelled",
+                    error_category="cancelled",
+                    error_message="sandbox execution was cancelled before execution",
+                    now=utc_now(),
+                )
             else:
                 job.status = "cancel_requested"
             return job
@@ -421,6 +559,95 @@ class SandboxJobService:
             raise SandboxJobError("sandbox timeout exceeds policy")
         if max_attempts < 1 or max_attempts > 3:
             raise SandboxJobError("sandbox attempt limit exceeds policy")
+
+
+class DockerSandboxJobExecutor:
+    """Adapt durable file references to one isolated Docker Job Attempt."""
+
+    def __init__(
+        self,
+        sandbox: DockerSandbox,
+        file_store: ResearchFileStore,
+        output_root: Path,
+    ) -> None:
+        self._sandbox = sandbox
+        self._file_store = file_store
+        self._output_root = output_root
+
+    def execute(
+        self,
+        *,
+        job: SandboxJob,
+        attempt: SandboxAttempt,
+        input_refs: tuple[ResearchFileRef | dict[str, str], ...],
+    ) -> SandboxExecutionOutput:
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory(prefix=f"sandbox-job-{job.id}-") as input_root:
+            mounts: list[SandboxInputMount] = []
+            for index, value in enumerate(input_refs):
+                if isinstance(value, dict):
+                    continue
+                snapshot = self._file_store.read(
+                    workspace_id=job.workspace_id,
+                    run_id=job.run_id,
+                    task_id=job.task_id,
+                    ref=value,
+                    shared_refs=(value,),
+                )
+                input_path = Path(input_root) / f"{index}-{Path(snapshot.name).name}"
+                input_path.write_text(snapshot.content or "", encoding="utf-8")
+                mounts.append(
+                    SandboxInputMount(
+                        host_path=input_path,
+                        container_name=input_path.name,
+                    )
+                )
+            result = self._sandbox.execute(
+                SandboxRequest(
+                    code=job.code,
+                    input_mounts=mounts,
+                    output_dir=self._output_root / str(job.workspace_id) / str(job.id),
+                    timeout_seconds=job.timeout_seconds,
+                ),
+                execution_key=f"{job.id}:{attempt.id}",
+            )
+            artifact_refs: list[dict[str, str]] = []
+            if result.status == "completed":
+                output_root = (self._output_root / str(job.workspace_id) / str(job.id)).resolve()
+                for artifact_path in result.artifacts:
+                    resolved_artifact = artifact_path.resolve()
+                    try:
+                        relative_name = resolved_artifact.relative_to(output_root)
+                    except ValueError as exc:
+                        raise ValueError("sandbox artifact escaped the output directory") from exc
+                    if not relative_name.parts:
+                        raise ValueError("sandbox artifact has no relative name")
+                    try:
+                        content = resolved_artifact.read_text(encoding="utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError("sandbox artifacts must be UTF-8 text") from exc
+                    name = str(relative_name)
+                    artifact = self._file_store.ingest_artifact(
+                        workspace_id=job.workspace_id,
+                        run_id=job.run_id,
+                        task_id=job.task_id,
+                        name=name,
+                        content=content,
+                        idempotency_key=f"sandbox:{job.id}:attempt:{attempt.id}:{name}",
+                    )
+                    artifact_refs.append(artifact.ref.as_dict())
+        return SandboxExecutionOutput(
+            status=result.status,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            file_refs=tuple(artifact_refs),
+            result_reference=f"sandbox-job://{job.id}/attempt/{attempt.id}",
+            error_category=("deadline" if result.status == "timed_out" else None),
+        )
+
+    def cancel(self, attempt: SandboxAttempt) -> bool:
+        return self._sandbox.cancel(f"{attempt.job_id}:{attempt.id}")
 
 
 class SandboxJobWorker:
@@ -474,6 +701,64 @@ class SandboxToolAdapter:
             result_reference=f"sandbox-job://{job.id}",
             summary="Sandbox Job 已排队，等待专用 Worker 完成",
         )
+
+    def resume(
+        self,
+        claim: TaskClaim,
+        call: TaskToolCall,
+        waiting_reference: str,
+    ) -> TaskObservationResult:
+        """Turn a durable Job Observation into the Task Observation."""
+        from deep_researcher.task_runtime import TaskObservationResult
+
+        del call
+        prefix = "sandbox-job:"
+        if not waiting_reference.startswith(prefix):
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="invalid_waiting_reference",
+                error_category="protocol",
+            )
+        try:
+            job_id = UUID(waiting_reference.removeprefix(prefix))
+        except ValueError:
+            return TaskObservationResult(
+                status="failed",
+                failure_ref="invalid_waiting_reference",
+                error_category="protocol",
+            )
+        with self._service._session_factory() as session:
+            job = session.get(SandboxJob, job_id)
+            observation = session.scalar(
+                select(SandboxObservation).where(SandboxObservation.job_id == job_id)
+            )
+            if job is None or job.run_id != claim.run_id or job.task_id != claim.task_id:
+                return TaskObservationResult(
+                    status="failed",
+                    failure_ref="sandbox_job_not_available",
+                    error_category="permission",
+                )
+            if observation is None:
+                return TaskObservationResult(
+                    status="waiting",
+                    waiting_reference=waiting_reference,
+                    result_reference=f"sandbox-job://{job.id}",
+                    summary="Sandbox Job 仍在等待专用 Worker",
+                )
+            if observation.status != "completed":
+                return TaskObservationResult(
+                    status="failed",
+                    failure_ref=observation.error_category or observation.status,
+                    error_category=observation.error_category or "execution",
+                    summary=observation.error_message,
+                )
+            return TaskObservationResult(
+                status="succeeded",
+                result_reference=observation.result_reference,
+                file_refs=tuple(observation.file_refs),
+                evidence_gain=True,
+                summary=observation.stdout_preview,
+            )
 
     def _workspace_id(self, claim: TaskClaim) -> UUID:
         with self._service._session_factory() as session:

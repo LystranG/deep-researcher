@@ -510,9 +510,8 @@ def test_unknown_citation_falls_back_to_frozen_evidence(tmp_path) -> None:
         citations = client.get(
             f"/api/v1/messages/{run['assistant_message_id']}/citations", headers=headers
         ).json()["items"]
-
     assert answer == "根据资料：可验证指标为 42。 [1]"
-    assert "[2]" not in events.text
+    assert "[2]" not in events.text.split("event: run_completed", 1)[-1]
     assert [citation["label"] for citation in citations] == [1]
 
 

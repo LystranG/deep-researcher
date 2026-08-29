@@ -2,7 +2,6 @@ from threading import Event, Thread
 from typing import Protocol
 from uuid import UUID, uuid4
 
-from deep_researcher.coordinator import ResearchCoordinator
 from deep_researcher.run_queue import RunQueue
 
 
@@ -19,13 +18,13 @@ class SandboxRuntime(Protocol):
 
 
 class RuntimeV2EntryPoint:
-    """Runtime v2 entry point bound to the currently configured run implementation."""
+    """Durable Plan/DAG/ReAct entry point for one leased Research Run."""
 
-    def __init__(self, coordinator: ResearchCoordinator) -> None:
-        self._coordinator = coordinator
+    def __init__(self, runtime: RunRuntime) -> None:
+        self._runtime = runtime
 
     def execute_run(self, run_id: UUID, *, lease_owner: str) -> None:
-        self._coordinator.execute_run(run_id, lease_owner=lease_owner)
+        self._runtime.execute_run(run_id, lease_owner=lease_owner)
 
 
 class RunWorker:
@@ -50,6 +49,8 @@ class RunWorker:
 
     def run_once(self) -> bool:
         """领取并执行一个运行，返回是否实际领取到任务"""
+        if self._sandbox_runtime is not None and self._sandbox_runtime.run_once():
+            return True
         run_id = self._queue.claim(self._owner)
         if run_id is None:
             return (
@@ -67,6 +68,8 @@ class RunWorker:
         heartbeat_thread.start()
         try:
             self._runtime.execute_run(run_id, lease_owner=self._owner)
+            if self._sandbox_runtime is not None:
+                self._sandbox_runtime.run_once()
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=2)

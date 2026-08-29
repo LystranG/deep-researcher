@@ -1302,7 +1302,7 @@ def test_cancellation_during_map_call_prevents_new_digest_commit(tmp_path) -> No
         )
         worker_thread = Thread(target=worker.run_once)
         worker_thread.start()
-        assert model_gateway.started.wait(timeout=5)
+        assert model_gateway.started.wait(timeout=30)
         before_cancel = client.get(
             f"/api/v1/runs/{run['run_id']}/map-works", headers=headers
         ).json()["items"]

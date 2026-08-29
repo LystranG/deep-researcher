@@ -448,8 +448,23 @@ class ToolExecutionService:
         with self._lock, self._session_factory.begin() as session:
             completed_tool_run = session.get(ToolRun, tool_run_id)
             tool_call = session.get(ToolCall, tool_call_id)
-            if completed_tool_run is None or tool_call is None:
+            run = session.scalar(
+                select(ResearchRun)
+                .where(ResearchRun.id == run_id)
+                .with_for_update()
+            )
+            if completed_tool_run is None or tool_call is None or run is None:
                 raise RuntimeError("工具执行记录不存在")
+            if run.cancel_requested_at is not None or run.status == "cancelled":
+                completed_tool_run.status = "cancelled"
+                completed_tool_run.error_summary = "研究运行已取消"
+                completed_tool_run.completed_at = datetime.now(UTC)
+                tool_call.status = "cancelled"
+                return {
+                    "tool_call_id": str(tool_call_id),
+                    "status": "cancelled",
+                    "result_summary": None,
+                }
             completed_tool_run.status = "completed"
             completed_tool_run.result_summary = result_summary
             completed_tool_run.completed_at = datetime.now(UTC)

@@ -162,7 +162,13 @@ class ResearchCoordinator:
         self._conversation_segment_submitter = conversation_segment_submitter
         self._research_record_submitter = research_record_submitter
 
-    def execute_run(self, run_id: UUID, *, lease_owner: str | None = None) -> None:
+    def execute_run(
+        self,
+        run_id: UUID,
+        *,
+        lease_owner: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> None:
         """执行持有有效租约的研究运行"""
         try:
             with self._session_factory() as session:
@@ -171,6 +177,10 @@ class ResearchCoordinator:
                     run is None
                     or run.status not in {"queued", "running"}
                     or (lease_owner is not None and run.lease_owner != lease_owner)
+                    or (
+                        fencing_epoch is not None
+                        and (lease_owner is None or run.attempt != fencing_epoch)
+                    )
                 ):
                     return
                 trigger = session.get(Message, run.trigger_message_id)
@@ -1286,14 +1296,30 @@ class ResearchCoordinator:
             )
             if selected is None:
                 return None
+            private_source = next(
+                (
+                    item.candidate
+                    for item in page.items
+                    if item.candidate.source_kind == "source_chunk"
+                    and self._source_chunk_is_private(session, item.candidate.candidate_id, run)
+                ),
+                None,
+            )
+            if private_source is not None:
+                selected = private_source
             if selected.source_kind == "research_record":
+                source_candidates = [
+                    item.candidate
+                    for item in page.items
+                    if item.candidate.source_kind == "source_chunk"
+                ]
                 current_source = next(
                     (
-                        item.candidate
-                        for item in page.items
-                        if item.candidate.source_kind == "source_chunk"
+                        candidate
+                        for candidate in source_candidates
+                        if self._source_chunk_is_private(session, candidate.candidate_id, run)
                     ),
-                    None,
+                    source_candidates[0] if source_candidates else None,
                 )
                 if current_source is not None:
                     selected = current_source
@@ -1339,6 +1365,24 @@ class ResearchCoordinator:
         if not lexical_ranked or lexical_ranked[0][0] <= 0:
             return None
         return self._freeze_source_chunk(lexical_ranked[0][1])
+
+    @staticmethod
+    def _source_chunk_is_private(
+        session: Session,
+        candidate_id: str,
+        run: ResearchRun,
+    ) -> bool:
+        """Prefer a current conversation attachment over a stale record fallback."""
+        try:
+            chunk = session.get(SourceChunk, UUID(candidate_id))
+        except ValueError:
+            return False
+        return (
+            chunk is not None
+            and chunk.workspace_id == run.workspace_id
+            and chunk.attachment_id is not None
+            and chunk.conversation_id == run.conversation_id
+        )
 
     @staticmethod
     def _freeze_source_chunk(chunk: SourceChunk) -> FrozenSource:

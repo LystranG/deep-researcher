@@ -108,6 +108,7 @@ from deep_researcher.retrieval import (
     PostgresResearchRecordRetrievalAdapter,
     PostgresSourceChunkRetrievalAdapter,
     RerankGateway,
+    TiktokenTokenEstimator,
 )
 from deep_researcher.run_queue import RunQueue
 from deep_researcher.sandbox import (
@@ -117,8 +118,10 @@ from deep_researcher.sandbox import (
     SandboxUnavailableError,
 )
 from deep_researcher.sandbox_jobs import (
+    DockerSandboxJobExecutor,
     SandboxJobError,
     SandboxJobService,
+    SandboxJobWorker,
     python_execute_tool_definition,
 )
 from deep_researcher.security import hash_access_token, hash_password, issue_access_token
@@ -765,7 +768,11 @@ def create_app(
             model=resolved_settings.rerank_model,
             api_base=resolved_settings.rerank_api_base,
         )
-    token_estimator = LiteLLMTokenEstimator(resolved_settings.openai_model)
+    token_estimator = (
+        TiktokenTokenEstimator(resolved_settings.openai_model)
+        if resolved_settings.database_url.startswith("sqlite")
+        else LiteLLMTokenEstimator(resolved_settings.openai_model)
+    )
     retrieval = (
         HybridRetrieval(
             resolved_rerank_gateway,
@@ -829,6 +836,7 @@ def create_app(
             research_record_indexer.process, record_id
         ),
     )
+    sandbox = DockerSandbox(image=resolved_settings.sandbox_image)
     object_store = LocalObjectStore(resolved_settings.object_store_root)
     research_file_store = ResearchFileStore(session_factory, object_store)
     sandbox_job_service = SandboxJobService(
@@ -842,6 +850,18 @@ def create_app(
             python_execute_tool_definition(sandbox_job_service),
         )
     )
+    sandbox_job_worker = SandboxJobWorker(
+        sandbox_job_service,
+        DockerSandboxJobExecutor(
+            sandbox,
+            research_file_store,
+            resolved_settings.sandbox_output_root,
+        ),
+        worker_id=f"sandbox-{id(session_factory)}",
+    )
+    run_queue = RunQueue(session_factory)
+    runtime = RuntimeV2EntryPoint(coordinator)
+    run_worker = RunWorker(run_queue, runtime, sandbox_runtime=sandbox_job_worker)
     document_processor = DocumentProcessor(
         session_factory,
         object_store,
@@ -859,12 +879,8 @@ def create_app(
         session_factory,
         embedding_gateway=resolved_embedding_gateway,
     )
-    sandbox = DockerSandbox(image=resolved_settings.sandbox_image)
     file_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="document-process")
     sandbox_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sandbox")
-    run_queue = RunQueue(session_factory)
-    runtime = RuntimeV2EntryPoint(coordinator)
-    run_worker = RunWorker(run_queue, runtime)
     embedded_worker_enabled = embedded_worker
 
     def upgrade_schema() -> None:
@@ -927,6 +943,7 @@ def create_app(
         app.state.graph_runner = resolved_graph_runner
         app.state.research_file_store = research_file_store
         app.state.sandbox_job_service = sandbox_job_service
+        app.state.sandbox_job_worker = sandbox_job_worker
         app.state.task_tool_registry = task_tool_registry
         if embedded_worker_enabled:
             run_worker.start()
@@ -948,6 +965,7 @@ def create_app(
     app.state.graph_runner = resolved_graph_runner
     app.state.research_file_store = research_file_store
     app.state.sandbox_job_service = sandbox_job_service
+    app.state.sandbox_job_worker = sandbox_job_worker
     app.state.task_tool_registry = task_tool_registry
 
     def get_session() -> Iterator[Session]:
