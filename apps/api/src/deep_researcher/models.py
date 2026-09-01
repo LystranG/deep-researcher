@@ -564,8 +564,8 @@ class Todo(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     result_summary: Mapped[str | None] = mapped_column(Text, default=None)
     failure_reason: Mapped[str | None] = mapped_column(Text, default=None)
-    sandbox_execution_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("sandbox_executions.id", ondelete="SET NULL"), index=True, default=None
+    sandbox_job_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("sandbox_jobs.id", ondelete="SET NULL"), index=True, default=None
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
@@ -1281,6 +1281,9 @@ class SandboxJob(Base):
     purpose: Mapped[str] = mapped_column(String(32))
     code: Mapped[str] = mapped_column(Text)
     input_refs: Mapped[list[dict[str, str]]] = mapped_column(JSON, default=list)
+    input_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_evidence_span_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     timeout_seconds: Mapped[int] = mapped_column(Integer)
     max_attempts: Mapped[int] = mapped_column(Integer, default=3)
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
@@ -1347,40 +1350,9 @@ class SandboxObservation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
-class SandboxExecution(Base):
-    __tablename__ = "sandbox_executions"
-
-    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    workspace_id: Mapped[UUID] = mapped_column(
-        ForeignKey("workspaces.id", ondelete="CASCADE"), index=True
-    )
-    run_id: Mapped[UUID] = mapped_column(
-        ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
-    )
-    requested_by_user_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), index=True, default=None
-    )
-    purpose: Mapped[str] = mapped_column(Text)
-    code: Mapped[str] = mapped_column(Text)
-    input_message_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    input_attachment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    input_evidence_span_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    timeout_seconds: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(32), default="queued")
-    stdout: Mapped[str] = mapped_column(Text, default="")
-    stderr: Mapped[str] = mapped_column(Text, default="")
-    error_message: Mapped[str | None] = mapped_column(Text, default=None)
-    cancel_requested_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), default=None
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-
-
 class DerivedEvidence(Base):
     __tablename__ = "derived_evidence"
-    __table_args__ = (UniqueConstraint("sandbox_execution_id"),)
+    __table_args__ = (UniqueConstraint("sandbox_job_id"),)
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     workspace_id: Mapped[UUID] = mapped_column(
@@ -1389,8 +1361,8 @@ class DerivedEvidence(Base):
     run_id: Mapped[UUID] = mapped_column(
         ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
     )
-    sandbox_execution_id: Mapped[UUID] = mapped_column(
-        ForeignKey("sandbox_executions.id", ondelete="CASCADE"), index=True
+    sandbox_job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_jobs.id", ondelete="CASCADE"), index=True
     )
     purpose: Mapped[str] = mapped_column(Text)
     code_hash: Mapped[str] = mapped_column(String(64))
@@ -1414,8 +1386,8 @@ class Artifact(Base):
     run_id: Mapped[UUID] = mapped_column(
         ForeignKey("research_runs.id", ondelete="CASCADE"), index=True
     )
-    sandbox_execution_id: Mapped[UUID] = mapped_column(
-        ForeignKey("sandbox_executions.id", ondelete="CASCADE"), index=True
+    sandbox_job_id: Mapped[UUID] = mapped_column(
+        ForeignKey("sandbox_jobs.id", ondelete="CASCADE"), index=True
     )
     filename: Mapped[str] = mapped_column(String(1000))
     storage_key: Mapped[str] = mapped_column(String(2000), unique=True)

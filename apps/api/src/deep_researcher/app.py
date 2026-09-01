@@ -22,7 +22,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, select
@@ -40,7 +40,6 @@ from deep_researcher.graph import ResearchGraphRunner
 from deep_researcher.mcp_adapter import LocalTrustedHttpMcpAdapter
 from deep_researcher.model_gateway import ExtractiveModelGateway, ModelGateway, build_model_gateway
 from deep_researcher.models import (
-    Artifact,
     Attachment,
     AuthSession,
     Citation,
@@ -66,8 +65,8 @@ from deep_researcher.models import (
     ResearchRun,
     ResearchSourceMount,
     ResearchTask,
+    ResearchWorkRevision,
     RunEvent,
-    SandboxExecution,
     SandboxJob,
     SandboxObservation,
     SkillInstallation,
@@ -144,7 +143,7 @@ from deep_researcher.web_search import (
     WebSearchGateway,
     build_web_search_gateway,
 )
-from deep_researcher.worker import RuntimeV2EntryPoint, RunWorker
+from deep_researcher.worker import RunWorker
 
 
 class RegisterRequest(BaseModel):
@@ -303,7 +302,7 @@ class LedgerStopDecisionResponse(BaseModel):
 class DerivedEvidenceResponse(BaseModel):
     id: str
     run_id: str
-    sandbox_execution_id: str
+    sandbox_job_id: str
     purpose: str
     code_hash: str
     input_message_ids: list[str]
@@ -358,7 +357,7 @@ class TodoResponse(BaseModel):
     status: str
     result_summary: str | None
     failure_reason: str | None
-    sandbox_execution_id: str | None
+    sandbox_job_id: str | None
     sandbox_code: str | None
     sandbox_input_attachment_ids: list[str]
     sandbox_artifacts: list[dict[str, str | int]]
@@ -525,7 +524,7 @@ class MemoryConflictResolveRequest(BaseModel):
     action: str
 
 
-class SandboxExecutionCreateRequest(BaseModel):
+class SandboxJobCreateRequest(BaseModel):
     purpose: str = Field(min_length=1, max_length=4000)
     code: str = Field(min_length=1, max_length=100_000)
     attachment_ids: list[UUID] = Field(default_factory=list, max_length=20)
@@ -542,7 +541,7 @@ class ArtifactResponse(BaseModel):
     created_at: datetime
 
 
-class SandboxExecutionResponse(BaseModel):
+class SandboxJobDetailResponse(BaseModel):
     id: str
     run_id: str
     purpose: str
@@ -836,6 +835,7 @@ def create_app(
     research_file_store = ResearchFileStore(session_factory, object_store)
 
     def notify_sandbox_observation(run_id: UUID, task_id: UUID) -> None:
+        """Project a durable Observation into its owning Task and wake the Run."""
         with session_factory.begin() as session:
             observation = session.scalar(
                 select(SandboxObservation)
@@ -851,94 +851,42 @@ def create_app(
             )
             if observation is None:
                 return
-            execution = session.get(SandboxExecution, observation.job_id)
-            if execution is not None:
-                execution.status = observation.status
-                execution.stdout = observation.stdout_preview
-                execution.stderr = observation.stderr_preview
-                execution.error_message = observation.error_message
-                execution.completed_at = observation.created_at
-                if (
-                    observation.status == "completed"
-                    and session.scalar(
-                        select(DerivedEvidence).where(
-                            DerivedEvidence.sandbox_execution_id == observation.job_id
-                        )
+            job = session.get(SandboxJob, observation.job_id)
+            if job is None:
+                return
+            if observation.status == "completed" and session.scalar(
+                select(DerivedEvidence).where(DerivedEvidence.sandbox_job_id == job.id)
+            ) is None:
+                stdout_hash = hashlib.sha256(observation.stdout_preview.encode()).hexdigest()
+                session.add(
+                    DerivedEvidence(
+                        workspace_id=job.workspace_id,
+                        run_id=job.run_id,
+                        sandbox_job_id=job.id,
+                        purpose=job.purpose,
+                        code_hash=hashlib.sha256(job.code.encode()).hexdigest(),
+                        input_message_ids=job.input_message_ids,
+                        input_attachment_ids=job.input_attachment_ids,
+                        input_evidence_span_ids=job.input_evidence_span_ids,
+                        input_file_refs=list(job.input_refs),
+                        stdout=observation.stdout_preview,
+                        stdout_hash=stdout_hash,
+                        result_hash=hashlib.sha256(
+                            json.dumps(
+                                {"artifact_hashes": [], "stdout_hash": stdout_hash},
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ).encode()
+                        ).hexdigest(),
                     )
-                    is None
-                ):
-                    session.add(
-                        DerivedEvidence(
-                            workspace_id=execution.workspace_id,
-                            run_id=run_id,
-                            sandbox_execution_id=execution.id,
-                            purpose=execution.purpose,
-                            code_hash=hashlib.sha256(execution.code.encode()).hexdigest(),
-                            input_message_ids=list(execution.input_message_ids),
-                            input_attachment_ids=list(execution.input_attachment_ids),
-                            input_evidence_span_ids=list(execution.input_evidence_span_ids),
-                            stdout=observation.stdout_preview,
-                            stdout_hash=hashlib.sha256(
-                                observation.stdout_preview.encode()
-                            ).hexdigest(),
-                            result_hash=hashlib.sha256(
-                                json.dumps(
-                                    {
-                                        "artifact_hashes": [],
-                                        "stdout_hash": hashlib.sha256(
-                                            observation.stdout_preview.encode()
-                                        ).hexdigest(),
-                                    },
-                                    ensure_ascii=False,
-                                    separators=(",", ":"),
-                                    sort_keys=True,
-                                ).encode()
-                            ).hexdigest(),
-                        )
-                    )
-                for file_ref in observation.file_refs:
-                    artifact_id = file_ref.get("id")
-                    if artifact_id is None:
-                        continue
-                    artifact_revision = session.get(
-                        ResearchArtifactRevision, UUID(artifact_id)
-                    )
-                    if artifact_revision is None:
-                        continue
-                    if session.scalar(
-                        select(Artifact).where(
-                            Artifact.storage_key
-                            == f"{execution.workspace_id}/{execution.id}/"
-                            f"attempt-1/{artifact_revision.normalized_name}"
-                        )
-                    ) is None:
-                        session.add(
-                            Artifact(
-                                workspace_id=execution.workspace_id,
-                                run_id=execution.run_id,
-                                sandbox_execution_id=execution.id,
-                                filename=artifact_revision.normalized_name,
-                                storage_key=(
-                                    f"{execution.workspace_id}/{execution.id}/"
-                                    f"attempt-1/{artifact_revision.normalized_name}"
-                                ),
-                                media_type=artifact_revision.media_type,
-                                size_bytes=artifact_revision.size_bytes,
-                                sha256=artifact_revision.content_hash,
-                            )
-                        )
-            if todo is not None and todo.status not in {
-                "completed",
-                "failed",
-                "cancelled",
-                "skipped",
-            }:
-                todo.status = (
-                    "completed" if observation.status == "completed" else "failed"
                 )
+            if todo is not None and todo.status not in {
+                "completed", "failed", "cancelled", "skipped"
+            }:
+                todo.status = "completed" if observation.status == "completed" else "failed"
                 todo.result_summary = observation.stdout_preview[-2000:] or None
                 todo.failure_reason = observation.error_message
-                todo.completed_at = datetime.now(UTC)
+                todo.completed_at = observation.created_at
         run_queue.wake(run_id)
 
     sandbox_job_service = SandboxJobService(
@@ -963,8 +911,7 @@ def create_app(
         worker_id=f"sandbox-{id(session_factory)}",
     )
     run_queue = RunQueue(session_factory)
-    runtime = RuntimeV2EntryPoint(coordinator)
-    run_worker = RunWorker(run_queue, runtime, sandbox_runtime=sandbox_job_worker)
+    run_worker = RunWorker(run_queue, coordinator, sandbox_runtime=sandbox_job_worker)
     document_processor = DocumentProcessor(
         session_factory,
         object_store,
@@ -1040,7 +987,7 @@ def create_app(
         app.state.run_worker = run_worker
         app.state.run_queue = run_queue
         app.state.run_coordinator = coordinator
-        app.state.runtime = runtime
+        app.state.runtime = coordinator
         app.state.tool_execution = tool_execution
         app.state.graph_runner = resolved_graph_runner
         app.state.research_file_store = research_file_store
@@ -1061,7 +1008,7 @@ def create_app(
     app.state.run_worker = run_worker
     app.state.run_queue = run_queue
     app.state.run_coordinator = coordinator
-    app.state.runtime = runtime
+    app.state.runtime = coordinator
     app.state.tool_execution = tool_execution
     app.state.graph_runner = resolved_graph_runner
     app.state.research_file_store = research_file_store
@@ -2352,16 +2299,19 @@ def create_app(
 
         def todo_response(todo: Todo) -> TodoResponse:
             """将 Todo 和关联 Sandbox 转成用户可见摘要"""
-            execution = (
-                session.get(SandboxExecution, todo.sandbox_execution_id)
-                if todo.sandbox_execution_id is not None
+            job = (
+                session.get(SandboxJob, todo.sandbox_job_id)
+                if todo.sandbox_job_id is not None
                 else None
             )
             artifacts = (
                 session.scalars(
-                    select(Artifact).where(Artifact.sandbox_execution_id == execution.id)
+                    select(ResearchArtifactRevision).where(
+                        ResearchArtifactRevision.run_id == job.run_id,
+                        ResearchArtifactRevision.published_by_task_id == job.task_id,
+                    )
                 ).all()
-                if execution is not None
+                if job is not None
                 else []
             )
             return TodoResponse(
@@ -2373,18 +2323,16 @@ def create_app(
                 status=todo.status,
                 result_summary=todo.result_summary,
                 failure_reason=todo.failure_reason,
-                sandbox_execution_id=str(execution.id) if execution is not None else None,
-                sandbox_code=execution.code if execution is not None else None,
-                sandbox_input_attachment_ids=(
-                    execution.input_attachment_ids if execution is not None else []
-                ),
+                sandbox_job_id=str(job.id) if job is not None else None,
+                sandbox_code=job.code if job is not None else None,
+                sandbox_input_attachment_ids=[],
                 sandbox_artifacts=[
                     {
                         "id": str(artifact.id),
-                        "filename": artifact.filename,
+                        "filename": artifact.normalized_name,
                         "media_type": artifact.media_type,
                         "size_bytes": artifact.size_bytes,
-                        "sha256": artifact.sha256,
+                        "sha256": artifact.content_hash,
                     }
                     for artifact in artifacts
                 ],
@@ -3363,29 +3311,12 @@ def create_app(
         summary = research_source_response(snapshot, list(attempts))
         return ResearchSourceDetailResponse(**summary.model_dump(), content=snapshot.content)
 
-    def sandbox_output_path(storage_key: str) -> Path:
-        root = resolved_settings.sandbox_output_root.resolve()
-        candidate = (root / storage_key).resolve()
-        if not candidate.is_relative_to(root):
-            raise ValueError("非法研究产物路径")
-        return candidate
-
-    def artifact_response(artifact: Artifact) -> ArtifactResponse:
-        return ArtifactResponse(
-            id=str(artifact.id),
-            filename=artifact.filename,
-            media_type=artifact.media_type,
-            size_bytes=artifact.size_bytes,
-            sha256=artifact.sha256,
-            created_at=artifact.created_at,
-        )
-
     def derived_evidence_response(evidence: DerivedEvidence) -> DerivedEvidenceResponse:
         """返回不包含代码、stdout 或完整输入内容的安全 provenance"""
         return DerivedEvidenceResponse(
             id=str(evidence.id),
             run_id=str(evidence.run_id),
-            sandbox_execution_id=str(evidence.sandbox_execution_id),
+            sandbox_job_id=str(evidence.sandbox_job_id),
             purpose=evidence.purpose,
             code_hash=evidence.code_hash,
             input_message_ids=evidence.input_message_ids,
@@ -3396,39 +3327,52 @@ def create_app(
             created_at=evidence.created_at,
         )
 
-    def sandbox_execution_response(
-        session: Session, execution: SandboxExecution
-    ) -> SandboxExecutionResponse:
+    def sandbox_job_detail_response(
+        session: Session, job: SandboxJob
+    ) -> SandboxJobDetailResponse:
+        observation = session.scalar(
+            select(SandboxObservation).where(SandboxObservation.job_id == job.id)
+        )
         artifacts = session.scalars(
-            select(Artifact)
+            select(ResearchArtifactRevision)
             .where(
-                Artifact.sandbox_execution_id == execution.id,
-                Artifact.deleted_at.is_(None),
+                ResearchArtifactRevision.run_id == job.run_id,
+                ResearchArtifactRevision.published_by_task_id == job.task_id,
             )
-            .order_by(Artifact.created_at, Artifact.filename)
+            .order_by(ResearchArtifactRevision.created_at, ResearchArtifactRevision.normalized_name)
         ).all()
         evidence = session.scalar(
             select(DerivedEvidence).where(
-                DerivedEvidence.sandbox_execution_id == execution.id
+                DerivedEvidence.sandbox_job_id == job.id
             )
         )
-        return SandboxExecutionResponse(
-            id=str(execution.id),
-            run_id=str(execution.run_id),
-            purpose=execution.purpose,
-            code=execution.code,
-            input_message_ids=execution.input_message_ids,
-            attachment_ids=execution.input_attachment_ids,
-            evidence_span_ids=execution.input_evidence_span_ids,
-            timeout_seconds=execution.timeout_seconds,
-            status=execution.status,
-            stdout=execution.stdout,
-            stderr=execution.stderr,
-            error_message=execution.error_message,
-            created_at=execution.created_at,
-            started_at=execution.started_at,
-            completed_at=execution.completed_at,
-            artifacts=[artifact_response(artifact) for artifact in artifacts],
+        return SandboxJobDetailResponse(
+            id=str(job.id),
+            run_id=str(job.run_id),
+            purpose=job.purpose,
+            code=job.code,
+            input_message_ids=job.input_message_ids,
+            attachment_ids=job.input_attachment_ids,
+            evidence_span_ids=job.input_evidence_span_ids,
+            timeout_seconds=job.timeout_seconds,
+            status=job.status,
+            stdout=observation.stdout_preview if observation else "",
+            stderr=observation.stderr_preview if observation else "",
+            error_message=job.error_message,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            artifacts=[
+                ArtifactResponse(
+                    id=str(artifact.id),
+                    filename=artifact.normalized_name,
+                    media_type=artifact.media_type,
+                    size_bytes=artifact.size_bytes,
+                    sha256=artifact.content_hash,
+                    created_at=artifact.created_at,
+                )
+                for artifact in artifacts
+            ],
             derived_evidence=(
                 derived_evidence_response(evidence) if evidence is not None else None
             ),
@@ -3549,25 +3493,22 @@ def create_app(
             ]
         )
 
-    def accessible_sandbox_execution(
-        session: Session, user: User, execution_id: UUID
-    ) -> SandboxExecution:
-        execution = session.scalar(
-            select(SandboxExecution)
-            .join(
-                WorkspaceMember,
-                WorkspaceMember.workspace_id == SandboxExecution.workspace_id,
-            )
-            .join(Workspace, Workspace.id == SandboxExecution.workspace_id)
+    def accessible_sandbox_job(
+        session: Session, user: User, job_id: UUID
+    ) -> SandboxJob:
+        job = session.scalar(
+            select(SandboxJob)
+            .join(WorkspaceMember, WorkspaceMember.workspace_id == SandboxJob.workspace_id)
+            .join(Workspace, Workspace.id == SandboxJob.workspace_id)
             .where(
-                SandboxExecution.id == execution_id,
+                SandboxJob.id == job_id,
                 WorkspaceMember.user_id == user.id,
                 Workspace.deleted_at.is_(None),
             )
         )
-        if execution is None:
+        if job is None:
             raise HTTPException(status_code=404, detail="沙箱执行不存在")
-        return execution
+        return job
 
     @app.get(
         "/api/v1/derived-evidence/{evidence_id}",
@@ -3595,13 +3536,13 @@ def create_app(
         return derived_evidence_response(evidence)
 
     @app.post(
-        "/api/v1/runs/{run_id}/sandbox-executions",
+        "/api/v1/runs/{run_id}/sandbox-jobs",
         response_model=SandboxJobResponse,
         status_code=202,
     )
-    def create_sandbox_execution(
+    def create_sandbox_job(
         run_id: UUID,
-        payload: SandboxExecutionCreateRequest,
+        payload: SandboxJobCreateRequest,
         session: SessionDependency,
         user: CurrentUser,
     ) -> SandboxJobResponse:
@@ -3677,25 +3618,11 @@ def create_app(
                 purpose="inspect_data",
                 code=payload.code,
                 input_refs=tuple(input_refs),
+                input_message_ids=(str(run.trigger_message_id),),
+                input_attachment_ids=tuple(str(value) for value in payload.attachment_ids),
+                input_evidence_span_ids=tuple(str(value) for value in payload.evidence_span_ids),
                 timeout_seconds=payload.timeout_seconds,
             )
-            legacy_view = session.get(SandboxExecution, job.id)
-            if legacy_view is None:
-                session.add(
-                    SandboxExecution(
-                        id=job.id,
-                        workspace_id=job.workspace_id,
-                        run_id=job.run_id,
-                        requested_by_user_id=user.id,
-                        purpose=job.purpose,
-                        code=job.code,
-                        input_message_ids=[str(run.trigger_message_id)],
-                        input_attachment_ids=[str(value) for value in payload.attachment_ids],
-                        input_evidence_span_ids=[str(value) for value in payload.evidence_span_ids],
-                        timeout_seconds=job.timeout_seconds,
-                        status="queued",
-                    )
-                )
             todo = session.scalar(
                 select(Todo).where(
                     Todo.run_id == run.id,
@@ -3704,24 +3631,20 @@ def create_app(
                 )
             )
             if todo is not None:
-                todo.sandbox_execution_id = job.id
+                todo.sandbox_job_id = job.id
         except SandboxJobError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return sandbox_job_response(job)
 
     @app.get(
-        "/api/v1/sandbox-executions/{execution_id}",
-        response_model=SandboxExecutionResponse,
+        "/api/v1/sandbox-jobs/{job_id}/detail",
+        response_model=SandboxJobDetailResponse,
     )
-    def get_sandbox_execution(
-        execution_id: UUID, session: SessionDependency, user: CurrentUser
-    ) -> SandboxExecutionResponse:
-        execution = accessible_sandbox_execution(session, user, execution_id)
-        job = session.get(SandboxJob, execution_id)
-        if job is not None and job.status == "running" and execution.status == "queued":
-            execution.status = "running"
-            execution.started_at = job.started_at
-        return sandbox_execution_response(session, execution)
+    def get_sandbox_job_detail(
+        job_id: UUID, session: SessionDependency, user: CurrentUser
+    ) -> SandboxJobDetailResponse:
+        job = accessible_sandbox_job(session, user, job_id)
+        return sandbox_job_detail_response(session, job)
 
     def sandbox_job_response(job: SandboxJob) -> SandboxJobResponse:
         return SandboxJobResponse(
@@ -3738,18 +3661,6 @@ def create_app(
             created_at=job.created_at,
             completed_at=job.completed_at,
         )
-
-    def accessible_sandbox_job(
-        session: Session, user: User, job_id: UUID
-    ) -> SandboxJob:
-        job = session.scalar(
-            select(SandboxJob)
-            .join(WorkspaceMember, WorkspaceMember.workspace_id == SandboxJob.workspace_id)
-            .where(SandboxJob.id == job_id, WorkspaceMember.user_id == user.id)
-        )
-        if job is None:
-            raise HTTPException(status_code=404, detail="Sandbox Job 不存在")
-        return job
 
     @app.get("/api/v1/sandbox-jobs/{job_id}", response_model=SandboxJobResponse)
     def get_sandbox_job(
@@ -3768,49 +3679,33 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return sandbox_job_response(job)
 
-    @app.post(
-        "/api/v1/sandbox-executions/{execution_id}/cancel",
-        response_model=SandboxExecutionResponse,
-    )
-    def cancel_sandbox_execution(
-        execution_id: UUID, session: SessionDependency, user: CurrentUser
-    ) -> SandboxExecutionResponse:
-        """Compatibility route backed exclusively by the durable Sandbox Job."""
-        accessible_sandbox_execution(session, user, execution_id)
-        try:
-            job = sandbox_job_service.cancel(execution_id)
-        except SandboxJobError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        execution = session.get(SandboxExecution, execution_id)
-        if execution is not None:
-            execution.status = "cancelled" if job.cancel_requested_at is not None else job.status
-            execution.error_message = job.error_message
-            execution.completed_at = job.completed_at
-            session.commit()
-            return sandbox_execution_response(session, execution)
-        raise HTTPException(status_code=404, detail="沙箱执行不存在")
-
-    @app.get("/api/v1/artifacts/{artifact_id}/download", response_class=FileResponse)
+    @app.get("/api/v1/artifacts/{artifact_id}/download", response_class=Response)
     def download_artifact(
         artifact_id: UUID, session: SessionDependency, user: CurrentUser
-    ) -> FileResponse:
+    ) -> Response:
         artifact = session.scalar(
-            select(Artifact)
-            .join(WorkspaceMember, WorkspaceMember.workspace_id == Artifact.workspace_id)
-            .join(Workspace, Workspace.id == Artifact.workspace_id)
+            select(ResearchArtifactRevision)
+            .join(
+                WorkspaceMember,
+                WorkspaceMember.workspace_id == ResearchArtifactRevision.workspace_id,
+            )
+            .join(Workspace, Workspace.id == ResearchArtifactRevision.workspace_id)
             .where(
-                Artifact.id == artifact_id,
-                Artifact.deleted_at.is_(None),
+                ResearchArtifactRevision.id == artifact_id,
                 Workspace.deleted_at.is_(None),
                 WorkspaceMember.user_id == user.id,
             )
         )
         if artifact is None:
             raise HTTPException(status_code=404, detail="研究产物不存在")
-        path = sandbox_output_path(artifact.storage_key)
-        if not path.is_file():
+        work = session.get(ResearchWorkRevision, artifact.work_revision_id)
+        if work is None:
             raise HTTPException(status_code=410, detail="研究产物文件已失效")
-        return FileResponse(path, media_type=artifact.media_type, filename=artifact.filename)
+        return Response(
+            content=work.content,
+            media_type=artifact.media_type,
+            headers={"Content-Disposition": f'attachment; filename="{artifact.normalized_name}"'},
+        )
 
     @app.post("/api/v1/runs/{run_id}/cancel", response_model=RunStatusResponse)
     def cancel_run(

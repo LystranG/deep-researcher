@@ -23,27 +23,6 @@ class SandboxRuntime(Protocol):
         """Execute one durably claimed Sandbox Job."""
 
 
-class RuntimeV2EntryPoint:
-    """Durable Plan/DAG/ReAct entry point for one leased Research Run."""
-
-    def __init__(self, runtime: RunRuntime) -> None:
-        self._runtime = runtime
-
-    def execute_runtime_v2(
-        self,
-        run_id: UUID,
-        *,
-        lease_owner: str,
-        fencing_epoch: int | None = None,
-    ) -> None:
-        if fencing_epoch is None:
-            raise RuntimeError("production RunQueue must provide a fencing epoch")
-        self._runtime.execute_runtime_v2(
-            run_id,
-            lease_owner=lease_owner,
-            fencing_epoch=fencing_epoch,
-        )
-
 class RunWorker:
     """从数据库队列领取并执行研究运行的 Worker"""
 

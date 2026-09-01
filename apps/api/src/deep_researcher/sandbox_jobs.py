@@ -110,6 +110,9 @@ class SandboxJobService:
         purpose: str,
         code: str,
         input_refs: tuple[ResearchFileRef | str | dict[str, object], ...] = (),
+        input_message_ids: tuple[str, ...] = (),
+        input_attachment_ids: tuple[str, ...] = (),
+        input_evidence_span_ids: tuple[str, ...] = (),
         timeout_seconds: int = 30,
         max_attempts: int = 3,
     ) -> SandboxJob:
@@ -152,6 +155,9 @@ class SandboxJobService:
             "input_refs": [
                 ref if isinstance(ref, dict) else ref.as_dict() for ref in parsed_refs
             ],
+            "input_message_ids": list(input_message_ids),
+            "input_attachment_ids": list(input_attachment_ids),
+            "input_evidence_span_ids": list(input_evidence_span_ids),
             "timeout_seconds": timeout_seconds,
         }
         parameters_hash = hashlib.sha256(
@@ -185,6 +191,9 @@ class SandboxJobService:
                 input_refs=[
                     ref if isinstance(ref, dict) else ref.as_dict() for ref in parsed_refs
                 ],
+                input_message_ids=list(input_message_ids),
+                input_attachment_ids=list(input_attachment_ids),
+                input_evidence_span_ids=list(input_evidence_span_ids),
                 timeout_seconds=timeout_seconds,
                 max_attempts=max_attempts,
                 deadline_at=utc_now() + timedelta(seconds=timeout_seconds),

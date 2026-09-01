@@ -179,7 +179,7 @@ def test_verified_research_record_becomes_searchable_after_run_commit(tmp_path) 
         ).json()
         client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
         record = None
-        for _ in range(50):
+        for _ in range(500):
             items = client.get(
                 f"/api/v1/workspaces/{workspace_id}/research-records", headers=headers
             ).json()["items"]

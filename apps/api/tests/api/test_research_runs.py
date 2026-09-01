@@ -227,9 +227,11 @@ def test_invalid_writer_citation_fails_without_publishing_a_message(tmp_path) ->
         messages = client.get(
             f"/api/v1/conversations/{conversation_id}/messages", headers=headers
         ).json()["items"]
-        citations = client.get(
+        citations_response = client.get(
             f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
-        ).json()["items"]
+        )
+        assert citations_response.status_code == 200, citations_response.text
+        citations = citations_response.json()["items"]
 
     assert detail["status"] == "failed"
     assert messages[-1]["content"] == ""
@@ -685,9 +687,11 @@ def test_calculation_research_cites_persisted_sandbox_evidence(
         messages = client.get(
             f"/api/v1/conversations/{conversation_id}/messages", headers=headers
         ).json()["items"]
-        citations = client.get(
+        citations_response = client.get(
             f"/api/v1/messages/{messages[-1]['id']}/citations", headers=headers
-        ).json()["items"]
+        )
+        assert citations_response.status_code == 200, citations_response.text
+        citations = citations_response.json()["items"]
         ledger = client.get(
             f"/api/v1/runs/{created['run_id']}/ledger", headers=headers
         ).json()

@@ -5,12 +5,15 @@ from pathlib import Path
 from uuid import UUID
 
 from deep_researcher.models import (
-    Artifact,
     Citation,
     DerivedEvidence,
     EvidenceSpan,
+    ResearchArtifactRevision,
     ResearchRun,
-    SandboxExecution,
+    ResearchTask,
+    SandboxAttempt,
+    SandboxJob,
+    SandboxObservation,
     SourceChunk,
     StopDecision,
     WorkspaceMember,
@@ -56,7 +59,7 @@ except OSError:
 Path('/output/result.txt').write_text('可下载研究产物')
 """
         created = client.post(
-            f"/api/v1/runs/{run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": "验证授权输入并生成结果",
@@ -80,7 +83,7 @@ Path('/output/result.txt').write_text('可下载研究产物')
         ).json()
         client.get(f"/api/v1/runs/{other_run['run_id']}/events", headers=headers)
         cross_workspace = client.post(
-            f"/api/v1/runs/{other_run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{other_run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": f"空间 {other_workspace_id} 不应读取空间 {workspace_id}",
@@ -148,7 +151,7 @@ def test_successful_sandbox_persists_reproducible_derived_evidence(tmp_path) -> 
             session.flush()
             evidence_span_id = evidence_span.id
         created = client.post(
-            f"/api/v1/runs/{run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": "验证派生结果",
@@ -212,30 +215,49 @@ def test_derived_evidence_readback_requires_workspace_membership(tmp_path) -> No
         client.get(f"/api/v1/runs/{run['run_id']}/events", headers=headers)
         current_user_id = UUID(client.get("/api/v1/auth/me", headers=headers).json()["id"])
         with client.app.state.session_factory.begin() as session:
-            execution = SandboxExecution(
+            task = session.query(ResearchTask).filter_by(
+                run_id=UUID(run["run_id"])
+            ).order_by(ResearchTask.ordinal).first()
+            assert task is not None
+            execution = SandboxJob(
                 workspace_id=UUID(workspace_id),
                 run_id=UUID(run["run_id"]),
-                requested_by_user_id=current_user_id,
-                purpose="ACL 验证",
+                task_id=task.id,
+                invocation_key=f"test:{run['run_id']}",
+                parameters_hash=hashlib.sha256(b"safe").hexdigest(),
+                purpose="inspect_data",
                 code="print('safe')",
-                input_attachment_ids=[],
-                input_evidence_span_ids=[],
                 timeout_seconds=5,
                 status="completed",
-                stdout="safe\n",
             )
             session.add(execution)
             session.flush()
+            attempt = SandboxAttempt(
+                job_id=execution.id,
+                attempt_number=1,
+                lease_owner="test",
+                lease_expires_at=execution.created_at,
+                status="completed",
+            )
+            session.add(attempt)
+            session.flush()
+            session.add(
+                SandboxObservation(
+                    job_id=execution.id,
+                    attempt_id=attempt.id,
+                    status="completed",
+                    attempt_count=1,
+                    stdout_preview="safe\n",
+                )
+            )
             evidence = DerivedEvidence(
                 workspace_id=UUID(workspace_id),
                 run_id=UUID(run["run_id"]),
-                sandbox_execution_id=execution.id,
+                sandbox_job_id=execution.id,
                 purpose=execution.purpose,
                 code_hash=hashlib.sha256(execution.code.encode()).hexdigest(),
-                input_attachment_ids=[],
-                input_evidence_span_ids=[],
-                stdout=execution.stdout,
-                stdout_hash=hashlib.sha256(execution.stdout.encode()).hexdigest(),
+                stdout="safe\n",
+                stdout_hash=hashlib.sha256(b"safe\n").hexdigest(),
                 result_hash=hashlib.sha256(b"stable-result").hexdigest(),
             )
             session.add(evidence)
@@ -279,14 +301,14 @@ def test_user_can_cancel_running_sandbox_execution(tmp_path) -> None:
             citations_before = session.query(Citation).filter_by(
                 message_id=UUID(run["assistant_message_id"])
             ).count()
-            artifacts_before = session.query(Artifact).filter_by(
+            artifacts_before = session.query(ResearchArtifactRevision).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
             evidence_before = session.query(DerivedEvidence).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
         created = client.post(
-            f"/api/v1/runs/{run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": "验证取消传播",
@@ -297,13 +319,13 @@ def test_user_can_cancel_running_sandbox_execution(tmp_path) -> None:
         ).json()
         for _ in range(100):
             current = client.get(
-                f"/api/v1/sandbox-executions/{created['id']}", headers=headers
+                f"/api/v1/sandbox-jobs/{created['id']}", headers=headers
             ).json()
             if current["status"] == "running":
                 break
             time.sleep(0.02)
         cancelled = client.post(
-            f"/api/v1/sandbox-executions/{created['id']}/cancel", headers=headers
+            f"/api/v1/sandbox-jobs/{created['id']}/cancel", headers=headers
         )
         assert cancelled.status_code == 200, cancelled.text
         execution = wait_for_execution(client, headers, created["id"])
@@ -311,7 +333,7 @@ def test_user_can_cancel_running_sandbox_execution(tmp_path) -> None:
             citations_after = session.query(Citation).filter_by(
                 message_id=UUID(run["assistant_message_id"])
             ).count()
-            artifacts_after = session.query(Artifact).filter_by(
+            artifacts_after = session.query(ResearchArtifactRevision).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
             evidence_after = session.query(DerivedEvidence).filter_by(
@@ -355,14 +377,14 @@ def test_run_cancellation_prevents_new_sandbox_ledger_facts(tmp_path) -> None:
             citations_before = session.query(Citation).filter_by(
                 message_id=UUID(run["assistant_message_id"])
             ).count()
-            artifacts_before = session.query(Artifact).filter_by(
+            artifacts_before = session.query(ResearchArtifactRevision).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
             evidence_before = session.query(DerivedEvidence).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
         created = client.post(
-            f"/api/v1/runs/{run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": "取消后不能发布结果",
@@ -379,14 +401,14 @@ def test_run_cancellation_prevents_new_sandbox_ledger_facts(tmp_path) -> None:
         ).json()
         for _ in range(100):
             current = client.get(
-                f"/api/v1/sandbox-executions/{created['id']}", headers=headers
+                f"/api/v1/sandbox-jobs/{created['id']}", headers=headers
             ).json()
             if current["status"] == "running":
                 break
             time.sleep(0.02)
         cancelled = client.post(f"/api/v1/runs/{run['run_id']}/cancel", headers=headers)
         rejected_after_cancel = client.post(
-            f"/api/v1/runs/{run['run_id']}/sandbox-executions",
+            f"/api/v1/runs/{run['run_id']}/sandbox-jobs",
             headers=headers,
             json={
                 "purpose": "取消后不能再创建",
@@ -400,7 +422,7 @@ def test_run_cancellation_prevents_new_sandbox_ledger_facts(tmp_path) -> None:
             citations_after = session.query(Citation).filter_by(
                 message_id=UUID(run["assistant_message_id"])
             ).count()
-            artifacts_after = session.query(Artifact).filter_by(
+            artifacts_after = session.query(ResearchArtifactRevision).filter_by(
                 run_id=UUID(run["run_id"])
             ).count()
             evidence_after = session.query(DerivedEvidence).filter_by(
@@ -443,7 +465,9 @@ def wait_for_execution(
 ) -> dict[str, object]:
     payload: dict[str, object] = {}
     for _ in range(300):
-        response = client.get(f"/api/v1/sandbox-executions/{execution_id}", headers=headers)
+        response = client.get(
+            f"/api/v1/sandbox-jobs/{execution_id}/detail", headers=headers
+        )
         payload = response.json()
         if payload["status"] in {
             "completed",
