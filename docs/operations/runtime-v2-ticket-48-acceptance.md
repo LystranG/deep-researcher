@@ -34,15 +34,40 @@ bounded and use explicit time limits.
 These checks require services or credentials that are not part of the default
 local test environment and were not run as part of this acceptance:
 
-- PostgreSQL queue and checkpoint takeover with two live Workers
-- Docker sandbox execution and container cancellation against a deployed
-  runtime
-- local MCP service cancellation and late-result behavior
 - configured model, embedding, rerank, or search providers
 - deployed Worker topology and restart recovery
 
-They are recorded as `unverified`, rather than inferred from deterministic
-SQLite tests. Before release, run the relevant integration suites with the
+The following external checks were run on 2026-09-01 against Docker
+29.2.1 on macOS with a PostgreSQL 17 / pgvector 0.8.5 container. No
+credentials were included in the command output:
+
+- `apps/api/tests/integration/test_postgres_event_log.py -k
+  'concurrent_event_writers or two_postgres_workers or
+  postgres_cancelled_queue_item'`: 3 passed. This covered concurrent event
+  sequence allocation, two-Worker claim competition with terminal
+  idempotency, and cancellation winning before queue claim.
+- A fresh PostgreSQL database migrated from the clean initial revision to
+  `a4b5c6d7e8`: passed. The clean-cut migration now removes PostgreSQL
+  foreign-key dependencies before dropping the legacy table while preserving
+  SQLite's batch migration path.
+- `apps/api/tests/integration/test_docker_sandbox.py`: 3 passed. This
+  covered Docker isolation, artifact publication, daemon-unavailable
+  fail-closed behavior, and environment filtering. The daemon reported
+  `cgroupfs`; no rootless claim was made. Durable sandbox cancellation and
+  late-result behavior remain covered only by the deterministic local tests.
+- Local HTTP MCP fixture tests in
+  `apps/api/tests/api/test_tool_approvals.py -k
+  'local_trusted_http_mcp or cancelling_waiting_approval'`: 2 passed.
+  `apps/api/tests/test_mcp_provider.py`: 3 passed. These covered the local
+  MCP call path, cancellation before invocation, structured result
+  validation, and late-result fencing in the deterministic adapter.
+
+The remaining checks are recorded as `unverified`, rather than inferred from
+deterministic tests: configured model/embedding/rerank/search providers,
+model-backed lease/checkpoint answer recovery, and deployed Worker topology
+restart recovery. The PostgreSQL lease/checkpoint test was not counted as
+passed because the environment had no configured model provider and therefore
+produced no final answer content. Before release, run those suites with the
 deployment configuration and attach their results to issue #48.
 
 ## Recovery Contract
