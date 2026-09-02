@@ -34,7 +34,6 @@ bounded and use explicit time limits.
 These checks require services or credentials that are not part of the default
 local test environment and were not run as part of this acceptance:
 
-- configured model, embedding, rerank, or search providers
 - deployed Worker topology and restart recovery
 
 The following external checks were run on 2026-09-01 against Docker
@@ -46,6 +45,15 @@ credentials were included in the command output:
   postgres_cancelled_queue_item'`: 3 passed. This covered concurrent event
   sequence allocation, two-Worker claim competition with terminal
   idempotency, and cancellation winning before queue claim.
+- The complete PostgreSQL event-log file, including expired-lease takeover and
+  checkpoint crash/restart recovery, passed 5/5 with the configured model
+  provider. The checkpoint assertion was updated from the retired
+  `research_progress` event name to the current `run_progress` event name.
+- Real Jina Reader verification passed 3/3, including successful hosted
+  content, timeout fallback, and constraint-exhaustion handling.
+- Real Hybrid Retrieval verification passed 4/4, covering configured
+  embedding and rerank providers, PostgreSQL vector/FTS retrieval, and
+  Workspace ACL isolation.
 - A fresh PostgreSQL database migrated from the clean initial revision to
   `a4b5c6d7e8`: passed. The clean-cut migration now removes PostgreSQL
   foreign-key dependencies before dropping the legacy table while preserving
@@ -63,12 +71,13 @@ credentials were included in the command output:
   validation, and late-result fencing in the deterministic adapter.
 
 The remaining checks are recorded as `unverified`, rather than inferred from
-deterministic tests: configured model/embedding/rerank/search providers,
-model-backed lease/checkpoint answer recovery, and deployed Worker topology
-restart recovery. The PostgreSQL lease/checkpoint test was not counted as
-passed because the environment had no configured model provider and therefore
-produced no final answer content. Before release, run those suites with the
-deployment configuration and attach their results to issue #48.
+the local environment: the ticket #12 combination test requiring Jina to be
+the selected reader (the live Jina account returned HTTP 402 and the designed
+local HTTP fallback was selected), and deployed Worker topology restart
+recovery. The configured model, embedding, rerank, and search provider tests
+and model-backed PostgreSQL lease/checkpoint recovery are now verified.
+Before release, run the remaining deployment test with the deployment
+configuration and attach its results to issue #48.
 
 ## Recovery Contract
 

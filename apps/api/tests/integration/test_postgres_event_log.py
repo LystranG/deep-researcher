@@ -308,7 +308,7 @@ def test_worker_restart_resumes_graph_checkpoint_without_duplicate_answer(tmp_pa
         ).json()["items"]
 
     assert events.text.count("event: run_completed") == 1
-    assert events.text.count("event: research_progress") >= 1
+    assert events.text.count("event: run_progress") >= 1
     assert [message["role"] for message in messages].count("assistant") == 1
     assert messages[-1]["content"]
 
