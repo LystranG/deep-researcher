@@ -146,17 +146,24 @@ class WebAcquisitionGateway(Protocol):
 
 
 class WebAcquisition:
-    """集中执行 URL 安全校验、Jina 主读取与 Local HTTP fallback"""
+    """集中执行 URL 安全校验、Provider 主读取与 Local HTTP fallback"""
 
     def __init__(
         self,
         *,
-        jina_reader: WebPageGateway,
+        firecrawl_reader: WebPageGateway | None = None,
         local_reader: WebPageGateway | None,
+        jina_reader: WebPageGateway | None = None,
         url_validator: Callable[[str], None] | None = None,
     ) -> None:
-        """注入两个正文 Adapter 与公共 URL 校验函数"""
-        self._jina_reader = jina_reader
+        """注入正文 Provider、兼容旧 Jina 调用方与公共 URL 校验函数"""
+        if firecrawl_reader is None and jina_reader is None:
+            raise ValueError("必须配置网页正文 Provider")
+        self._provider_reader = firecrawl_reader or jina_reader
+        assert self._provider_reader is not None
+        self._provider_adapter_id = (
+            "firecrawl_reader" if firecrawl_reader is not None else "jina_reader"
+        )
         self._local_reader = local_reader
         self._url_validator = url_validator or _validate_public_url
 
@@ -171,25 +178,27 @@ class WebAcquisition:
         if should_stop is not None and should_stop():
             return WebAcquisitionResult(selected=None, attempts=(), stopped_reason="cancelled")
 
-        jina_attempt = _normalize_attempt(
-            self._jina_reader.fetch(url),
-            adapter_id="jina_reader",
+        provider_reader = self._provider_reader
+        assert provider_reader is not None
+        provider_attempt = _normalize_attempt(
+            provider_reader.fetch(url),
+            adapter_id=self._provider_adapter_id,
             adapter_version="legacy",
             requested_url=url,
         )
-        jina_attempt = _reject_unsafe_final_url(jina_attempt, self._url_validator)
-        attempts = [jina_attempt]
-        if jina_attempt.status == "success":
-            return WebAcquisitionResult(selected=jina_attempt, attempts=tuple(attempts))
+        provider_attempt = _reject_unsafe_final_url(provider_attempt, self._url_validator)
+        attempts = [provider_attempt]
+        if provider_attempt.status == "success":
+            return WebAcquisitionResult(selected=provider_attempt, attempts=tuple(attempts))
         if (
-            jina_attempt.error_category in _MUST_STOP_CATEGORIES
-            or not jina_attempt.fallback_allowed
+            provider_attempt.error_category in _MUST_STOP_CATEGORIES
+            or not provider_attempt.fallback_allowed
             or self._local_reader is None
         ):
             return WebAcquisitionResult(
                 selected=None,
                 attempts=tuple(attempts),
-                stopped_reason=jina_attempt.error_category,
+                stopped_reason=provider_attempt.error_category,
             )
         if should_stop is not None and should_stop():
             return WebAcquisitionResult(
@@ -210,6 +219,136 @@ class WebAcquisition:
                 None if local_attempt.status == "success" else local_attempt.error_category
             ),
         )
+
+
+class FirecrawlWebPageAdapter:
+    """将 Firecrawl Scrape API 的 Markdown 响应规范化为正文获取尝试。"""
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        client: httpx.Client | None = None,
+        adapter_version: str = "v2",
+    ) -> None:
+        self._api_key = api_key
+        self._client = client or httpx.Client(timeout=60.0, follow_redirects=False)
+        self._adapter_version = adapter_version
+
+    def fetch(self, url: str) -> WebPageAttempt:
+        """通过 Firecrawl 抓取单个公开 URL，并只请求 Markdown 格式。"""
+        if not self._api_key:
+            return WebPageAttempt.failure(
+                adapter_id="firecrawl_reader",
+                adapter_version=self._adapter_version,
+                requested_url=url,
+                error_category="provider_unavailable",
+                retryable=False,
+                fallback_allowed=True,
+            )
+        try:
+            response = self._client.post(
+                "https://api.firecrawl.dev/v2/scrape",
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"url": url, "formats": ["markdown"], "onlyMainContent": True},
+            )
+            if response.status_code >= 400:
+                return WebPageAttempt.failure(
+                    adapter_id="firecrawl_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    content_type=response.headers.get("content-type"),
+                    error_category=_firecrawl_error_category(response),
+                    retryable=response.status_code in {408, 429} or response.status_code >= 500,
+                    fallback_allowed=response.status_code not in {401, 402, 403},
+                )
+            raw_payload = response.json()
+            if not isinstance(raw_payload, dict):
+                return WebPageAttempt.failure(
+                    adapter_id="firecrawl_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    error_category="unusable_extraction",
+                    retryable=False,
+                    fallback_allowed=True,
+                )
+            payload = cast(dict[str, object], raw_payload)
+            if payload.get("success") is False:
+                return WebPageAttempt.failure(
+                    adapter_id="firecrawl_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    error_category="provider_rejected",
+                    retryable=False,
+                    fallback_allowed=True,
+                )
+            data = payload.get("data")
+            record = data if isinstance(data, dict) else payload
+            markdown = record.get("markdown")
+            if not isinstance(markdown, str):
+                return WebPageAttempt.failure(
+                    adapter_id="firecrawl_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    error_category="unusable_extraction",
+                    retryable=False,
+                    fallback_allowed=True,
+                )
+            content_text = markdown.strip()
+            if len(content_text) < 80:
+                return WebPageAttempt.failure(
+                    adapter_id="firecrawl_reader",
+                    adapter_version=self._adapter_version,
+                    requested_url=url,
+                    http_status=response.status_code,
+                    error_category="unusable_extraction",
+                    retryable=False,
+                    fallback_allowed=True,
+                )
+            metadata = record.get("metadata")
+            metadata_record = metadata if isinstance(metadata, dict) else {}
+            final_url = (
+                _optional_string(metadata_record.get("sourceURL"))
+                or _optional_string(metadata_record.get("url"))
+                or url
+            )
+            title = _optional_string(metadata_record.get("title")) or urlparse(final_url).netloc
+            status_code = metadata_record.get("statusCode")
+            return WebPageAttempt.success(
+                adapter_id="firecrawl_reader",
+                adapter_version=self._adapter_version,
+                requested_url=url,
+                final_url=final_url,
+                http_status=(
+                    int(status_code) if isinstance(status_code, int) else response.status_code
+                ),
+                content_type="text/markdown",
+                title=title,
+                content=content_text,
+                complete=True,
+                truncated=False,
+            )
+        except (httpx.HTTPError, OSError, ValueError, json.JSONDecodeError):
+            return WebPageAttempt.failure(
+                adapter_id="firecrawl_reader",
+                adapter_version=self._adapter_version,
+                requested_url=url,
+                error_category="provider_unavailable",
+                retryable=True,
+                fallback_allowed=True,
+            )
+
+
+# Descriptive name matching the existing JinaReaderWebPageAdapter convention.
+FirecrawlReaderWebPageAdapter = FirecrawlWebPageAdapter
 
 
 class JinaReaderWebPageAdapter:
@@ -531,6 +670,17 @@ def _jina_error_category(response: httpx.Response) -> str:
 def _jina_fallback_allowed(response: httpx.Response) -> bool:
     """判断 Jina 失败后是否仍允许安全本地读取"""
     return _jina_error_category(response) not in {"constraint_exhausted", "access_restricted"}
+
+
+def _firecrawl_error_category(response: httpx.Response) -> str:
+    """将 Firecrawl 错误响应归一为稳定类别。"""
+    if response.status_code == 402:
+        return "constraint_exhausted"
+    if response.status_code in {401, 403}:
+        return "access_restricted"
+    if response.status_code in {408, 429} or response.status_code >= 500:
+        return "provider_unavailable"
+    return "provider_rejected"
 
 
 def _validate_public_url(url: str) -> None:

@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     rerank_model: str | None = None
     brave_search_api_key: str | None = None
     jina_reader_api_key: str | None = None
+    firecrawl_api_key: str | None = None
     trusted_mcp_url: str | None = None
     trusted_mcp_timeout_seconds: float = 30.0
     tool_approval_ttl_seconds: int = 900

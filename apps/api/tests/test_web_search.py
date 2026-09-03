@@ -19,6 +19,7 @@ from deep_researcher.settings import Settings
 from deep_researcher.source_map import SourceMapLedger
 from deep_researcher.testing import running_worker_client
 from deep_researcher.web_page import (
+    FirecrawlWebPageAdapter,
     JinaReaderWebPageAdapter,
     WebAcquisition,
     WebPageAttempt,
@@ -123,6 +124,78 @@ def test_jina_adapter_preserves_partial_extraction_provenance() -> None:
     assert attempt.completeness == "partial"
     assert attempt.truncated is True
     assert attempt.content_hash is not None
+
+
+def test_firecrawl_adapter_extracts_markdown_and_metadata() -> None:
+    content = "页面正文用于验证 Firecrawl Markdown 抓取与来源元数据。" * 4
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.firecrawl.dev/v2/scrape"
+        assert request.headers["Authorization"] == "Bearer test-key"
+        assert json.loads(request.content) == {
+            "url": "https://example.com/report",
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+        }
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "markdown": content,
+                    "metadata": {
+                        "title": "Firecrawl 报告",
+                        "sourceURL": "https://example.com/report-final",
+                        "statusCode": 200,
+                    },
+                },
+            },
+        )
+
+    adapter = FirecrawlWebPageAdapter(
+        api_key="test-key",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    attempt = adapter.fetch("https://example.com/report")
+
+    assert attempt.status == "success"
+    assert attempt.adapter_id == "firecrawl_reader"
+    assert attempt.final_url == "https://example.com/report-final"
+    assert attempt.title == "Firecrawl 报告"
+    assert attempt.content_type == "text/markdown"
+    assert attempt.completeness == "complete"
+
+
+def test_firecrawl_quota_failure_stops_without_local_fallback() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(402, json={"error": "quota"}))
+    )
+    adapter = FirecrawlWebPageAdapter(api_key="test-key", client=client)
+
+    result = WebAcquisition(
+        firecrawl_reader=adapter,
+        local_reader=LocalReaderMustNotRun(),
+        url_validator=lambda _: None,
+    ).acquire("https://example.com/report")
+
+    assert result.selected is None
+    assert result.stopped_reason == "constraint_exhausted"
+    assert [attempt.adapter_id for attempt in result.attempts] == ["firecrawl_reader"]
+
+
+def test_firecrawl_malformed_response_is_normalized_for_fallback() -> None:
+    client = httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"data": []}))
+    )
+    attempt = FirecrawlWebPageAdapter(api_key="test-key", client=client).fetch(
+        "https://example.com/report"
+    )
+
+    assert attempt.status == "failed"
+    assert attempt.error_category == "unusable_extraction"
+    assert attempt.fallback_allowed is True
 
 
 class FakeWebSearchGateway:

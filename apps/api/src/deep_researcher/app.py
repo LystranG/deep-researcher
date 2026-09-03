@@ -133,6 +133,7 @@ from deep_researcher.tool_execution import (
     ToolExecutionService,
 )
 from deep_researcher.web_page import (
+    FirecrawlWebPageAdapter,
     HttpWebPageGateway,
     JinaReaderWebPageAdapter,
     WebAcquisition,
@@ -728,12 +729,23 @@ def create_app(
         resolved_web_search_gateway = build_web_search_gateway(
             api_key=resolved_settings.brave_search_api_key
         )
-    resolved_web_page_gateway = web_page_gateway or WebAcquisition(
-            jina_reader=JinaReaderWebPageAdapter(
-                api_key=resolved_settings.jina_reader_api_key
-            ),
+    if web_page_gateway is not None:
+        resolved_web_page_gateway = web_page_gateway
+    else:
+        primary_reader = (
+            FirecrawlWebPageAdapter(api_key=resolved_settings.firecrawl_api_key)
+            if resolved_settings.firecrawl_api_key
+            else JinaReaderWebPageAdapter(api_key=resolved_settings.jina_reader_api_key)
+        )
+        resolved_web_page_gateway = WebAcquisition(
+            firecrawl_reader=primary_reader
+            if resolved_settings.firecrawl_api_key
+            else None,
+            jina_reader=primary_reader
+            if not resolved_settings.firecrawl_api_key
+            else None,
             local_reader=HttpWebPageGateway(),
-    )
+        )
     resolved_embedding_gateway = embedding_gateway
     resolved_rerank_gateway = rerank_gateway
     retrieval_configured = not (
