@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     """应用配置；所有可变部署决策都从这里进入。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=None,
         env_prefix="DEEP_RESEARCHER_",
         extra="ignore",
     )

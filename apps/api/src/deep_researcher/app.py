@@ -705,7 +705,7 @@ def create_app(
     rerank_gateway: RerankGateway | None = None,
     embedded_worker: bool = False,
 ) -> FastAPI:
-    resolved_settings = settings or Settings()
+    resolved_settings = settings or Settings(_env_file=".env")  # type: ignore[call-arg]
     engine = build_engine(resolved_settings.database_url)
     session_factory = build_session_factory(engine)
     resolved_model_gateway = model_gateway
