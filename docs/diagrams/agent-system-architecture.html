@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deep Researcher Agent Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&family=Noto+Sans+KR:wght@400;500;600&family=Noto+Serif+KR:wght@400&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    :root {
+      --paper: #f5f5f5;
+      --paper-2: #ececec;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #7a8399;
+      --rule: rgba(45,49,66,.14);
+      --accent: #eb6c36;
+      --accent-tint: rgba(235,108,54,.08);
+      --link: #2e5aa8;
+      --sans: 'Geist', 'Noto Sans KR', system-ui, sans-serif;
+      --serif: 'Instrument Serif', 'Noto Serif KR', Georgia, serif;
+      --mono: 'Geist Mono', ui-monospace, monospace;
+    }
+    html { background: var(--paper); }
+    body {
+      margin: 0;
+      padding: 48px 32px 40px;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: var(--sans);
+    }
+    main { max-width: 1440px; margin: 0 auto; }
+    .eyebrow, .figure-label, .source, .legend-label {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .eyebrow { margin: 0 0 12px; }
+    h1 {
+      margin: 0;
+      font-family: var(--serif);
+      font-size: 40px;
+      font-weight: 400;
+      line-height: 1.1;
+    }
+    .dek {
+      max-width: 920px;
+      margin: 16px 0 36px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    figure { margin: 0 0 40px; }
+    .figure-label { margin: 0 0 10px; }
+    svg { display: block; width: 100%; height: auto; }
+    .notes {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr .85fr;
+      gap: 20px;
+      margin-top: 28px;
+    }
+    .note {
+      min-height: 148px;
+      padding: 20px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      background: #fff;
+    }
+    .note.focal { border-top: 3px solid var(--accent); }
+    .note h2 {
+      margin: 8px 0 12px;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .note p, .note ul {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+    }
+    .note ul { padding-left: 18px; }
+    .note li + li { margin-top: 6px; }
+    footer {
+      padding-top: 16px;
+      border-top: 1px solid var(--rule);
+      color: var(--soft);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    @media (max-width: 760px) {
+      body { padding: 28px 16px; }
+      h1 { font-size: 32px; }
+      .dek { font-size: 14px; }
+      figure { overflow-x: auto; }
+      figure svg { min-width: 1040px; }
+      .notes { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <p class="eyebrow">Deep Researcher · Agent Runtime</p>
+  <h1>Agent system architecture &amp; execution flow</h1>
+  <p class="dek">这份图把用户可见的领域事实、独立 Worker、LangGraph 编排和证据生命周期分开表达。架构图回答“组件和事实在哪里”，流程图回答“一次 Research Run 如何推进、暂停、恢复并结束”。<br><a href="#react-detail">直接跳转到 ReAct 循环详情 ↓</a></p>
+
+  <figure>
+    <p class="figure-label">01 · Architecture / trust and ownership boundaries</p>
+    <svg viewBox="0 0 1320 500" role="img" aria-labelledby="agent-architecture-title agent-architecture-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="agent-architecture-title">Deep Researcher agent architecture</title>
+      <desc id="agent-architecture-desc">Architecture showing the API control plane, PostgreSQL domain facts, dedicated worker, LangGraph orchestration, retrieval sources, tool approval, and event projection boundaries.</desc>
+      <defs>
+        <marker id="arch-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="arch-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#2e5aa8"/></marker>
+        <marker id="arch-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+      </defs>
+      <rect width="1320" height="500" fill="#f5f5f5"/>
+
+      <!-- Zones -->
+      <rect x="24" y="36" width="1272" height="116" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+      <rect x="24" y="180" width="1272" height="172" rx="8" fill="rgba(45,49,66,.02)" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+      <rect x="24" y="380" width="1272" height="80" rx="8" fill="rgba(235,108,54,.04)" stroke="rgba(235,108,54,.50)" stroke-width="1" stroke-dasharray="4,4"/>
+      <rect x="40" y="40" width="132" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="106" y="49" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".14em">CONTROL PLANE</text>
+      <rect x="40" y="184" width="124" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="102" y="193" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".14em">RUNTIME PLANE</text>
+      <rect x="40" y="384" width="108" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="94" y="393" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".14em">FACTS + EVENTS</text>
+
+      <!-- Connectors first -->
+      <path d="M 184,94 H 216" fill="none" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arch-link)"/>
+      <path d="M 384,94 H 416" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <path d="M 576,94 H 608" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <path d="M 708,152 V 200 H 704 V 220" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <path d="M 544,256 H 512" fill="none" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arch-link)"/>
+      <path d="M 864,256 H 896" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <path d="M 1056,256 H 1088" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <path d="M 704,292 V 328 H 708 V 380" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arch-accent)"/>
+      <path d="M 1184,300 V 344 H 1160 V 380" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arch-arrow)"/>
+      <path d="M 824,416 H 856" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#arch-accent)"/>
+      <path d="M 1032,416 H 1064" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#arch-arrow)"/>
+      <rect x="676" y="332" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="708" y="341" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">COMMIT</text>
+      <rect x="1140" y="346" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1164" y="355" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">PROJECT</text>
+
+      <!-- Nodes -->
+      <g>
+        <rect x="56" y="68" width="128" height="52" rx="6" fill="rgba(79,93,117,.10)" stroke="#7a8399"/>
+        <text x="120" y="91" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">User / Web UI</text>
+        <text x="120" y="108" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">message + SSE</text>
+      </g>
+      <g>
+        <rect x="216" y="68" width="168" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+        <rect x="224" y="76" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+        <text x="240" y="85" fill="#2d3142" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle">API</text>
+        <text x="300" y="99" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">FastAPI</text>
+        <text x="300" y="112" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ACL · command</text>
+      </g>
+      <g>
+        <rect x="416" y="68" width="160" height="52" rx="6" fill="rgba(45,49,66,.05)" stroke="#4f5d75"/>
+        <text x="496" y="91" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Run Queue</text>
+        <text x="496" y="108" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">lease · epoch · lock</text>
+      </g>
+      <g>
+        <rect x="608" y="68" width="200" height="52" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <text x="708" y="91" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Dedicated Worker</text>
+        <text x="708" y="108" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">heartbeat · recovery</text>
+      </g>
+
+      <g>
+        <rect x="544" y="220" width="320" height="72" rx="6" fill="#fff" stroke="#2d3142"/>
+        <rect x="804" y="230" width="52" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+        <text x="830" y="239" fill="#2d3142" font-size="7" font-family="'Geist Mono',monospace" text-anchor="middle">GRAPH</text>
+        <text x="704" y="251" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">LangGraph runtime</text>
+        <text x="704" y="268" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">map → plan → research → verify → write</text>
+        <text x="704" y="282" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">checkpoint: run:{run_id}</text>
+      </g>
+      <g>
+        <rect x="352" y="230" width="160" height="52" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="432" y="253" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Hybrid Retrieval</text>
+        <text x="432" y="270" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ACL → FTS + vector + rerank</text>
+      </g>
+      <g>
+        <rect x="896" y="230" width="160" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+        <text x="976" y="253" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Tool Policy</text>
+        <text x="976" y="270" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">allowlist · approval · MCP</text>
+      </g>
+      <g>
+        <rect x="1088" y="230" width="160" height="70" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="1168" y="253" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Sources + Memory</text>
+        <text x="1168" y="270" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">frozen chunks · records</text>
+        <text x="1168" y="284" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">conversation leads</text>
+      </g>
+
+      <g>
+        <rect x="616" y="380" width="208" height="72" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+        <text x="720" y="404" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Domain Database</text>
+        <text x="720" y="421" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">runs · tasks · evidence · artifacts</text>
+        <text x="720" y="435" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">PostgreSQL + pgvector</text>
+      </g>
+      <g>
+        <rect x="856" y="380" width="176" height="72" rx="6" fill="#fff" stroke="#2d3142"/>
+        <text x="944" y="404" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Event Projector</text>
+        <text x="944" y="421" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">committed facts → RunEvent</text>
+        <text x="944" y="435" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ordered · idempotent · replay</text>
+      </g>
+      <g>
+        <rect x="1064" y="380" width="176" height="72" rx="6" fill="#fff" stroke="#2d3142"/>
+        <text x="1152" y="404" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Object / File Space</text>
+        <text x="1152" y="421" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">work revisions · artifacts</text>
+        <text x="1152" y="435" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">publish is explicit</text>
+      </g>
+
+      <!-- Legend -->
+      <line x1="40" y1="476" x2="1280" y2="476" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+      <text x="40" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">LEGEND</text>
+      <line x1="126" y1="489" x2="158" y2="489" stroke="#4f5d75" marker-end="url(#arch-arrow)"/>
+      <text x="170" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">internal flow</text>
+      <line x1="280" y1="489" x2="312" y2="489" stroke="#2e5aa8" marker-end="url(#arch-link)"/>
+      <text x="324" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">external / retrieval</text>
+      <line x1="470" y1="489" x2="502" y2="489" stroke="#eb6c36" marker-end="url(#arch-accent)"/>
+      <text x="514" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">focal commit path</text>
+      <line x1="658" y1="489" x2="690" y2="489" stroke="#4f5d75" stroke-dasharray="4,3" marker-end="url(#arch-arrow)"/>
+      <text x="702" y="492" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">passive projection</text>
+    </svg>
+  </figure>
+
+  <figure>
+    <p class="figure-label">02 · Runtime / one Research Run</p>
+    <svg viewBox="0 0 1320 760" role="img" aria-labelledby="agent-flow-title agent-flow-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="agent-flow-title">Research Run execution flow</title>
+      <desc id="agent-flow-desc">Flowchart showing a research run being created, claimed by a worker, frozen into a context, planned, optionally paused for tool approval, researched in bounded branches, verified, written, citation-validated, and finalized.</desc>
+      <defs>
+        <marker id="flow-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="flow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+      </defs>
+      <rect width="1320" height="760" fill="#f5f5f5"/>
+
+      <!-- Connectors -->
+      <path d="M 660,64 V 88" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 660,140 V 164" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 660,216 V 240" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 660,292 V 316" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#flow-accent)"/>
+      <path d="M 660,368 V 392" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 580,430 H 440 V 470" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 740,430 H 880 V 470" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#flow-accent)"/>
+      <path d="M 440,522 V 550 H 660 V 574" fill="none" stroke="#4f5d75" marker-end="url(#flow-arrow)"/>
+      <path d="M 880,522 V 550 H 660 V 574" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#flow-accent)"/>
+      <path d="M 660,626 V 650" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#flow-accent)"/>
+      <path d="M 500,430 H 300 V 260 H 580" fill="none" stroke="#4f5d75" stroke-dasharray="5,4" marker-end="url(#flow-arrow)"/>
+      <rect x="324" y="248" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="372" y="257" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">NO APPROVAL</text>
+      <rect x="824" y="418" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="848" y="427" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">YES</text>
+      <rect x="452" y="418" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="472" y="427" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">NO</text>
+
+      <!-- Nodes -->
+      <ellipse cx="660" cy="44" rx="92" ry="20" fill="rgba(79,93,117,.10)" stroke="#7a8399"/>
+      <text x="660" y="49" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">User message</text>
+
+      <rect x="520" y="88" width="280" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="111" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">API creates ResearchRun</text>
+      <text x="660" y="128" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">Message + initial RunEvent · status=queued</text>
+
+      <rect x="520" y="164" width="280" height="52" rx="6" fill="rgba(45,49,66,.05)" stroke="#4f5d75"/>
+      <text x="660" y="187" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Worker claims run</text>
+      <text x="660" y="204" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">row lock · lease · heartbeat · fencing epoch</text>
+
+      <rect x="520" y="240" width="280" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="263" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Freeze research context</text>
+      <text x="660" y="280" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ACL retrieval · sources · memory · skills · maps</text>
+
+      <rect x="520" y="316" width="280" height="52" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="660" y="339" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Planner creates bounded plan</text>
+      <text x="660" y="356" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">tasks · dependencies · budgets · tool allowlist</text>
+
+      <polygon points="660,392 740,430 660,468 580,430" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="427" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Tool approval needed?</text>
+
+      <rect x="300" y="470" width="280" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+      <text x="440" y="493" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Bounded research fan-out</text>
+      <text x="440" y="510" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">source mapper · Researcher branches</text>
+
+      <rect x="740" y="470" width="280" height="52" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="880" y="493" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">interrupt → user decision</text>
+      <text x="880" y="510" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">pending approval · resume without params</text>
+
+      <rect x="520" y="574" width="280" height="52" rx="6" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="597" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Fan-in → verify → write</text>
+      <text x="660" y="614" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">Verifier · Writer · Citation Validator</text>
+
+      <ellipse cx="660" cy="682" rx="132" ry="20" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="660" y="687" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Finalize ledger + answer + citations</text>
+
+      <!-- Side outcomes -->
+      <rect x="80" y="574" width="224" height="52" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+      <text x="192" y="597" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Cancelled</text>
+      <text x="192" y="614" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">persistent command wins</text>
+      <path d="M 520,600 H 304" fill="none" stroke="#4f5d75" stroke-dasharray="4,3" marker-end="url(#flow-arrow)"/>
+
+      <rect x="1016" y="574" width="224" height="52" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+      <text x="1128" y="597" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Waiting / partial / failed</text>
+      <text x="1128" y="614" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">budget · no gain · evidence gap</text>
+      <path d="M 800,600 H 1016" fill="none" stroke="#4f5d75" stroke-dasharray="4,3" marker-end="url(#flow-arrow)"/>
+
+      <line x1="40" y1="728" x2="1280" y2="728" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+      <text x="40" y="744" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">FLOW NOTES</text>
+      <text x="150" y="744" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">Graph checkpoint is recovery data; PostgreSQL domain tables remain the user-visible source of truth.</text>
+    </svg>
+  </figure>
+
+  <figure>
+    <p class="figure-label">03 · LangGraph / node responsibilities and routing</p>
+    <svg viewBox="0 0 1320 1040" role="img" aria-labelledby="langgraph-title langgraph-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="langgraph-title">LangGraph node responsibilities</title>
+      <desc id="langgraph-desc">Detailed LangGraph flow showing source mapping, planning, tool preparation and approval, bounded researcher fan-out, verifier fan-in, writer, citation validation, and graph completion.</desc>
+      <defs>
+        <marker id="lg-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="lg-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+      </defs>
+      <rect width="1320" height="1040" fill="#f5f5f5"/>
+      <rect x="152" y="548" width="1000" height="276" rx="8" fill="rgba(235,108,54,.02)" stroke="rgba(235,108,54,.55)" stroke-width="1" stroke-dasharray="6,4"/>
+      <rect x="172" y="552" width="176" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="260" y="561" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle" letter-spacing=".12em">REACT AGENT / TASK RUNTIME</text>
+
+      <!-- Main vertical route -->
+      <path d="M 660,56 V 80" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 660,168 V 192" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 660,280 V 304" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 660,392 V 416" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lg-accent)"/>
+
+      <!-- Approval route: tool_prepare -> tool_execution -> researcher -->
+      <path d="M 800,460 H 840 V 368 Q 840,360 832,360 H 720 V 384" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lg-accent)"/>
+      <path d="M 948,504 V 532 Q 948,540 940,540 H 620 Q 612,540 612,548 V 560 Q 612,568 604,568 H 520 V 572" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lg-accent)"/>
+      <path d="M 520,460 H 400 V 548 Q 400,556 408,556 H 432 V 572" fill="none" stroke="#4f5d75" stroke-dasharray="5,4" marker-end="url(#lg-arrow)"/>
+      <rect x="824" y="348" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="848" y="357" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">YES</text>
+      <rect x="352" y="476" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="400" y="485" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">NO TOOL CALL</text>
+
+      <!-- Fan-out from researcher coordinator to bounded branches -->
+      <path d="M 456,660 V 688 H 264 V 716" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 456,660 V 688 H 456 V 716" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 456,660 V 688 H 648 V 716" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 456,660 V 688 H 840 V 716" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 456,660 V 688 H 1032 V 716" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <rect x="364" y="672" width="184" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="456" y="681" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">Send × bounded research_briefs</text>
+
+      <!-- Fan-in to verifier, then the sequential quality gates -->
+      <path d="M 264,804 V 832 H 320 V 856" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 456,804 V 832 H 320 V 856" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 648,804 V 832 H 320 V 856" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 840,804 V 832 H 320 V 856" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 1032,804 V 832 H 320 V 856" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 560,888 H 628" fill="none" stroke="#4f5d75" marker-end="url(#lg-arrow)"/>
+      <path d="M 868,888 H 936" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lg-accent)"/>
+      <path d="M 1026,936 V 968" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#lg-accent)"/>
+
+      <!-- Nodes -->
+      <ellipse cx="660" cy="36" rx="72" ry="20" fill="rgba(79,93,117,.10)" stroke="#7a8399"/>
+      <text x="660" y="41" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">START</text>
+
+      <rect x="520" y="80" width="280" height="88" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="532" y="92" width="108" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="586" y="101" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">source_mapper</text>
+      <text x="660" y="123" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Map source chunks</text>
+      <text x="660" y="140" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">digest · claims · locators · gaps</text>
+      <text x="660" y="156" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ledger.complete / ledger.fail</text>
+
+      <rect x="520" y="192" width="280" height="88" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <rect x="532" y="204" width="72" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,.55)"/>
+      <text x="568" y="213" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">planner</text>
+      <text x="660" y="235" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Create finite plan</text>
+      <text x="660" y="252" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">tasks · dependencies · budgets</text>
+      <text x="660" y="268" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">research_briefs · allowed_tools</text>
+
+      <rect x="520" y="304" width="280" height="88" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="532" y="316" width="104" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="584" y="325" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">tool_prepare</text>
+      <text x="660" y="347" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Prepare tool call</text>
+      <text x="660" y="364" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">normalize intent · policy allowlist</text>
+      <text x="660" y="380" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">idempotent ToolCall + Approval fact</text>
+
+      <polygon points="660,416 800,460 660,504 520,460" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="457" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">tool_call exists?</text>
+      <text x="660" y="474" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">conditional route</text>
+
+      <rect x="808" y="416" width="280" height="88" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <rect x="820" y="428" width="112" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,.55)"/>
+      <text x="876" y="437" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">tool_execution</text>
+      <text x="948" y="459" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Pause for approval</text>
+      <text x="948" y="476" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">interrupt → resume payload</text>
+      <text x="948" y="492" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">execute only after decision</text>
+
+      <rect x="316" y="572" width="280" height="88" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="328" y="584" width="92" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="374" y="593" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">researcher</text>
+      <text x="456" y="615" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Dispatch bounded work</text>
+      <text x="456" y="632" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">Send one branch per ResearchBrief</text>
+      <text x="456" y="648" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">Model Turn ↺ Tool ↺ Observation · bounded</text>
+
+      <!-- Branch cards are the responsibilities of the dispatched researcher calls -->
+      <g>
+        <rect x="184" y="716" width="160" height="88" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="264" y="740" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Branch 1</text>
+        <text x="264" y="757" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">direct evidence</text>
+        <text x="264" y="773" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">sources → finding</text>
+        <text x="264" y="789" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding</text>
+      </g>
+      <g>
+        <rect x="376" y="716" width="160" height="88" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="456" y="740" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Branch 2</text>
+        <text x="456" y="757" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">limits / counterevidence</text>
+        <text x="456" y="773" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">sources → finding</text>
+        <text x="456" y="789" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding</text>
+      </g>
+      <g>
+        <rect x="568" y="716" width="160" height="88" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="648" y="740" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Branch 3</text>
+        <text x="648" y="757" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">source comparison</text>
+        <text x="648" y="773" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">sources → finding</text>
+        <text x="648" y="789" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding</text>
+      </g>
+      <g>
+        <rect x="760" y="716" width="160" height="88" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="840" y="740" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Branch 4</text>
+        <text x="840" y="757" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">bounded role / depth</text>
+        <text x="840" y="773" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">sources → finding</text>
+        <text x="840" y="789" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding</text>
+      </g>
+      <g>
+        <rect x="952" y="716" width="160" height="88" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+        <text x="1032" y="740" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Branch N</text>
+        <text x="1032" y="757" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">bounded parallel limit</text>
+        <text x="1032" y="773" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">sources → finding</text>
+        <text x="1032" y="789" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding</text>
+      </g>
+
+      <rect x="80" y="856" width="480" height="64" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="92" y="868" width="72" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="128" y="877" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">verifier</text>
+      <text x="320" y="884" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Fan-in and verify evidence</text>
+      <text x="320" y="901" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ResearchFinding[] → supported / insufficient / conflicted</text>
+
+      <rect x="628" y="856" width="240" height="64" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="640" y="868" width="56" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="668" y="877" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">writer</text>
+      <text x="748" y="884" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Draft answer</text>
+      <text x="748" y="901" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">context + findings → draft</text>
+
+      <rect x="936" y="856" width="180" height="80" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <rect x="948" y="868" width="132" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,.55)"/>
+      <text x="1014" y="877" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">citation_validator</text>
+      <text x="1026" y="899" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Publish-safe answer</text>
+      <text x="1026" y="916" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">citation bounds · fallback</text>
+
+      <ellipse cx="1026" cy="988" rx="72" ry="20" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="1026" y="993" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">END</text>
+
+      <line x1="40" y1="1020" x2="1280" y2="1020" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+    </svg>
+  </figure>
+
+  <figure id="react-detail">
+    <p class="figure-label">04 · Task runtime / bounded ReAct loop</p>
+    <svg viewBox="0 0 1320 620" role="img" aria-labelledby="react-title react-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="react-title">Bounded ReAct task runtime loop</title>
+      <desc id="react-desc">Flow showing a ResearchTask being claimed, advanced one model turn at a time, optionally executing a tool, persisting an observation, and looping until a result proposal or a budget, cancellation, no-progress, or failure terminal state.</desc>
+      <defs>
+        <marker id="react-arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#4f5d75"/></marker>
+        <marker id="react-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="#eb6c36"/></marker>
+      </defs>
+      <rect width="1320" height="620" fill="#f5f5f5"/>
+
+      <!-- Main route -->
+      <path d="M 660,56 V 84" fill="none" stroke="#4f5d75" marker-end="url(#react-arrow)"/>
+      <path d="M 660,156 V 184" fill="none" stroke="#4f5d75" marker-end="url(#react-arrow)"/>
+      <path d="M 660,256 V 284" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#react-accent)"/>
+      <path d="M 660,356 V 372 H 460 Q 452,372 452,380 V 504 H 544" fill="none" stroke="#4f5d75" marker-end="url(#react-arrow)"/>
+
+      <!-- Tool branch and loop-back -->
+      <path d="M 800,320 H 840 V 376 Q 840,384 832,384 H 720 V 384" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#react-accent)"/>
+      <rect x="836" y="308" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="872" y="317" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">TOOL CALL</text>
+      <path d="M 800,420 H 920 V 220 H 960" fill="none" stroke="#eb6c36" stroke-width="1.2" marker-end="url(#react-accent)"/>
+      <rect x="856" y="324" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="892" y="333" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">WAITING</text>
+      <path d="M 520,220 H 280 V 520 H 560" fill="none" stroke="#4f5d75" stroke-dasharray="5,4" marker-end="url(#react-arrow)"/>
+      <rect x="292" y="504" width="112" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="348" y="513" fill="#7a8399" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">NEXT MODEL TURN</text>
+
+      <!-- Nodes -->
+      <ellipse cx="660" cy="36" rx="96" ry="20" fill="rgba(79,93,117,.10)" stroke="#7a8399"/>
+      <text x="660" y="41" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Task becomes ready</text>
+
+      <rect x="520" y="84" width="280" height="72" rx="6" fill="rgba(45,49,66,.05)" stroke="#4f5d75"/>
+      <text x="660" y="108" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">TaskRuntime.claim()</text>
+      <text x="660" y="125" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">task lease · task fencing epoch</text>
+      <text x="660" y="141" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">one controller owns this advance</text>
+
+      <rect x="520" y="184" width="280" height="72" rx="6" fill="#fff" stroke="#2d3142"/>
+      <rect x="532" y="196" width="104" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,.40)"/>
+      <text x="584" y="205" fill="#2d3142" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">advance()</text>
+      <text x="660" y="227" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Complete one Model Turn</text>
+      <text x="660" y="244" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">read history · tool snapshot · success criteria</text>
+
+      <polygon points="660,284 800,320 660,356 520,320" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="317" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Model output?</text>
+      <text x="660" y="334" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">ToolCall or ResultProposal</text>
+      <rect x="468" y="364" width="104" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="520" y="373" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace" text-anchor="middle">RESULT PROPOSAL</text>
+
+      <rect x="520" y="384" width="280" height="72" rx="6" fill="#fff" stroke="#2d3142"/>
+      <text x="660" y="408" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Execute tool adapter</text>
+      <text x="660" y="425" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">policy · schema · approval · idempotency</text>
+      <text x="660" y="441" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">persist Observation / waiting / failure</text>
+
+      <ellipse cx="660" cy="504" rx="116" ry="20" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="660" y="509" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">ResultProposal → TaskOutcome</text>
+
+      <!-- Terminal gates -->
+      <rect x="960" y="84" width="280" height="72" rx="6" fill="rgba(45,49,66,.03)" stroke="rgba(45,49,66,.30)"/>
+      <text x="1100" y="108" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Terminal gate</text>
+      <text x="1100" y="125" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">cancel · max turns · budget</text>
+      <text x="1100" y="141" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">no evidence gain · invalid output</text>
+      <path d="M 800,120 H 960" fill="none" stroke="#4f5d75" stroke-dasharray="4,3" marker-end="url(#react-arrow)"/>
+
+      <rect x="960" y="184" width="280" height="72" rx="6" fill="rgba(235,108,54,.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="1100" y="208" fill="#2d3142" font-size="12" font-weight="600" text-anchor="middle">Waiting gate</text>
+      <text x="1100" y="225" fill="#4f5d75" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">approval / external result pending</text>
+      <text x="1100" y="241" fill="#7a8399" font-size="9" font-family="'Geist Mono',monospace" text-anchor="middle">wake → resume same task</text>
+
+      <line x1="40" y1="572" x2="1280" y2="572" stroke="rgba(45,49,66,.10)" stroke-width=".8"/>
+      <text x="40" y="592" fill="#eb6c36" font-size="8" font-family="'Geist Mono',monospace" letter-spacing=".14em">IMPLEMENTATION NOTE</text>
+      <text x="196" y="592" fill="#4f5d75" font-size="8" font-family="'Geist Mono',monospace">Implemented in task_runtime.py · MAX_MODEL_TURNS=8 · NO_EVIDENCE_GAIN_LIMIT=2</text>
+    </svg>
+  </figure>
+
+  <section class="notes" aria-label="Architecture notes">
+    <article class="note focal">
+      <p class="source">Domain boundary</p>
+      <h2>领域事实与编排状态分离</h2>
+      <p>ResearchRun、TaskOutcome、Evidence、Citation、Memory、Tool Approval 和 RunEvent 在数据库中形成可审计事实；LangGraph checkpoint 只保存恢复所需的内部状态。</p>
+    </article>
+    <article class="note">
+      <p class="source">Evidence path</p>
+      <h2>证据先冻结，再进入 Agent</h2>
+      <ul>
+        <li>检索先做 Workspace ACL、软删除和版本有效性过滤。</li>
+        <li>来源正文回读后才能生成 Evidence Span 和 Citation。</li>
+        <li>Research Record 与 Long-term Memory 保持分离。</li>
+      </ul>
+    </article>
+    <article class="note">
+      <p class="source">Operational edge</p>
+      <h2>Worker 是长任务边界</h2>
+      <p>API 不运行长时 Agent。Worker 领取租约、发送 heartbeat、执行恢复，并通过 fencing epoch 防止失效 Worker 继续提交事实。</p>
+    </article>
+    <article class="note focal">
+      <p class="source">Runtime discrepancy</p>
+      <h2>当前有两套运行模型</h2>
+      <p><code>graph.py</code> 是当前协调器实际调用的固定拓扑；<code>task_runtime.py</code> 已实现有界 ReAct 循环，但目前没有从 <code>execute_runtime_v2()</code> 接入。图 04 因此标记为“已实现能力”，不是当前 Graph 的实际边。</p>
+    </article>
+  </section>
+
+  <footer>
+    Source anchors: <span>graph.py</span> · <span>coordinator.py</span> · <span>worker.py</span> · <span>run_queue.py</span> · <span>retrieval.py</span> · <span>tool_execution.py</span> · <span>run_event_projector.py</span> · ADR-0001 / 0004 / 0012
+  </footer>
+</main>
+</body>
+</html>
