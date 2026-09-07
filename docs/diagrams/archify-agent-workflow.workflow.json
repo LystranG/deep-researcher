@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Deep Researcher Agent Run Workflow",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "archify-agent-workflow.html",
+    "views": [
+      { "id": "run", "label": "Research Run", "focus": ["user", "api", "worker", "context", "plan", "graph", "answer"], "note": "从用户消息跟随一次 Research Run 到可发布回答。" },
+      { "id": "langgraph", "label": "LangGraph", "focus": ["plan", "graph", "researcher", "verifier", "writer", "validator"], "note": "查看固定 Graph 节点及其职责。" },
+      { "id": "react", "label": "ReAct loop", "focus": ["researcher", "turn", "tool", "observation"], "note": "查看 Task Runtime 中有界的 Model Turn、Tool 和 Observation 循环。" }
+    ]
+  },
+  "lanes": [
+    { "id": "user", "label": "User / API" },
+    { "id": "runtime", "label": "Worker / Coordinator" },
+    { "id": "graphlane", "label": "LangGraph" },
+    { "id": "agent", "label": "Nested ReAct Agent" },
+    { "id": "facts", "label": "Facts / Outcome" }
+  ],
+  "phases": [
+    { "id": "intake", "label": "Intake", "fromCol": 0, "toCol": 0 },
+    { "id": "prepare", "label": "Prepare", "fromCol": 1, "toCol": 2, "variant": "emphasis" },
+    { "id": "orchestrate", "label": "Orchestrate", "fromCol": 3, "toCol": 4 },
+    { "id": "publish", "label": "Verify / publish", "fromCol": 5, "toCol": 5, "variant": "emphasis" }
+  ],
+  "groups": [
+    { "id": "react-boundary", "label": "Researcher Agent / bounded ReAct", "lane": "agent", "fromCol": 2, "toCol": 5, "variant": "security" },
+    { "id": "durable-facts", "label": "Durable run and task facts", "lane": "facts", "fromCol": 1, "toCol": 5, "variant": "dashed" }
+  ],
+  "semanticChecks": {
+    "allowedRoots": ["user"],
+    "allowedTerminals": ["answer", "cancelled", "failed", "validator"],
+    "requiredEdges": [
+      { "from": "plan", "to": "graph" },
+      { "from": "graph", "to": "researcher" },
+      { "from": "researcher", "to": "verifier" },
+      { "from": "verifier", "to": "writer" },
+      { "from": "writer", "to": "validator" }
+    ],
+    "requiredPaths": [
+      { "from": "user", "to": "answer" },
+      { "from": "turn", "to": "observation" },
+      { "from": "observation", "to": "turn" }
+    ]
+  },
+  "nodes": [
+    { "id": "user", "lane": "user", "col": 0, "type": "external", "label": "User", "tag": "entry", "width": 140 },
+    { "id": "api", "lane": "user", "col": 1, "type": "backend", "label": "FastAPI", "tag": "queued", "width": 150 },
+    { "id": "worker", "lane": "runtime", "col": 2, "type": "backend", "label": "Dedicated Worker", "tag": "running", "width": 170 },
+    { "id": "context", "lane": "runtime", "col": 3, "type": "backend", "label": "Frozen Context", "tag": "immutable", "width": 170 },
+    { "id": "plan", "lane": "graphlane", "col": 4, "type": "backend", "label": "Planner", "tag": "bounded", "width": 150 },
+    { "id": "graph", "lane": "graphlane", "col": 5, "type": "backend", "label": "ResearchGraph", "tag": "checkpoint", "width": 170 },
+    { "id": "researcher", "lane": "agent", "col": 5, "type": "backend", "label": "Researcher Agent", "tag": "nested", "width": 180 },
+    { "id": "turn", "lane": "agent", "col": 3, "type": "backend", "label": "Model Turn", "tag": "≤ 8", "width": 160 },
+    { "id": "tool", "lane": "agent", "col": 2, "type": "messagebus", "label": "Tool Adapter", "tag": "side effect", "width": 160 },
+    { "id": "observation", "lane": "agent", "col": 4, "type": "database", "label": "Observation", "tag": "durable", "width": 160 },
+    { "id": "verifier", "lane": "facts", "col": 5, "type": "backend", "label": "Verifier", "tag": "fan-in", "width": 180 },
+    { "id": "writer", "lane": "facts", "col": 3, "type": "backend", "label": "Writer", "tag": "model", "width": 150 },
+    { "id": "validator", "lane": "facts", "col": 1, "type": "security", "label": "Citation Validator", "tag": "quality gate", "width": 180 },
+    { "id": "answer", "lane": "runtime", "col": 5, "type": "frontend", "label": "Answer + events", "tag": "terminal", "width": 160 },
+    { "id": "cancelled", "lane": "facts", "col": 0, "type": "security", "label": "Cancelled", "tag": "terminal", "width": 150 },
+    { "id": "failed", "lane": "user", "col": 3, "type": "security", "label": "Partial / failed", "tag": "terminal", "width": 170 }
+  ],
+  "edges": [
+    { "id": "user-api", "from": "user", "to": "api", "label": "submit", "variant": "emphasis", "role": "main" },
+    { "id": "api-worker", "from": "api", "to": "worker", "label": "queue", "variant": "default", "role": "main" },
+    { "id": "worker-context", "from": "worker", "to": "context", "label": "execute", "variant": "emphasis", "role": "main" },
+    { "id": "context-plan", "from": "context", "to": "plan", "label": "frozen input", "variant": "default", "role": "main" },
+    { "id": "plan-graph", "from": "plan", "to": "graph", "label": "compile route", "variant": "emphasis", "role": "main" },
+    { "id": "graph-researcher", "from": "graph", "to": "researcher", "label": "Send branches", "variant": "emphasis", "role": "main" },
+    { "id": "researcher-turn", "from": "researcher", "to": "turn", "label": "advance", "variant": "emphasis", "role": "main" },
+    { "id": "turn-tool", "from": "turn", "to": "tool", "label": "ToolCall", "variant": "security", "role": "branch" },
+    { "id": "tool-observation", "from": "tool", "to": "observation", "label": "Observation", "variant": "default", "role": "main" },
+    { "id": "observation-turn", "from": "observation", "to": "turn", "label": "next turn", "variant": "dashed", "role": "return" },
+    { "id": "researcher-verifier", "from": "researcher", "to": "verifier", "label": "fan-in findings", "variant": "emphasis", "role": "main" },
+    { "id": "verifier-writer", "from": "verifier", "to": "writer", "variant": "default", "role": "main" },
+    { "id": "writer-validator", "from": "writer", "to": "validator", "variant": "emphasis", "role": "main" },
+    { "id": "validator-answer", "from": "validator", "to": "answer", "label": "publish", "variant": "emphasis", "role": "main" },
+    { "id": "worker-cancel", "from": "worker", "to": "cancelled", "label": "cancel", "variant": "security", "role": "error" },
+    { "id": "worker-failed", "from": "worker", "to": "failed", "label": "gap / budget", "variant": "security", "role": "error" }
+  ],
+  "cards": []
+}

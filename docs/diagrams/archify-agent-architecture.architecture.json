@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Deep Researcher Agent Architecture",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "archify-agent-architecture.html",
+    "repository": {
+      "url": "https://github.com/LystranG/deep-researcher",
+      "revision": "ec0226d33e22406b0c208b999d551377261be52b"
+    },
+    "views": [
+      {
+        "id": "runtime",
+        "label": "Runtime path",
+        "focus": ["web", "api", "queue", "worker", "coordinator", "graph"],
+        "note": "Follow one Research Run from the API to the dedicated Worker and LangGraph runtime."
+      },
+      {
+        "id": "evidence",
+        "label": "Evidence and memory",
+        "focus": ["retrieval", "sources", "database", "files", "events"],
+        "note": "Trace how frozen sources, memory, records, artifacts, and replayable events are persisted."
+      },
+      {
+        "id": "tools",
+        "label": "Tool boundary",
+        "focus": ["graph", "policy", "mcp", "sandbox", "database"],
+        "note": "Inspect approval, MCP side effects, and isolated Python execution."
+      }
+    ]
+  },
+  "components": [
+    { "id": "web", "type": "frontend", "label": "Web UI", "sublabel": "HTTP + SSE", "tag": "client", "pos": [40, 220], "size": [140, 72], "sources": [{ "path": "apps/web/src/WorkspaceView.tsx" }] },
+    { "id": "api", "type": "backend", "label": "FastAPI", "sublabel": "ACL + commands", "tag": "control plane", "pos": [240, 220], "size": [160, 72], "sources": [{ "path": "apps/api/src/deep_researcher/app.py" }] },
+    { "id": "queue", "type": "messagebus", "label": "Run Queue", "sublabel": "lease + fencing", "tag": "PostgreSQL", "pos": [460, 220], "size": [160, 72], "sources": [{ "path": "apps/api/src/deep_researcher/run_queue.py" }] },
+    { "id": "worker", "type": "backend", "label": "Dedicated Worker", "sublabel": "heartbeat + recovery", "tag": "long task", "pos": [680, 220], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/worker.py" }] },
+    { "id": "coordinator", "type": "backend", "label": "Research Coordinator", "sublabel": "freeze + finalize", "tag": "orchestrator", "pos": [920, 220], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/coordinator.py", "line": 171 }] },
+    { "id": "graph", "type": "backend", "label": "LangGraph Runtime", "sublabel": "map → plan → verify", "tag": "checkpointed", "pos": [1140, 220], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/graph.py", "line": 271 }] },
+    { "id": "retrieval", "type": "backend", "label": "Hybrid Retrieval", "sublabel": "FTS + vector + RRF", "tag": "context", "pos": [920, 380], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/retrieval.py", "line": 787 }] },
+    { "id": "policy", "type": "security", "label": "Tool Policy", "sublabel": "allowlist + approval", "tag": "guardrail", "pos": [1140, 380], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/tool_execution.py" }] },
+    { "id": "sources", "type": "external", "label": "Sources + Memory", "sublabel": "chunks · records · memory", "tag": "workspace scope", "pos": [680, 380], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/research_context.py" }] },
+    { "id": "database", "type": "database", "label": "Domain PostgreSQL", "sublabel": "runs · tasks · evidence", "tag": "source of truth", "pos": [460, 520], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/models.py" }] },
+    { "id": "events", "type": "messagebus", "label": "RunEvent Log", "sublabel": "ordered + replayable", "tag": "SSE projection", "pos": [680, 520], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/run_event_projector.py" }] },
+    { "id": "files", "type": "database", "label": "Research File Space", "sublabel": "revisions + artifacts", "tag": "explicit publish", "pos": [920, 520], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/research_file_space.py" }] },
+    { "id": "mcp", "type": "external", "label": "Trusted MCP", "sublabel": "research_notes.create", "tag": "side effect", "pos": [1140, 520], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/mcp_adapter.py" }] },
+    { "id": "sandbox", "type": "security", "label": "Python Sandbox", "sublabel": "Docker · no network", "tag": "derived evidence", "pos": [240, 520], "size": [180, 72], "sources": [{ "path": "apps/api/src/deep_researcher/sandbox_jobs.py" }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Application and Agent Runtime", "wraps": ["api", "queue", "worker", "coordinator", "graph", "retrieval", "policy"] },
+    { "kind": "security-group", "label": "Workspace-controlled data and side effects", "wraps": ["sources", "database", "events", "files", "mcp", "sandbox"] }
+  ],
+  "connections": [
+    { "id": "web-api", "from": "web", "to": "api", "variant": "emphasis" },
+    { "id": "api-queue", "from": "api", "to": "queue", "variant": "default" },
+    { "id": "queue-worker", "from": "queue", "to": "worker", "variant": "emphasis" },
+    { "id": "worker-coordinator", "from": "worker", "to": "coordinator", "label": "execute", "variant": "emphasis", "labelDy": -30 },
+    { "id": "coordinator-graph", "from": "coordinator", "to": "graph", "label": "run Graph", "variant": "emphasis", "labelDy": -30 },
+    { "id": "coordinator-retrieval", "from": "coordinator", "to": "retrieval", "variant": "default", "fromSide": "bottom", "toSide": "top" },
+    { "id": "retrieval-sources", "from": "retrieval", "to": "sources", "label": "recall", "variant": "default", "fromSide": "left", "toSide": "right", "labelDy": -30 },
+    { "id": "graph-policy", "from": "graph", "to": "policy", "label": "tool policy", "variant": "security", "fromSide": "bottom", "toSide": "top", "labelAt": [1230, 306] },
+    { "id": "policy-mcp", "from": "policy", "to": "mcp", "label": "approved", "variant": "security", "fromSide": "bottom", "toSide": "top", "labelAt": [1230, 466] },
+    { "id": "coordinator-db", "from": "coordinator", "to": "database", "variant": "default", "fromSide": "bottom", "toSide": "top", "via": [[1010, 320], [520, 320], [520, 500], [550, 500]] },
+    { "id": "database-events", "from": "database", "to": "events", "variant": "dashed" }
+  ],
+  "cards": [
+    { "dot": "orange", "title": "Runtime boundary", "items": ["API creates facts; Worker owns long-running execution", "Lease, heartbeat, and fencing protect commits"] },
+    { "dot": "cyan", "title": "Evidence boundary", "items": ["Retrieval filters scope before ranking", "Only immutable source text can support Citation"] },
+    { "dot": "rose", "title": "Side effects", "items": ["MCP writes require policy, grant, and approval", "Python runs in an isolated, auditable Sandbox"] }
+  ]
+}
